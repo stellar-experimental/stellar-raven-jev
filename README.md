@@ -132,3 +132,7 @@ cargo fmt --check
 ```
 
 Tests use fixtures and local HTTP servers. They never call live Jev.
+
+## License
+
+Apache License 2.0. Copyright 2026 Stellar Development Foundation. See [LICENSE](LICENSE).
