@@ -1,0 +1,28 @@
+# Credentials
+.env
+.env.*
+!.env.example
+
+# Build
+/target/
+
+# Run evidence, local experiments, and evaluation artifacts stay out of the repository.
+/runs/
+/evidence/
+/experiments/
+/research-repos/
+/eval/
+/scripts/
+/.agents/
+
+# Session reports and reviews. Only the user guides below are tracked.
+/docs/*
+!/docs/MCP-LOCAL.md
+!/docs/service-v2/
+/docs/service-v2/*
+!/docs/service-v2/USAGE.md
+
+*.log
+.DS_Store
+__pycache__/
+*.pyc
