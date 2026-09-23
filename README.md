@@ -39,9 +39,9 @@ Read the `text_path` file for any result you cite. The excerpt holds 400 charact
 `currentness` says how time affects the question:
 
 - `intent` is the question's time dependence (`current`, `comparative`, `versioned`, or `timeless`) with Jev's confidence.
-- `target` is the newest protocol version that two independent sources, or one official page, mention and that at least one live document covers. It is set only for questions that name a protocol or a CAP.
+- `leading_protocol` is the newest protocol version that two independent sources, or one official page, mention in the results and that at least one live result covers. It is set only for current-state questions that name a protocol or a CAP. It describes the evidence, not verified network state.
 - `newest_dated_evidence` lists the three newest dated results among the fifteen best. It is empty for a timeless question.
-- `conflicts` names official pages that still call the target planned while other sources report it live. An official page dated before the newest live report is not a conflict.
+- `conflicts` names official pages that still call the leading protocol planned while other sources report it live. An official page dated before the newest live report is not a conflict.
 
 Options:
 
@@ -105,7 +105,7 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 2. Connectors fetch bounded documents from each selected source in parallel. Registry listings return one roster document with every row plus bounded per-row documents.
 3. Documents are admitted round-robin across sources up to the global limit. Each source keeps its upstream order.
 4. Jev scores each admitted document. Long documents are split into chunks scored in parallel; `probability` is the maximum chunk score and selects the document. When the intent depends on time or version, the same chunk calls also ask whether the text calls the subject live, only planned, superseded, or dated. Those answers come from the best chunk only. Each score keeps the four evidence signals in `signals` as independent per-signal maxima across chunks; they do not describe one jointly supported chunk.
-5. Selected documents are ordered by weighted reciprocal-rank fusion of relevance (the mean of the two best chunk scores, so long documents gain less from more chunks), currentness, recency, authority, and corroboration by independent sources. The intent sets the weights: a timeless question uses relevance and a little authority only. Dates, versions, authority, and corroboration are computed in code, not asked of Jev. For a confident `current` intent, live documents about the target come first and superseded or older-version documents come last. When no official page reaches the compact list, the best one takes its last slot.
+5. Selected documents are ordered by weighted reciprocal-rank fusion of relevance (the mean of the two best chunk scores, so long documents gain less from more chunks), currentness, recency, authority, and corroboration by independent sources. The intent sets the weights: a timeless question uses relevance and a little authority only. Dates, versions, authority, and corroboration are computed in code, not asked of Jev. For a confident `current` intent, live documents about the leading protocol come first and superseded or older-version documents come last. When no official page reaches the compact list, the best one takes its last slot.
 6. Exact duplicates, same URL, title, and text, are scored once. The score, or the failure, is copied to every original ID with its own provenance, so counts and labels do not change.
 
 ## Evidence

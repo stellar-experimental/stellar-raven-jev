@@ -739,7 +739,10 @@ fn leading_target(question: &str, intent: &crate::rank::Intent, evidence: &mut E
         .iter()
         .map(|s| (s.document_id.as_str(), s))
         .collect();
-    let target = (about_versions && intent.asks_currentness())
+    // Only a question about the current state has a meaningful leading version. For a
+    // comparative or versioned question the newest version in the results says nothing about
+    // the network, and agents misread it as the current protocol.
+    let target = (about_versions && intent.kind == "current")
         .then(|| crate::rank::leading_protocol(&selected, &tiers, &scores))
         .flatten();
     evidence.rerank = json!({

@@ -271,7 +271,7 @@ fn currentness(
         let reported_live = titles(live);
         if !official_planned.is_empty() && !reported_live.is_empty() {
             conflicts.push(json!({
-                "target": format!("Protocol {t}"),
+                "protocol": format!("Protocol {t}"),
                 "official_describe_as_planned": official_planned,
                 "others_report_live": reported_live,
             }));
@@ -279,8 +279,8 @@ fn currentness(
     }
     json!({
         "intent": intent,
-        "target": target.map(|t| format!("Protocol {t}")),
-        "target_support_clusters": rerank["target_support_clusters"],
+        "leading_protocol": target.map(|t| format!("Protocol {t}")),
+        "leading_protocol_support_clusters": rerank["target_support_clusters"],
         "assessed_documents": selected
             .iter()
             .filter(|r| r["rank"]["current"].as_object().is_some_and(|c| !c.is_empty()))
