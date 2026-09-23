@@ -82,9 +82,19 @@ struct Ledger {
     stopped: bool,
     authentication_failed: bool,
     unresolved_usage: bool,
-    /// Reservations not yet settled. Every attempt ends in `settle` or a stop flag.
+    /// Reservations not yet settled or retained. Every attempt ends in `settle`,
+    /// `retain_unresolved`, or a stop flag.
     in_flight: u64,
+    /// Unresolved attempts since the last settled one.
+    consecutive_unresolved: u32,
+    /// The unresolved-usage circuit opens at this many consecutive unresolved attempts.
+    unresolved_stop_after: u32,
 }
+
+/// One upstream block page (HTTP 402 wrapping a Cloudflare challenge) used to stop every later
+/// score in a run. Each unresolved attempt still retains its full reservation, so the budget stays
+/// a hard ceiling; three in a row means a systematic failure and stops the client.
+const UNRESOLVED_STOP_AFTER: u32 = 3;
 
 // A dropped future cannot release a possibly spent reservation. This guard also
 // closes the client when a trace write fails after the reservation was made.
@@ -161,6 +171,7 @@ impl JevClient {
             audit_dir,
             ledger: Mutex::new(Ledger {
                 budget_nanos: (config.budget_usd * NANOS_PER_USD).floor() as u64,
+                unresolved_stop_after: UNRESOLVED_STOP_AFTER,
                 ..Ledger::default()
             }),
             settled: tokio::sync::Notify::new(),
@@ -175,7 +186,7 @@ impl JevClient {
             "upstream_attempts_reserved": client.backend.upstream_attempts(),
             "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and Cloudflare credit purchase overhead",
             "proxy_retry_policy": "no client retries; proxy hides upstream status and retry headers",
-            "unresolved_usage_policy": "stop new reservations after any attempt without a valid usage receipt; no automatic retry; retain the full reservation",
+            "unresolved_usage_policy": "retain the full reservation of any attempt without a valid usage receipt; no automatic retry; stop new reservations after 3 consecutive unresolved attempts",
             "token_guard": "UTF-8 byte limits are local guards, not a verified provider tokenizer",
             "retrieved_pricing_date": "2026-09-21"
         }))?;
@@ -477,7 +488,7 @@ impl JevClient {
     }
 
     /// Reserve, and wait while unsettled reservations are what fills the budget. Each in-flight
-    /// attempt ends in `settle` or a stop flag, and both wake this wait. Without this, parallel
+    /// attempt ends in `settle`, `retain_unresolved`, or a stop flag, and each wakes this wait. Without this, parallel
     /// scoring under a small budget failed every document after the first `concurrency` of them.
     async fn reserve_waiting(&self) -> Result<u64> {
         loop {
@@ -544,6 +555,22 @@ impl JevClient {
         }
     }
 
+    /// Retain an attempt's full reservation after an error without a usage receipt. Returns true
+    /// when this opens the unresolved-usage circuit.
+    fn retain_unresolved(&self) -> bool {
+        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        ledger.in_flight = ledger.in_flight.saturating_sub(1);
+        ledger.consecutive_unresolved = ledger.consecutive_unresolved.saturating_add(1);
+        if ledger.consecutive_unresolved >= ledger.unresolved_stop_after.max(1) {
+            ledger.unresolved_usage = true;
+        }
+        let opened = ledger.unresolved_usage;
+        drop(ledger);
+        self.settled.notify_waiters();
+        opened
+    }
+
+    #[cfg(test)]
     fn stop_on_unresolved_usage(&self) {
         self.ledger
             .lock()
@@ -605,6 +632,8 @@ impl JevClient {
         })();
         if result.is_err() {
             ledger.stopped = true;
+        } else {
+            ledger.consecutive_unresolved = 0;
         }
         ledger.in_flight = ledger.in_flight.saturating_sub(1);
         drop(ledger);
@@ -630,8 +659,8 @@ impl JevClient {
             "Jev request exceeds the local byte limit; no request was sent"
         );
         let trace_id = uuid::Uuid::new_v4().to_string();
-        // An error without a usage receipt is terminal, including retryable HTTP
-        // statuses. A new attempt would spend while earlier usage is unresolved.
+        // An error without a usage receipt retains the full reservation and is not retried.
+        // Three such errors in a row open the unresolved-usage circuit (`retain_unresolved`).
         {
             let attempt = 0;
             let reservation = self.reserve_waiting().await?;
@@ -658,8 +687,8 @@ impl JevClient {
             {
                 Ok(response) => response,
                 Err(_) => {
-                    self.stop_on_unresolved_usage();
-                    trace["unresolved_usage_circuit_open"] = json!(true);
+                    let opened = self.retain_unresolved();
+                    trace["unresolved_usage_circuit_open"] = json!(opened);
                     trace["state"] = json!("transport_error_or_incomplete_body");
                     trace["accounting"] =
                         json!("Full reservation retained; provider completion is unknown.");
@@ -675,8 +704,8 @@ impl JevClient {
                 if self.stop_on_authentication_failure(response.status)? {
                     trace["authentication_circuit_open"] = json!(true);
                 }
-                self.stop_on_unresolved_usage();
-                trace["unresolved_usage_circuit_open"] = json!(true);
+                let opened = self.retain_unresolved();
+                trace["unresolved_usage_circuit_open"] = json!(opened);
                 trace["state"] = json!("http_error");
                 trace["accounting"] = json!("Full reservation retained; no usage receipt.");
                 let path = self.write_audit(&audit_name, &trace)?;
@@ -742,8 +771,8 @@ impl JevClient {
                     }
                     trace["state"] = json!("schema_error");
                     if !pending.receipt_accounted {
-                        self.stop_on_unresolved_usage();
-                        trace["unresolved_usage_circuit_open"] = json!(true);
+                        let opened = self.retain_unresolved();
+                        trace["unresolved_usage_circuit_open"] = json!(opened);
                     }
                     trace["validation_error"] = json!(error.to_string());
                     trace["accounting"] =
@@ -1866,6 +1895,40 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn unresolved_attempts_keep_reservations_and_open_the_circuit_after_three_in_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = client(dir.path(), 1.0);
+        client.backend = Backend::TypeSafe {
+            token: "offline-placeholder".into(),
+        };
+        // Two unresolved attempts retain their reservations but do not stop the client.
+        let first = client.reserve().unwrap();
+        assert!(!client.retain_unresolved());
+        let second = client.reserve().unwrap();
+        assert!(!client.retain_unresolved());
+        assert!(client.spending_stop_reason().is_none());
+        // A settled attempt resets the run of failures.
+        let ok = client.reserve().unwrap();
+        client.settle(ok, 1000, 10).unwrap();
+        for _ in 0..2 {
+            client.reserve().unwrap();
+            assert!(!client.retain_unresolved());
+        }
+        // The third consecutive unresolved attempt opens the circuit.
+        client.reserve().unwrap();
+        assert!(client.retain_unresolved());
+        assert!(client
+            .reserve()
+            .unwrap_err()
+            .to_string()
+            .contains("unresolved paid-attempt usage"));
+        let ledger = client.ledger.lock().unwrap();
+        let settled = client.backend.cost_nanos(1000).unwrap();
+        assert_eq!(ledger.accounted_nanos, 5 * first.max(second) + settled);
+        assert_eq!(ledger.in_flight, 0);
+    }
+
     fn client_with_budget_nanos(dir: &Path, nanos: u64) -> JevClient {
         let mut client = client(dir, 0.0);
         client.backend = Backend::TypeSafe {
@@ -2011,6 +2074,8 @@ mod tests {
                     token: TOKEN.into(),
                 };
                 let reservation = candidate.backend.reservation().unwrap();
+                // This test covers the circuit's mechanics, so it opens at the first unresolved attempt.
+                candidate.ledger.lock().unwrap().unresolved_stop_after = 1;
                 let client = Arc::new(candidate);
                 let (first_seen, first_ready) = oneshot::channel();
                 let (release, released) = oneshot::channel();
@@ -2152,6 +2217,7 @@ mod tests {
                 url,
             )
             .unwrap();
+            client.ledger.lock().unwrap().unresolved_stop_after = 1;
             let reservation = client.backend.reservation().unwrap();
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
