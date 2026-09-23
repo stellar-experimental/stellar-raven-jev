@@ -121,9 +121,18 @@ pub fn validate_config(config: &RunConfig) -> Result<()> {
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
     let path = path.as_ref();
     let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
+    std::fs::write(&temporary, serde_json::to_vec(value)?)?;
     std::fs::rename(temporary, path)?;
     Ok(())
+}
+
+/// Fetch order without text: the text of every fetched document is in documents.json or
+/// omitted.json under the namespaced ID `source_id::id`.
+fn retrieved_index(fetched: &[Document]) -> Vec<serde_json::Value> {
+    fetched
+        .iter()
+        .map(|d| json!({"id":d.id,"source_id":d.source_id}))
+        .collect()
 }
 
 fn prepare(question: &str, config: &RunConfig) -> Result<(RunConfig, HttpRecorder)> {
@@ -155,7 +164,7 @@ fn prepare(question: &str, config: &RunConfig) -> Result<(RunConfig, HttpRecorde
     )?;
     write_json(
         config.output_dir.join("retrieved.json"),
-        &Vec::<Document>::new(),
+        &Vec::<serde_json::Value>::new(),
     )?;
     let http = HttpRecorder::new(&config.output_dir, &config)?;
     persist(&config, &Evidence::default(), &Usage::default(), "running")?;
@@ -176,9 +185,13 @@ fn persist(
     )?;
     write_json(root.join("documents.json"), &evidence.documents)?;
     write_json(root.join("scores.json"), &evidence.scores)?;
-    write_json(root.join("selected.json"), &evidence.selected)?;
-    write_json(root.join("rejected.json"), &evidence.rejected)?;
-    write_json(root.join("uncertain.json"), &evidence.uncertain)?;
+    // Each admitted document's text is stored once, in documents.json. The classification
+    // keeps each status list in its original order by ID.
+    let ids = |documents: &[Document]| documents.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+    write_json(
+        root.join("classification.json"),
+        &json!({"selected":ids(&evidence.selected),"uncertain":ids(&evidence.uncertain),"rejected":ids(&evidence.rejected)}),
+    )?;
     write_json(root.join("omitted.json"), &evidence.omitted)?;
     write_json(root.join("failures.json"), &evidence.failures)?;
     write_json(root.join("usage.json"), usage)?;
@@ -191,11 +204,7 @@ fn persist(
         failures: evidence.failures.len(),
         usage: usage.clone(),
     };
-    if status != "running" {
-        crate::export::write_run_index(root)?;
-    }
-    let mut artifacts = Vec::new();
-    collect_artifacts(root, root, &mut artifacts)?;
+    let artifacts = collect_artifacts(root)?;
     write_json(
         root.join("manifest.json"),
         &json!({
@@ -210,30 +219,40 @@ fn persist(
     Ok(outcome)
 }
 
-fn collect_artifacts(
-    root: &Path,
-    directory: &Path,
-    artifacts: &mut Vec<serde_json::Value>,
-) -> Result<()> {
-    let mut entries = std::fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+/// Top-level files with their sizes, and a file count and byte total per directory.
+fn collect_artifacts(root: &Path) -> Result<serde_json::Value> {
+    let mut files = Vec::new();
+    let mut directories = serde_json::Map::new();
+    let mut entries = std::fs::read_dir(root)?.collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_artifacts(root, &path, artifacts)?;
-        } else if path.file_name().is_some_and(|name| name != "manifest.json") {
-            artifacts.push(json!({"path":path.strip_prefix(root)?.to_string_lossy(),"bytes":entry.metadata()?.len()}));
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.path().is_dir() {
+            let (mut count, mut bytes) = (0u64, 0u64);
+            let mut stack = vec![entry.path()];
+            while let Some(directory) = stack.pop() {
+                for child in std::fs::read_dir(directory)? {
+                    let child = child?;
+                    if child.path().is_dir() {
+                        stack.push(child.path());
+                    } else {
+                        count += 1;
+                        bytes += child.metadata()?.len();
+                    }
+                }
+            }
+            directories.insert(name, json!({"files":count,"bytes":bytes}));
+        } else if name != "manifest.json" {
+            files.push(json!({"path":name,"bytes":entry.metadata()?.len()}));
         }
     }
-    Ok(())
+    Ok(json!({"files":files,"directories":directories}))
 }
 
 pub(crate) fn refresh_manifest_artifacts(root: &Path) -> Result<()> {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
-    let mut artifacts = Vec::new();
-    collect_artifacts(root, root, &mut artifacts)?;
-    manifest["artifacts"] = json!(artifacts);
+    manifest["artifacts"] = collect_artifacts(root)?;
     write_json(root.join("manifest.json"), &manifest)
 }
 
@@ -440,7 +459,10 @@ async fn execute(
     }
     drop(jobs);
     // Raw response bodies already preserve each connector's evidence while fetching runs.
-    write_json(config.output_dir.join("retrieved.json"), &fetched)?;
+    write_json(
+        config.output_dir.join("retrieved.json"),
+        &retrieved_index(&fetched),
+    )?;
     evidence
         .timings
         .insert("fetch", run_started.elapsed().as_millis() as u64);
@@ -640,6 +662,26 @@ fn validate_routes(sources: &[Source], scores: &[SourceScore]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Documents for one status, in classification order, from the single document store.
+    fn by_status(directory: &Path, status: &str) -> Vec<Document> {
+        let read = |name: &str| std::fs::read(directory.join(name)).unwrap();
+        let documents: Vec<Document> = serde_json::from_slice(&read("documents.json")).unwrap();
+        let classification: serde_json::Value =
+            serde_json::from_slice(&read("classification.json")).unwrap();
+        classification[status]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| {
+                documents
+                    .iter()
+                    .find(|d| d.id == id.as_str().unwrap())
+                    .unwrap()
+                    .clone()
+            })
+            .collect()
+    }
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Mutex,
@@ -822,7 +864,7 @@ mod tests {
             .unwrap();
             assert_eq!(manifest["config"]["max_documents"], global);
             assert_eq!(manifest["config"]["per_source_documents"], per_source);
-            let retrieved: Vec<Document> = serde_json::from_slice(
+            let retrieved: Vec<serde_json::Value> = serde_json::from_slice(
                 &std::fs::read(outcome.directory.join("retrieved.json")).unwrap(),
             )
             .unwrap();
@@ -851,9 +893,7 @@ mod tests {
             "source-decisions.json",
             "documents.json",
             "scores.json",
-            "selected.json",
-            "rejected.json",
-            "uncertain.json",
+            "classification.json",
             "failures.json",
             "usage.json",
         ] {
@@ -900,10 +940,7 @@ mod tests {
         assert_eq!(backend.scored.load(Ordering::SeqCst), 1);
         let fetched: BTreeSet<_> = backend.fetched.lock().unwrap().iter().cloned().collect();
         assert_eq!(fetched, BTreeSet::from(["a".into(), "b".into()]));
-        let selected: Vec<Document> = serde_json::from_slice(
-            &std::fs::read(outcome.directory.join("selected.json")).unwrap(),
-        )
-        .unwrap();
+        let selected: Vec<Document> = by_status(&outcome.directory, "selected");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].source_id, "b");
         assert_eq!(selected[0].id, "b::same-id");
@@ -945,13 +982,18 @@ mod tests {
         assert_eq!(backend.scored.load(Ordering::SeqCst), 0);
         let fetched: BTreeSet<_> = backend.fetched.lock().unwrap().iter().cloned().collect();
         assert_eq!(fetched, BTreeSet::from(["a".into(), "b".into()]));
+        let classification: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(outcome.directory.join("classification.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            classification,
+            json!({"selected":[],"uncertain":[],"rejected":[]})
+        );
         for name in [
             "retrieved.json",
             "documents.json",
             "scores.json",
-            "selected.json",
-            "uncertain.json",
-            "rejected.json",
             "omitted.json",
             "failures.json",
         ] {
@@ -997,10 +1039,7 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].stage, "fetch_deadline");
         assert_eq!(failures[0].source_id.as_deref(), Some("a"));
-        let selected: Vec<Document> = serde_json::from_slice(
-            &std::fs::read(outcome.directory.join("selected.json")).unwrap(),
-        )
-        .unwrap();
+        let selected: Vec<Document> = by_status(&outcome.directory, "selected");
         assert_eq!(selected[0].source_id, "b");
     }
     #[tokio::test]
@@ -1104,10 +1143,7 @@ mod tests {
             .filter_map(|f| f.source_id.as_deref())
             .collect();
         assert_eq!(failed_sources, BTreeSet::from(["a", "b"]));
-        let uncertain: Vec<Document> = serde_json::from_slice(
-            &std::fs::read(outcome.directory.join("uncertain.json")).unwrap(),
-        )
-        .unwrap();
+        let uncertain: Vec<Document> = by_status(&outcome.directory, "uncertain");
         let sources_seen: BTreeSet<_> = uncertain.iter().map(|d| d.source_id.as_str()).collect();
         assert_eq!(sources_seen, BTreeSet::from(["a", "b"]));
         assert!(uncertain

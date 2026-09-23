@@ -85,19 +85,30 @@ fn agentic_search_filters_before_routing_and_delivers_exact_text() {
         results.len() > 1,
         "The display limit must not cap JSON results"
     );
+    // Each admitted document is stored once; text_path holds its exact text.
+    let documents: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(root.join("documents.json")).unwrap()).unwrap();
     for row in results {
         assert!(eligible.contains(&row["source_id"]));
         let text = std::fs::read_to_string(row["text_path"].as_str().unwrap()).unwrap();
-        let document: Value =
-            serde_json::from_slice(&std::fs::read(row["document_path"].as_str().unwrap()).unwrap())
-                .unwrap();
+        let document = documents.iter().find(|d| d["id"] == row["id"]).unwrap();
         assert_eq!(row["text"], text);
         assert_eq!(document["text"], text);
         assert_eq!(row["text_bytes"], text.len());
+        assert!(row.get("document_path").is_none());
+    }
+    for gone in [
+        "INDEX.md",
+        "documents",
+        "selected.json",
+        "uncertain.json",
+        "rejected.json",
+    ] {
+        assert!(!root.join(gone).exists(), "{gone} is no longer written");
     }
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
-    assert!(manifest["artifacts"]
+    assert!(manifest["artifacts"]["files"]
         .as_array()
         .unwrap()
         .iter()

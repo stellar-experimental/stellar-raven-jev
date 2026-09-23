@@ -3,7 +3,7 @@ use crate::{
     pipeline::RunOutcome,
     types::{Document, DocumentScore, Failure},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, fmt::Write as _, path::Path};
 
@@ -58,6 +58,46 @@ fn validate_variant(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Selected and uncertain documents in their saved order. Current runs store each admitted
+/// document once in documents.json and list IDs by status in classification.json. Runs saved
+/// before that layout keep full documents in selected.json and uncertain.json.
+fn classified(root: &Path) -> Result<Vec<(&'static str, Vec<Document>)>> {
+    let statuses = ["selected", "uncertain"];
+    if !root.join("classification.json").is_file() {
+        return statuses
+            .into_iter()
+            .map(|status| Ok((status, read(root, &format!("{status}.json"))?)))
+            .collect();
+    }
+    let classification: Value = read(root, "classification.json")?;
+    let mut documents: BTreeMap<String, Document> = BTreeMap::new();
+    for document in read::<Vec<Document>>(root, "documents.json")? {
+        let id = document.id.clone();
+        anyhow::ensure!(
+            documents.insert(id.clone(), document).is_none(),
+            "documents.json repeats document {id}"
+        );
+    }
+    statuses
+        .into_iter()
+        .map(|status| {
+            let ids = classification[status]
+                .as_array()
+                .with_context(|| format!("classification.json lacks {status}"))?;
+            let list = ids
+                .iter()
+                .map(|id| {
+                    let id = id.as_str().context("Classification IDs must be strings")?;
+                    documents
+                        .remove(id)
+                        .with_context(|| format!("documents.json lacks classified document {id}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((status, list))
+        })
+        .collect()
+}
+
 /// Rebuild the report from saved documents and scores. With a variant name, output goes to
 /// `search-<variant>.json` and `search-documents-<variant>/`, so the original presentation stays.
 /// This lets a newer ranking be replayed on an older run without new retrieval or scoring.
@@ -91,8 +131,7 @@ pub fn build_report_variant(
     let document_dir = root.join(format!("search-documents{suffix}"));
     std::fs::create_dir_all(&document_dir)?;
     let mut results = Vec::new();
-    for status in ["selected", "uncertain"] {
-        let mut documents: Vec<Document> = read(&root, &format!("{status}.json"))?;
+    for (status, mut documents) in classified(&root)? {
         // Order by usable_evidence, then content completeness, then ID. The rank policy decides
         // whether near-ties count as ties.
         documents.sort_by(|a, b| {
@@ -106,9 +145,7 @@ pub fn build_report_variant(
         for document in documents {
             let number = results.len() + 1;
             let text_path = document_dir.join(format!("{number:04}.txt"));
-            let document_path = document_dir.join(format!("{number:04}.json"));
             std::fs::write(&text_path, &document.text)?;
-            std::fs::write(&document_path, serde_json::to_vec_pretty(&document)?)?;
             let excerpt: String = document.text.chars().take(400).collect();
             let score = scores.get(document.id.as_str());
             let mut row = json!({
@@ -117,7 +154,7 @@ pub fn build_report_variant(
                 "probability":score.map(|s| s.probability),"reason":score.map(|s| &s.reason),
                 "signals":score.map(|s| &s.signals),"signals_aggregation":score.map(|s| &s.signals_aggregation),
                 "excerpt_truncated":excerpt.len() < document.text.len(),"excerpt":excerpt,
-                "text_bytes":document.text.len(),"text_path":text_path,"document_path":document_path,
+                "text_bytes":document.text.len(),"text_path":text_path,
                 "content_scope":content_scope(&document),
             });
             if full_text {
@@ -128,7 +165,7 @@ pub fn build_report_variant(
     }
     let report = json!({
         "schema_version":1,"question":question["question"],"mode":if question["config"]["fixture"] == true {"fixture"} else {"live"},
-        "status":outcome.status,"directory":root,"index_path":root.join("INDEX.md"),
+        "status":outcome.status,"directory":root,
         "report_path":root.join(format!("search{suffix}.json")),"source_scope":scope,
         "replay_variant":variant,"rank_policy":rank_policy,
         "counts":{"selected":outcome.selected,"uncertain":outcome.uncertain,"rejected":outcome.rejected,"omitted":omitted.len(),"reports":failures.len()},
@@ -137,7 +174,7 @@ pub fn build_report_variant(
     });
     std::fs::write(
         root.join(format!("search{suffix}.json")),
-        serde_json::to_vec_pretty(&report)?,
+        serde_json::to_vec(&report)?,
     )?;
     // A replay leaves every frozen input artifact alone, including manifest.json.
     if variant.is_none() {
@@ -246,7 +283,7 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
             "duplicate_urls":duplicate_urls,"uncertain":report["counts"]["uncertain"],
         },
         "report_stage_counts":stages,
-        "full_report_path":report["report_path"],"index_path":report["index_path"],
+        "full_report_path":report["report_path"],
         "limitations":report["limitations"],
     })
 }
@@ -299,7 +336,7 @@ pub fn render_text(report: &Value, limit: usize) -> String {
         for (i, row) in results.iter().take(shown).enumerate() {
             let _ = writeln!(
                 output,
-                "\n{}. {} [{}; score {}]\n   {}\n   Source: {}\n   {}\n   Text: {}\n   Record: {}",
+                "\n{}. {} [{}; score {}]\n   {}\n   Source: {}\n   {}\n   Text: {}",
                 i + 1,
                 field(&row["title"]),
                 field(&row["status"]),
@@ -307,8 +344,7 @@ pub fn render_text(report: &Value, limit: usize) -> String {
                 field(&row["url"]),
                 field(&row["source_id"]),
                 field(row.get("text").unwrap_or(&row["excerpt"])),
-                field(&row["text_path"]),
-                field(&row["document_path"])
+                field(&row["text_path"])
             );
         }
     }
@@ -319,9 +355,8 @@ pub fn render_text(report: &Value, limit: usize) -> String {
     let _ = writeln!(output, "Source responses can contain only summaries or chunks. Read document provenance for content scope.");
     let _ = writeln!(
         output,
-        "Reports: {}/failures.json\nIndex: {}\nJSON: {}\nJev cost: ${}",
+        "Reports: {}/failures.json\nJSON: {}\nJev cost: ${}",
         field(&report["directory"]),
-        field(&report["index_path"]),
         field(&report["report_path"]),
         report["usage"]["cost_usd"]
     );
@@ -421,6 +456,57 @@ mod tests {
             build_report_variant(&outcome, false, Some("t"), RankPolicy::Raw).is_err(),
             "an existing variant is never overwritten"
         );
+    }
+
+    #[test]
+    fn report_reads_the_single_store_by_classification_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |name: &str, value: &Value| {
+            std::fs::write(root.join(name), serde_json::to_vec(value).unwrap()).unwrap()
+        };
+        let doc = |id: &str| {
+            json!({"id":id,"source_id":"s","title":id,"url":format!("https://x/{id}"),
+                   "text":format!("text {id}"),"provenance":{},"raw_artifacts":[]})
+        };
+        write(
+            "question.json",
+            &json!({"question":"q","config":{"fixture":true}}),
+        );
+        write("source-scope.json", &json!({"scope":"all"}));
+        write("scores.json", &json!([]));
+        write("failures.json", &json!([]));
+        write("omitted.json", &json!([]));
+        write("documents.json", &json!([doc("r"), doc("u"), doc("s")]));
+        write(
+            "classification.json",
+            &json!({"selected":["s"],"uncertain":["u"],"rejected":["r"]}),
+        );
+        let outcome = RunOutcome {
+            directory: root.to_path_buf(),
+            status: "complete".into(),
+            selected: 1,
+            rejected: 1,
+            uncertain: 1,
+            failures: 0,
+            usage: Default::default(),
+        };
+        let report = build_report_variant(&outcome, false, Some("n"), RankPolicy::Banded).unwrap();
+        let rows = report["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "rejected documents stay out of the report");
+        assert_eq!(
+            (rows[0]["id"].as_str(), rows[0]["status"].as_str()),
+            (Some("s"), Some("selected"))
+        );
+        assert_eq!(
+            (rows[1]["id"].as_str(), rows[1]["status"].as_str()),
+            (Some("u"), Some("uncertain"))
+        );
+        write(
+            "classification.json",
+            &json!({"selected":["missing"],"uncertain":[],"rejected":[]}),
+        );
+        assert!(build_report_variant(&outcome, false, Some("m"), RankPolicy::Banded).is_err());
     }
 
     #[test]

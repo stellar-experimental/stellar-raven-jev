@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use futures::StreamExt;
 use reqwest::{redirect::Policy, Client, Method, Url};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -11,7 +12,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, sync::Semaphore};
+use tokio::sync::Semaphore;
 
 #[derive(Clone)]
 pub struct HttpRecorder {
@@ -111,9 +112,61 @@ fn write_metadata(path: &Path, value: &Value) -> Result<()> {
     // Async filesystem writes can outlive a canceled future. Keep each small
     // metadata replacement synchronous and atomic to prevent competing writes.
     let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
+    std::fs::write(&temporary, serde_json::to_vec(value)?)?;
     std::fs::rename(temporary, path)?;
     Ok(())
+}
+
+/// Finalizes one raw HTTP record on every exit, including a cancelled request future: it gzips
+/// the retained body, hashes the exact bytes, and only then points the metadata at `.body.gz`.
+struct RawRecord {
+    root: PathBuf,
+    prefix: String,
+    metadata: Value,
+    finished: bool,
+}
+
+impl RawRecord {
+    fn finish(&mut self) -> Result<()> {
+        self.finished = true;
+        let streamed = self.root.join(format!("{}.body", self.prefix));
+        if streamed.is_file() {
+            let bytes = std::fs::read(&streamed)?;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            std::io::Write::write_all(&mut encoder, &bytes)?;
+            let compressed = format!("{}.body.gz", self.prefix);
+            let temporary = self.root.join(format!("{compressed}.tmp"));
+            std::fs::write(&temporary, encoder.finish()?)?;
+            std::fs::rename(&temporary, self.root.join(&compressed))?;
+            self.metadata["body_artifact"] = json!(compressed);
+            self.metadata["body_encoding"] = json!("gzip");
+            self.metadata["body_sha256"] = json!(format!("{:x}", Sha256::digest(&bytes)));
+            write_metadata(
+                &self.root.join(format!("{}.json", self.prefix)),
+                &self.metadata,
+            )?;
+            std::fs::remove_file(&streamed)?;
+        } else {
+            self.metadata["body_artifact"] = Value::Null;
+            write_metadata(
+                &self.root.join(format!("{}.json", self.prefix)),
+                &self.metadata,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RawRecord {
+    fn drop(&mut self) {
+        if !self.finished {
+            if self.metadata["complete"] != true && self.metadata["failure"].is_null() {
+                self.metadata["failure"] = json!("request cancelled before the response ended");
+            }
+            let _ = self.finish();
+        }
+    }
 }
 
 impl HttpRecorder {
@@ -197,23 +250,55 @@ impl HttpRecorder {
         headers: Vec<(String, String)>,
         body: Option<Value>,
     ) -> Result<HttpResponse> {
+        self.request_recorded(method, url, headers, body, true)
+            .await
+    }
+
+    /// For a caller that saves the exact request body in its own audit record (the Jev trace).
+    /// The metadata keeps the body's SHA-256 and size, so the one full copy stays verifiable.
+    pub async fn request_body_recorded_elsewhere(
+        &self,
+        method: Method,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Value>,
+    ) -> Result<HttpResponse> {
+        self.request_recorded(method, url, headers, body, false)
+            .await
+    }
+
+    async fn request_recorded(
+        &self,
+        method: Method,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Value>,
+        record_body: bool,
+    ) -> Result<HttpResponse> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let prefix = format!("raw/{sequence:06}");
         let metadata_path = self.root.join(format!("{prefix}.json"));
-        let body_artifact = format!("{prefix}.body");
-        let mut metadata =
-            json!({"method": method.as_str(), "body_artifact": body_artifact, "complete": false});
+        // The body streams to `.body`. RawRecord gzips it to `.body.gz` when the request ends,
+        // including cancellation, and only then points the metadata at the compressed file.
+        let streaming_artifact = format!("{prefix}.body");
+        let mut record = RawRecord {
+            root: self.root.clone(),
+            prefix: prefix.clone(),
+            metadata: json!({"method": method.as_str(), "body_artifact": streaming_artifact,
+                "body_encoding": "identity", "complete": false}),
+            finished: false,
+        };
         let started = Instant::now();
         let operation = async {
             let parsed = Url::parse(url).context("Invalid request URL")?;
             if !parsed.username().is_empty() || parsed.password().is_some() {
                 bail!("URL credentials are forbidden");
             }
-            metadata["url"] = json!(safe_url(&parsed));
-            metadata["request_header_names"] =
+            record.metadata["url"] = json!(safe_url(&parsed));
+            record.metadata["request_header_names"] =
                 json!(headers.iter().map(|(key, _)| key).collect::<Vec<_>>());
             // Only explicit safe headers retain values. Unknown headers can contain credentials.
-            metadata["request_headers"] = json!(headers
+            record.metadata["request_headers"] = json!(headers
                 .iter()
                 .map(|(key, value)| {
                     let safe = matches!(
@@ -230,7 +315,16 @@ impl HttpRecorder {
                     )
                 })
                 .collect::<std::collections::BTreeMap<_, _>>());
-            metadata["request_body"] = body.as_ref().map(safe_body).unwrap_or(Value::Null);
+            if record_body {
+                record.metadata["request_body"] =
+                    body.as_ref().map(safe_body).unwrap_or(Value::Null);
+            } else if let Some(body) = &body {
+                let bytes = serde_json::to_vec(body)?;
+                record.metadata["request_body_sha256"] =
+                    json!(format!("{:x}", Sha256::digest(&bytes)));
+                record.metadata["request_body_bytes"] = json!(bytes.len());
+                record.metadata["request_body_recorded_in"] = json!("caller audit record");
+            }
             if self.config.fixture {
                 bail!("Network requests are forbidden in fixture mode");
             }
@@ -241,11 +335,11 @@ impl HttpRecorder {
             {
                 bail!("Request URL must use HTTPS");
             }
-            write_metadata(&metadata_path, &metadata)?;
+            write_metadata(&metadata_path, &record.metadata)?;
             let _permit = self.semaphore.acquire().await?;
             // Wall-clock start after the permit, so timelines separate queue wait from transfer.
-            metadata["queued_ms"] = json!(started.elapsed().as_millis() as u64);
-            metadata["started_unix_ms"] = json!(std::time::SystemTime::now()
+            record.metadata["queued_ms"] = json!(started.elapsed().as_millis() as u64);
+            record.metadata["started_unix_ms"] = json!(std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64);
@@ -277,7 +371,7 @@ impl HttpRecorder {
                 .await
                 .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e.without_url()))?;
             let status = response.status().as_u16();
-            metadata["status"] = json!(status);
+            record.metadata["status"] = json!(status);
             let response_headers: std::collections::BTreeMap<String, String> = response
                 .headers()
                 .iter()
@@ -302,8 +396,9 @@ impl HttpRecorder {
                     )
                 })
                 .collect();
-            metadata["response_headers"] = json!(response_headers);
-            let mut file = tokio::fs::File::create(self.root.join(&body_artifact)).await?;
+            record.metadata["response_headers"] = json!(response_headers);
+            // Synchronous chunk writes: a cancelled request leaves no write pending.
+            let mut file = std::fs::File::create(self.root.join(&streaming_artifact))?;
             let mut stream = response.bytes_stream();
             let mut bytes = Vec::new();
             while let Some(chunk) = stream.next().await {
@@ -318,30 +413,30 @@ impl HttpRecorder {
                     counters.1 += retain_count as u64;
                 }
                 let retained = &chunk[..retain_count];
-                file.write_all(retained).await?;
+                std::io::Write::write_all(&mut file, retained)?;
                 bytes.extend_from_slice(retained);
-                metadata["retained_bytes"] = json!(bytes.len());
+                record.metadata["retained_bytes"] = json!(bytes.len());
                 if retain_count < chunk.len().min(available) {
-                    file.flush().await?;
+                    std::io::Write::flush(&mut file)?;
                     bail!("HTTP response byte limit reached; retained body is incomplete");
                 }
                 if chunk.len() > available {
-                    file.flush().await?;
+                    std::io::Write::flush(&mut file)?;
                     bail!(
                         "Response exceeds --max-body-bytes {}; retained body is incomplete",
                         self.config.max_body_bytes
                     );
                 }
             }
-            file.flush().await?;
-            metadata["complete"] = json!(true);
+            std::io::Write::flush(&mut file)?;
+            record.metadata["complete"] = json!(true);
             if (300..400).contains(&status) {
                 bail!("HTTP redirect {status} refused; credentials were not forwarded");
             }
             Ok(HttpResponse {
                 status,
                 body: bytes,
-                artifact: body_artifact,
+                artifact: streaming_artifact.clone(),
                 headers: response_headers,
             })
         };
@@ -355,18 +450,33 @@ impl HttpRecorder {
         } else {
             operation.await
         };
-        metadata["elapsed_ms"] = json!(started.elapsed().as_millis());
+        record.metadata["elapsed_ms"] = json!(started.elapsed().as_millis());
         if let Err(error) = &result {
-            metadata["failure"] = json!(error.to_string());
+            record.metadata["failure"] = json!(error.to_string());
         }
-        write_metadata(&metadata_path, &metadata)?;
-        result
+        record.finish()?;
+        result.map(|mut response| {
+            if let Some(artifact) = record.metadata["body_artifact"].as_str() {
+                response.artifact = artifact.to_owned();
+            }
+            response
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_body(path: &Path) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap()),
+            &mut bytes,
+        )
+        .unwrap();
+        bytes
+    }
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -396,10 +506,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("byte limit"));
-        assert_eq!(
-            std::fs::read(dir.path().join("raw/000000.body")).unwrap(),
-            b"abcd"
-        );
+        assert_eq!(raw_body(&dir.path().join("raw/000000.body.gz")), b"abcd");
         let error = clone
             .request(Method::GET, &url, vec![], None)
             .await
@@ -474,7 +581,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("deadline"));
         assert_eq!(
-            std::fs::read(directory.path().join("raw/000000.body")).unwrap(),
+            raw_body(&directory.path().join("raw/000000.body.gz")),
             b"abc"
         );
         let metadata: Value = serde_json::from_slice(
@@ -485,6 +592,58 @@ mod tests {
         assert_eq!(metadata["retained_bytes"], 3);
         assert!(metadata["failure"].as_str().unwrap().contains("deadline"));
         task.abort();
+    }
+    #[tokio::test]
+    async fn a_cancelled_request_still_finalizes_its_partial_body_and_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut recorder = HttpRecorder::new(directory.path(), &RunConfig::default()).unwrap();
+        recorder.allow_loopback = true;
+        let url = format!("http://{address}");
+        let request = {
+            let recorder = recorder.clone();
+            tokio::spawn(async move { recorder.request(Method::GET, &url, vec![], None).await })
+        };
+        // Wait until the first bytes are on disk, then cancel from outside, as a fetch deadline does.
+        let streamed = directory.path().join("raw/000000.body");
+        for _ in 0..200 {
+            if std::fs::metadata(&streamed)
+                .map(|m| m.len() == 3)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let metadata: Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("raw/000000.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["body_artifact"], "raw/000000.body.gz");
+        assert_eq!(metadata["body_encoding"], "gzip");
+        assert_eq!(metadata["complete"], false);
+        assert!(metadata["failure"].as_str().unwrap().contains("cancelled"));
+        let body = raw_body(&directory.path().join("raw/000000.body.gz"));
+        assert_eq!(body, b"abc");
+        assert_eq!(
+            metadata["body_sha256"],
+            format!("{:x}", Sha256::digest(&body))
+        );
+        assert!(!streamed.exists(), "the uncompressed copy is removed");
+        server.abort();
     }
     #[tokio::test]
     async fn preserves_retry_after_ms_and_filters_unsafe_response_headers() {
@@ -535,7 +694,7 @@ mod tests {
         let metadata = std::fs::read_to_string(dir.path().join("raw/000000.json")).unwrap();
         assert!(!metadata.contains("secret"));
         assert_eq!(
-            std::fs::read(dir.path().join(response.artifact)).unwrap(),
+            raw_body(&dir.path().join(&response.artifact)),
             b"upstream error"
         );
     }
@@ -580,11 +739,9 @@ mod tests {
         assert_eq!(metadata["complete"], false);
         assert_eq!(metadata["retained_bytes"], 3);
         assert_eq!(metadata["failure"], error.to_string());
-        assert_eq!(metadata["body_artifact"], "raw/000000.body");
-        assert_eq!(
-            std::fs::read(dir.path().join("raw/000000.body")).unwrap(),
-            b"abc"
-        );
+        assert_eq!(metadata["body_artifact"], "raw/000000.body.gz");
+        assert_eq!(metadata["body_encoding"], "gzip");
+        assert_eq!(raw_body(&dir.path().join("raw/000000.body.gz")), b"abc");
     }
     #[tokio::test]
     async fn malformed_json_preserves_complete_body_and_reports_parse_failure() {
@@ -604,7 +761,7 @@ mod tests {
             .to_string()
             .contains("Response is not valid JSON"));
         assert_eq!(
-            std::fs::read(dir.path().join(&response.artifact)).unwrap(),
+            raw_body(&dir.path().join(&response.artifact)),
             response.body
         );
         let metadata: Value =
@@ -629,10 +786,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("redirect"));
-        assert_eq!(
-            std::fs::read(dir.path().join("raw/000000.body")).unwrap(),
-            b"move"
-        );
+        assert_eq!(raw_body(&dir.path().join("raw/000000.body.gz")), b"move");
     }
     #[tokio::test]
     async fn oversized_body_is_an_explicit_recorded_failure() {
@@ -654,9 +808,6 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("raw/000000.json")).unwrap())
                 .unwrap();
         assert_eq!(metadata["complete"], false);
-        assert_eq!(
-            std::fs::read(dir.path().join("raw/000000.body")).unwrap(),
-            b"abc"
-        );
+        assert_eq!(raw_body(&dir.path().join("raw/000000.body.gz")), b"abc");
     }
 }

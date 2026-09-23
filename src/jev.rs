@@ -377,7 +377,7 @@ impl JevClient {
     fn write_audit(&self, name: &str, data: &Value) -> Result<String> {
         let filename = format!("{name}.json");
         let path = self.audit_dir.join(&filename);
-        let bytes = serde_json::to_vec_pretty(data)?;
+        let bytes = serde_json::to_vec(data)?;
         std::fs::write(path, bytes).context("Cannot save the Jev audit trace")?;
         Ok(format!("jev/{filename}"))
     }
@@ -574,7 +574,7 @@ impl JevClient {
             self.write_audit(&audit_name, &trace)?;
             let response = match self
                 .http
-                .request(
+                .request_body_recorded_elsewhere(
                     reqwest::Method::POST,
                     &url,
                     headers.clone(),
@@ -1676,10 +1676,16 @@ mod tests {
                 assert_eq!(failed["authentication_circuit_open"] == true, matches!(status, 401 | 403));
                 assert_eq!(failed["unresolved_usage_circuit_open"], true);
                 assert_eq!(failed["reservation_usd"], reservation as f64 / NANOS_PER_USD);
-                let raw = dir.path().join(failed["response_artifact"].as_str().unwrap());
-                assert_eq!(std::fs::read(&raw).unwrap(), ERROR_BODY.as_bytes());
+                let artifact = failed["response_artifact"].as_str().unwrap();
+                let mut body = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut flate2::read::GzDecoder::new(std::fs::File::open(dir.path().join(artifact)).unwrap()),
+                    &mut body,
+                )
+                .unwrap();
+                assert_eq!(body, ERROR_BODY.as_bytes());
                 let metadata: Value = serde_json::from_slice(
-                    &std::fs::read(raw.with_extension("json")).unwrap(),
+                    &std::fs::read(dir.path().join(artifact.replace(".body.gz", ".json"))).unwrap(),
                 ).unwrap();
                 assert_eq!(metadata["status"], status);
                 assert_eq!(metadata["complete"], true);

@@ -96,7 +96,7 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 - When attempts still in flight fill the budget, the next attempt waits for one to settle. It fails at once only when nothing is in flight.
 - An attempt that ends without a usage receipt (an HTTP error, a transport error, or an invalid body) keeps its full reservation as spent and is not retried. After 3 such attempts in a row, the client stops new attempts for the run. A settled attempt resets the count.
 - HTTP 401 or 403 stops the client at once.
-- A document whose scoring fails goes to `uncertain.json` with a `failures.json` entry.
+- A document whose scoring fails is listed as `uncertain` in `classification.json`, with a `failures.json` entry.
 
 ## How a run works
 
@@ -109,7 +109,23 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 
 ## Evidence
 
-Every run writes a directory with `manifest.json`, `INDEX.md`, readable `documents/*.md`, `search.json`, `routes.json`, `source-decisions.json`, `documents.json`, `scores.json`, `selected.json`, `uncertain.json`, `rejected.json`, `omitted.json`, `failures.json`, `usage.json`, `raw/*` HTTP bodies with credential-free request metadata, and `jev/` audit traces for every paid attempt.
+Every run writes one directory for agents and later review. It has no human-oriented copies. All JSON is compact.
+
+| Path | Holds |
+|---|---|
+| `question.json`, `query-plan.json`, `sources.json`, `source-scope.json` | The question and configuration, keyword variants, the source catalog, and the eligible scope |
+| `routes.json`, `source-decisions.json` | Every routing verdict and which sources were fetched |
+| `retrieved.json` | Every fetched document in fetch order, as `{id, source_id}`; its text is under ID `source_id::id` |
+| `documents.json` | Each admitted document once, with its exact text and provenance |
+| `classification.json` | Selected, uncertain, and rejected document IDs, each list in order |
+| `omitted.json` | Full documents cut before scoring (duplicate IDs or the `--max-documents` limit) |
+| `scores.json`, `failures.json`, `usage.json` | Jev scores and signals, every report entry, and accounted cost |
+| `search.json`, `search-documents/NNNN.txt` | The ranked report and the exact text files that `text_path` points to |
+| `raw/NNNNNN.body.gz`, `raw/NNNNNN.json` | Each HTTP response, gzipped with the SHA-256 of the exact bytes, and credential-free request metadata. A Jev request body is saved once, in its Jev trace; its metadata keeps the body hash. |
+| `jev/` | One audit trace per paid attempt (request, reservation, receipt, answers) and one chunk record per document |
+| `manifest.json` | The outcome, configuration, `phase_ms` timings, and file and byte totals |
+
+`report` also replays runs saved before this layout, which used `selected.json` and `uncertain.json`.
 `manifest.json` records `phase_ms` for routing, fetching, scoring, and finalization.
 Run directories use owner-only permissions on Unix. Raw responses can contain private source content.
 
