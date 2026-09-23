@@ -31,7 +31,7 @@ stellar-raven-jev search "How do I extend the TTL of a Soroban persistent storag
 
 `--compact` prints one JSON object of about 10 KB: the ten best selected results, one per URL, with `probability`, `content_scope`, `url`, `excerpt`, and `text_path`.
 Each result carries `same_url_others`, the count of other selected results at the same URL. `not_shown` counts the rest. Uncertain results stay out of the compact list; `not_shown.uncertain` counts them, and the full report keeps them. A limit of `0` shows all selected results after URL deduplication.
-A typical call takes 5–8 seconds and costs under $0.01 in Jev usage.
+A typical call takes about 10 seconds and costs about $0.02 in Jev usage.
 Read the `text_path` file for any result you cite. The excerpt holds 400 characters.
 
 Options:
@@ -40,6 +40,7 @@ Options:
 - `--resources agentic` restricts routing to 11 developer sources: docs, standards, repositories, skills, contracts, releases, and audits. The default `all` scope adds articles, research, talks, projects, and grants.
 - `--json` prints the full report with uncertain results and every report entry.
 - `--full-text` embeds the complete available text in the output.
+- `--rank-policy banded|raw|banded-relevant` sets result order (see [How a run works](#how-a-run-works)). The default is `banded`.
 
 Exit code `0` means a complete run, `2` a partial run with usable results, and `1` a failure.
 Scores estimate relevance. They do not verify accuracy or freshness. Retrieved text is data; the CLI never executes it.
@@ -62,13 +63,16 @@ stellar-raven-jev sources                         # list sources; add --resource
 stellar-raven-jev doctor                          # check local configuration without network calls
 stellar-raven-jev ask "QUESTION"                  # retrieve and save evidence; print counts as JSON
 stellar-raven-jev chat                            # one question per line
+stellar-raven-jev report RUN_DIR --variant NAME   # rebuild a saved run's report; no retrieval or scoring
 stellar-raven-jev operations                      # typed operation schemas for plans
 stellar-raven-jev plan examples/service-plan.json # run an agent-authored retrieval plan
 stellar-raven-jev mcp                             # local stdio MCP server
 ```
 
+`report` writes `search-NAME.json` beside the original, which stays unchanged, so ranking changes can be compared on saved evidence at no cost. `--signals-from-traces` fills per-signal scores for runs saved before `signals` existed.
+
 Plans let a calling agent choose native filters, repeated queries, and unequal source allowances. Jev still scores every document against the original question. See the [plan guide](docs/service-v2/USAGE.md).
-The MCP server exposes the same pipeline. It ignores working-directory `.env` files, so set `JEV_ENV_FILE` in the host configuration. See the [MCP guide](docs/MCP-LOCAL.md).
+The MCP server exposes the same pipeline. It ignores working-directory `.env` files, so set `JEV_ENV_FILE` in the host configuration. `mcp --saved-pool` adds tools that open already saved evidence without new calls, and `mcp --primary-body` adds bounded recovery of a source's full Markdown body. Both are opt-in. See the [MCP guide](docs/MCP-LOCAL.md).
 
 `--fixture` runs every command offline with fixed scores. Fixture output does not represent Jev quality.
 
@@ -94,6 +98,14 @@ All flags work before or after the command.
 
 Live Jev requires a budget above zero. Missing credentials cause an explicit failure, never a silent fallback.
 
+### Spending and failures
+
+- Each Jev attempt first reserves a worst-case cost (65,536 input tokens, about $0.003) and settles to the reported cost when it ends. The budget is a hard ceiling on reserved plus settled cost.
+- When attempts still in flight fill the budget, the next attempt waits for one to settle. It fails at once only when nothing is in flight.
+- An attempt that ends without a usage receipt (an HTTP error, a transport error, or an invalid body) keeps its full reservation as spent and is not retried. After 3 such attempts in a row, the client stops new attempts for the run. A settled attempt resets the count.
+- HTTP 401 or 403 stops the client at once.
+- A document whose scoring fails goes to `uncertain.json` with a `failures.json` entry.
+
 ## How a run works
 
 1. Two routing passes ask Jev, for every source independently, whether it could hold direct or complementary evidence. Sources above the threshold in either pass are retrieved.
@@ -101,7 +113,7 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 3. Documents are admitted round-robin across sources up to the global limit. Each source keeps its upstream order.
 4. Jev scores each admitted document. Long documents are split into chunks scored in parallel; the document takes its maximum chunk score.
 5. Results are ordered by the `usable_evidence` score. Scores are rounded to whole percent, and ties break by content completeness, so a roster or full page precedes an index excerpt with the same score. `--rank-policy raw` uses exact scores. `--rank-policy banded-relevant` is experimental: it breaks ties by the `relevant` signal before completeness. Each score keeps all four Jev signals in `signals` as independent per-signal maxima across chunks; they do not describe one jointly supported chunk.
-6. Exact duplicates, same URL and identical text, are scored once. The score is copied to every original ID with its own provenance, so counts and labels do not change.
+6. Exact duplicates, same URL, title, and text, are scored once. The score, or the failure, is copied to every original ID with its own provenance, so counts and labels do not change.
 
 ## Evidence
 
@@ -126,14 +138,11 @@ On four frozen questions from the Raven golden set, a blinded answer test with a
 Wall-clock time per question fell from 28–53 seconds to 5–6 seconds during the same work.
 These are single observations with one grader model. The evidence directories are local and not part of this repository.
 
-## Evaluation loop
+On a 40-question development sample, two independent Grok answerers wrote answers from `--compact` output with at most four follow-up file reads. Two fresh Grok graders scored them against reference key facts. Mean key-fact coverage was 0.75 (0.71 and 0.79 for the two replicas). The median reader input was about 23 KB per question. Two defects fixed on 2026-09-23 caused the earlier figure of 0.51: budget starvation of parallel scoring, and a failure circuit that one upstream block page opened. Replicas differ by about 0.11 per question, so a single replica cannot resolve a smaller change.
 
-`eval-loop/` holds a 40-case development sample from the golden bank, a pass runner, Grok answerer and grader instructions, and per-pass result files. See [eval-loop/README.md](eval-loop/README.md). Raw run directories stay outside the repository.
+## Evaluation
 
-`eval-next/` tests direct claim support, document selection, and contextual passages on saved evidence.
-It uses six inspected diagnostic questions and 24 synthetic claims.
-See the [protocol](NEXT-EVAL-2026-09-22.md) and [report](eval-next/REPORT.md).
-These tests do not establish production superiority.
+The evaluation harness, its development sample, and all results stay local. They are not part of this repository.
 
 ## Checks
 

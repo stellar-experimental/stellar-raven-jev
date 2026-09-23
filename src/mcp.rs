@@ -1612,6 +1612,7 @@ fn known_usage(root: &Path, usage: &Usage, fixture: bool) -> Result<bool> {
     }
     direct_directory(root, &directory)?;
     let mut attempts = 0;
+    let mut retained_usd = 0.0;
     for entry in std::fs::read_dir(&directory)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1621,13 +1622,30 @@ fn known_usage(root: &Path, usage: &Usage, fixture: bool) -> Result<bool> {
         }
         attempts += 1;
         let trace: Value = artifact(&directory, name)?;
-        let complete = trace["state"] == "complete"
-            || (trace["state"] == "schema_error" && trace["usage_receipt_accounted"] == true);
-        if !complete || trace["accounting_error"] == true || trace["backend"] == "jev_proxy" {
+        if trace["accounting_error"] == true || trace["backend"] == "jev_proxy" {
             return Ok(false);
         }
+        let complete = trace["state"] == "complete"
+            || (trace["state"] == "schema_error" && trace["usage_receipt_accounted"] == true);
+        if complete {
+            continue;
+        }
+        // A finished direct attempt without a receipt keeps its full reservation in the run's
+        // usage. That reservation covers the whole request (one upstream attempt, a request far
+        // below the reserved tokens), so it is a known upper bound the session can charge.
+        // Unfinished attempts ("reserved") and the proxy, which can hide retries, stay unknown.
+        let finished_without_receipt = matches!(
+            trace["state"].as_str(),
+            Some("http_error" | "transport_error_or_incomplete_body" | "schema_error")
+        );
+        match trace["reservation_usd"].as_f64() {
+            Some(reservation) if finished_without_receipt && reservation > 0.0 => {
+                retained_usd += reservation
+            }
+            _ => return Ok(false),
+        }
     }
-    Ok(attempts == usage.requests)
+    Ok(attempts == usage.requests && usage.cost_usd + 1e-12 >= retained_usd)
 }
 
 /// Serve one local client. The supplied budget covers the whole process session.
@@ -3210,19 +3228,60 @@ mod tests {
     }
 
     #[test]
-    fn retained_error_reservations_do_not_prove_final_provider_usage() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        let usage = Usage {
-            requests: 2,
-            cost_usd: 0.01,
-            ..Default::default()
+    fn retained_direct_error_reservations_are_a_known_upper_bound_but_other_gaps_are_not() {
+        let check = |first: Value, cost: f64| {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let usage = Usage {
+                requests: 2,
+                cost_usd: cost,
+                ..Default::default()
+            };
+            std::fs::write(root.join("usage.json"), serde_json::to_vec(&usage).unwrap()).unwrap();
+            std::fs::create_dir(root.join("jev")).unwrap();
+            std::fs::write(
+                root.join("jev/test-attempt-0.json"),
+                serde_json::to_vec(&first).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(root.join("jev/test-attempt-1.json"),serde_json::to_vec(&json!({"state":"complete","backend":"typesafe","http_status":200,"reservation_usd":0.003})).unwrap()).unwrap();
+            known_usage(&root, &usage, false).unwrap()
         };
-        std::fs::write(root.join("usage.json"), serde_json::to_vec(&usage).unwrap()).unwrap();
-        std::fs::create_dir(root.join("jev")).unwrap();
-        for (attempt, state) in [(0, "http_error"), (1, "complete")] {
-            std::fs::write(root.join(format!("jev/test-attempt-{attempt}.json")),serde_json::to_vec(&json!({"state":state,"backend":"typesafe","http_status":if attempt==0 {429} else {200},"reservation_usd":0.003})).unwrap()).unwrap();
+        // A finished direct error whose reservation is inside the run's usage: bounded, known.
+        for state in [
+            "http_error",
+            "transport_error_or_incomplete_body",
+            "schema_error",
+        ] {
+            assert!(
+                check(
+                    json!({"state":state,"backend":"typesafe","http_status":402,"reservation_usd":0.003}),
+                    0.01
+                ),
+                "{state}"
+            );
         }
-        assert!(!known_usage(&root, &usage, false).unwrap());
+        // Usage that does not include the retained reservation is inconsistent.
+        assert!(!check(
+            json!({"state":"http_error","backend":"typesafe","reservation_usd":0.003}),
+            0.002
+        ));
+        // An unfinished attempt, a missing reservation, the proxy, and accounting errors stay unknown.
+        assert!(!check(
+            json!({"state":"reserved","backend":"typesafe","reservation_usd":0.003}),
+            0.01
+        ));
+        assert!(!check(
+            json!({"state":"http_error","backend":"typesafe"}),
+            0.01
+        ));
+        assert!(!check(
+            json!({"state":"http_error","backend":"jev_proxy","reservation_usd":0.0145}),
+            0.02
+        ));
+        assert!(!check(
+            json!({"state":"complete","backend":"typesafe","accounting_error":true,"reservation_usd":0.003}),
+            0.01
+        ));
     }
 }

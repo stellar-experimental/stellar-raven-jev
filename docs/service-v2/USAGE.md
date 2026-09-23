@@ -112,15 +112,16 @@ Transport overhead and discarded excess bytes are outside that byte count.
 `deadline_secs` stops network waits and document scoring.
 Authentication startup and final artifact saves can finish after that deadline.
 `max_spend_usd` limits the plan's Jev allocation within the CLI or MCP allocation.
-Unknown paid-request usage retains its reservation.
-The Jev client then blocks new reservations, including retries without a valid usage receipt.
-This applies to HTTP errors, transport failures, missing usage, and cancellation after reservation.
+Unknown paid-request usage retains its full reservation. The request is not retried.
+This applies to HTTP errors, transport failures, and missing usage.
+After 3 such requests in a row, the Jev client blocks new reservations. A settled request resets the count.
+Cancellation after reservation, and HTTP 401 or 403, block new reservations at once.
 Previously reserved requests can still start or finish, including requests waiting for HTTP capacity.
 They can record valid receipts and settle their existing reservations.
 A typed plan skips later source calls after the client stops.
 It preserves fetched documents, omissions, failures, and unscored documents with the stop reason.
 A malformed answer with valid accounted usage does not itself imply unknown spending.
-The MCP server also blocks later spending when it cannot reconcile usage.
+The MCP server blocks later spending when it cannot reconcile usage. It charges a retained direct-backend reservation as a known upper bound and continues.
 
 `max_documents` limits distinct document score admissions across the plan.
 Each call has its own document allowance and page allowance.

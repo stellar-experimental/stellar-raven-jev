@@ -98,10 +98,11 @@ The transport follows the official [stdio](https://modelcontextprotocol.io/speci
 Its UTF-8 size cannot exceed 16,384 bytes.
 `budget_usd` is optional.
 No other arguments are accepted.
-The `0.5` example supports initial reservations but does not guarantee complete retrieval.
-Four concurrent direct requests need about $0.0116 in available reservations.
+A typical live call settles at about $0.02 and scores up to 400 documents.
+Each direct attempt reserves about $0.0029 until it settles; the 16 parallel scoring jobs therefore hold up to about $0.046 at once.
+With a smaller call budget, scoring waits for reservations to settle instead of failing, so the call runs slower but completes.
 One proxy request reserves about $0.0145 because the proxy can hide retries.
-The actual run can require more budget.
+A call budget of $0.10 or more avoids waits for direct backends.
 The caller cannot change the output directory or increase retrieval limits.
 
 The result includes counts, selected evidence, uncertain evidence, gaps, failures, usage, and the remaining session budget.
@@ -144,15 +145,16 @@ Fixture calls can use a zero allocation.
 
 The server compares `usage.json` with the returned pipeline usage.
 It checks every Jev attempt record before it releases the allocation.
-Missing receipts, incomplete attempts, and accounting errors block further session spending.
+Incomplete attempts, a usage mismatch, and accounting errors block further session spending.
 A pipeline error before finalization also blocks further spending.
 The reserved allocation remains unavailable when usage is unknown.
 
+With a direct backend (Cloudflare or TypeSafe), a finished attempt without a usage receipt keeps its full reservation.
+That reservation covers the whole request, so the session charges it as a known upper bound and continues.
+Upstream block pages return HTTP 402 on a small share of calls, so this keeps a session usable.
+Within one call, the Jev client stops new attempts after 3 consecutive unresolved attempts.
 The proxy hides possible upstream retries.
 A proxy call therefore blocks further session spending, even when its response succeeds.
-Direct provider receipts can permit another call within the remaining budget.
-A retained error reservation bounds cost but does not prove finalized provider usage.
-An HTTP error therefore blocks later spending, even when a subsequent retry succeeds.
 Restarting the process creates a new explicit session allocation.
 Operators must account for previous sessions before they restart live work.
 
