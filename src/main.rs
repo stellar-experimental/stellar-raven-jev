@@ -40,8 +40,8 @@ struct Cli {
     jev_hedge_ms: u64,
     #[arg(long, global = true, hide = true, default_value_t = 2)]
     max_pages: usize,
-    /// Scoring admission limit across all sources. The default is above the largest fetch seen
-    /// in the 40-case development pass (342), so every fetched document is normally scored.
+    /// Scoring admission limit across all sources. It is an operating budget, set high enough that
+    /// every fetched document is normally scored.
     #[arg(long, global = true, hide = true, default_value_t = 400)]
     max_documents: usize,
     #[arg(long, global = true, hide = true, default_value_t = 12)]

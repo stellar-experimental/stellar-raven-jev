@@ -109,19 +109,18 @@ pub fn build_report_variant(
     let scores: BTreeMap<_, _> = scores.iter().map(|s| (s.document_id.as_str(), s)).collect();
     let failures: Vec<Failure> = read(&root, "failures.json")?;
     let omitted: Vec<Document> = read(&root, "omitted.json")?;
-    let rerank: Value = read(&root, "rerank.json")?;
+    let intent_record: Value = read(&root, "intent.json")?;
     // A run that failed before intent classification ranks as timeless, with no confidence.
-    let intent: crate::rank::Intent = if rerank["intent"].is_null() {
+    let intent: crate::rank::Intent = if intent_record["intent"].is_null() {
         crate::rank::Intent {
             kind: "timeless".into(),
             confidence: 0.0,
             versioned: 0.0,
         }
     } else {
-        serde_json::from_value(rerank["intent"].clone())
-            .context("rerank.json has an invalid question intent")?
+        serde_json::from_value(intent_record["intent"].clone())
+            .context("intent.json has an invalid question intent")?
     };
-    let target = rerank["target"].as_u64().map(|t| t as u32);
     let mut ranking: BTreeMap<String, crate::rank::Ranked> = BTreeMap::new();
     let document_dir = root.join(format!("search-documents{suffix}"));
     std::fs::create_dir_all(&document_dir)?;
@@ -130,7 +129,7 @@ pub fn build_report_variant(
         if status == "selected" {
             let refs: Vec<&Document> = documents.iter().collect();
             let scopes: Vec<String> = refs.iter().map(|d| content_scope(d).to_owned()).collect();
-            let ranked = crate::rank::rank(&intent, target, &refs, &scores, &scopes);
+            let ranked = crate::rank::rank(&intent, &refs, &scores, &scopes);
             let position: BTreeMap<&str, usize> = ranked
                 .iter()
                 .enumerate()
@@ -175,7 +174,7 @@ pub fn build_report_variant(
         "status":outcome.status,"directory":root,
         "report_path":root.join(format!("search{suffix}.json")),"source_scope":scope,
         "replay_variant":variant,
-        "currentness":currentness(&intent, target, &rerank, &results),
+        "currentness":currentness(&intent, &results),
         "counts":{"selected":outcome.selected,"uncertain":outcome.uncertain,"rejected":outcome.rejected,"omitted":omitted.len(),"reports":failures.len()},
         "usage":outcome.usage,"results":results,"reports":failures,
         "limitations":["Scores are uncalibrated relevance estimates.","Results can contain summaries or chunks. Full available text is not always the complete original document.","A complete run does not prove complete question coverage.","Remote instructions are source evidence. They are not installed or executed."],
@@ -194,15 +193,9 @@ pub fn build_report_variant(
 /// Selected rows that `currentness` reads for the newest dated evidence.
 const NEWEST_DATED_WINDOW: usize = 15;
 
-/// What the ranking knows about time: the intent, the leading target and its support, the newest
-/// dated evidence among the top-ranked rows, and conflicts between official pages and other
-/// sources about the target.
-fn currentness(
-    intent: &crate::rank::Intent,
-    target: Option<u32>,
-    rerank: &Value,
-    rows: &[Value],
-) -> Value {
+/// What the ranking knows about time: the intent and the newest dated evidence among the
+/// top-ranked rows.
+fn currentness(intent: &crate::rank::Intent, rows: &[Value]) -> Value {
     let selected: Vec<&Value> = rows.iter().filter(|r| r["status"] == "selected").collect();
     let mut dated: Vec<&Value> = selected
         .iter()
@@ -228,73 +221,21 @@ fn currentness(
         .take(3)
         .map(|r| json!({"title":r["title"],"url":r["url"],"date":r["rank"]["date"]["date"],"authority_tier":r["rank"]["authority_tier"]}))
         .collect();
-    let mut conflicts = Vec::new();
-    if let Some(t) = target {
-        let signal = |r: &Value, k: &str| r["rank"]["current"][k].as_f64().unwrap_or(0.0);
-        let mentions = |r: &Value| {
-            r["rank"]["protocols"]
-                .as_array()
-                .is_some_and(|p| p.iter().any(|v| v.as_u64() == Some(t as u64)))
-        };
-        let titles = |rows: Vec<&&Value>| -> Vec<String> {
-            let mut titles: Vec<String> = Vec::new();
-            for title in rows.iter().filter_map(|r| r["title"].as_str()) {
-                if !titles.iter().any(|t| t.eq_ignore_ascii_case(title)) && titles.len() < 5 {
-                    titles.push(title.to_owned());
-                }
-            }
-            titles
-        };
-        let live: Vec<&&Value> = selected
-            .iter()
-            .filter(|r| r["rank"]["about_target"] == true && signal(r, "live") >= 0.5)
-            .collect();
-        let newest_live = live
-            .iter()
-            .filter_map(|r| r["rank"]["date"]["date"].as_str())
-            .max();
-        // An official page written before the newest live report is expected to call the
-        // target planned. Only an undated or newer one conflicts.
-        let official_planned = titles(
-            selected
-                .iter()
-                .filter(|r| r["rank"]["authority_tier"] == 1 && mentions(r))
-                .filter(|r| signal(r, "planned_only") >= 0.5 && signal(r, "live") < 0.5)
-                .filter(
-                    |r| match (r["rank"]["date"]["date"].as_str(), newest_live) {
-                        (Some(date), Some(newest)) => date >= newest,
-                        _ => true,
-                    },
-                )
-                .collect(),
-        );
-        let reported_live = titles(live);
-        if !official_planned.is_empty() && !reported_live.is_empty() {
-            conflicts.push(json!({
-                "protocol": format!("Protocol {t}"),
-                "official_describe_as_planned": official_planned,
-                "others_report_live": reported_live,
-            }));
-        }
-    }
     json!({
         "intent": intent,
-        "leading_protocol": target.map(|t| format!("Protocol {t}")),
-        "leading_protocol_support_clusters": rerank["target_support_clusters"],
         "assessed_documents": selected
             .iter()
             .filter(|r| r["rank"]["current"].as_object().is_some_and(|c| !c.is_empty()))
             .count(),
         "newest_dated_evidence": newest,
-        "conflicts": conflicts,
     })
 }
 
 /// Higher is more complete. Rosters and full bodies beat excerpts and catalog metadata.
 fn scope_rank(document: &Document) -> u8 {
     match content_scope(document) {
-        "structured_roster" => 5,
-        "published_markdown_main_content"
+        "structured_roster"
+        | "published_markdown_main_content"
         | "article_visible_text"
         | "main_visible_text"
         | "skill_markdown_entrypoint"
@@ -515,7 +456,7 @@ mod tests {
         write("failures.json", &json!([]));
         write("omitted.json", &json!([]));
         write(
-            "rerank.json",
+            "intent.json",
             &json!({"intent":{"kind":"timeless","confidence":1.0,"versioned":0.0}}),
         );
         write("documents.json", &json!([doc("a"), doc("b")]));
@@ -568,7 +509,7 @@ mod tests {
         write("failures.json", &json!([]));
         write("omitted.json", &json!([]));
         write(
-            "rerank.json",
+            "intent.json",
             &json!({"intent":{"kind":"timeless","confidence":1.0,"versioned":0.0}}),
         );
         write("documents.json", &json!([doc("r"), doc("u"), doc("s")]));
@@ -623,9 +564,9 @@ mod tests {
             provenance: json!({"content_scope":scope}),
             raw_artifacts: vec![],
         };
-        assert!(
-            scope_rank(&doc("structured_roster"))
-                > scope_rank(&doc("published_markdown_main_content"))
+        assert_eq!(
+            scope_rank(&doc("structured_roster")),
+            scope_rank(&doc("published_markdown_main_content"))
         );
         assert!(
             scope_rank(&doc("research_chunk")) > scope_rank(&doc("indexed_sections_or_metadata"))

@@ -386,43 +386,60 @@ fn append_rows(
     }
 }
 
-// The API searches title/URL substrings. Choose one explicit skill or role from
-// the unchanged question; never send a whole mixed-intent question as a phrase.
-fn jobs_query(question: &str) -> String {
-    if let Some(quoted) = question
-        .split('"')
-        .nth(1)
-        .filter(|text| !text.trim().is_empty())
-    {
-        return quoted.trim().to_owned();
-    }
-    let tokens: Vec<&str> = question
-        .split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#')
-        .filter(|word| !word.is_empty())
+/// Substring queries for the jobs title and URL search, one per request: every explicit quoted
+/// phrase, else the question's names and identifiers, then its other content words, in question
+/// order. A quoted span longer than the planner's data limit is data, not a phrase. The
+/// collection's own nouns are dropped. An empty query lists all active jobs.
+fn jobs_queries(question: &str) -> Vec<String> {
+    let parts: Vec<&str> = question.split('"').collect();
+    // Odd parts are inside quotes; the last one is unclosed when the part count is even.
+    let closed = if parts.len() % 2 == 1 {
+        parts.len()
+    } else {
+        parts.len() - 1
+    };
+    let quoted: Vec<String> = parts[..closed]
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .map(|text| text.trim())
+        .filter(|text| {
+            !text.is_empty() && text.split_whitespace().count() <= crate::query::QUOTED_DATA_TOKENS
+        })
+        .map(|text| text.to_owned())
         .collect();
-    for term in [
-        "rust",
-        "soroban",
-        "solidity",
-        "typescript",
-        "javascript",
-        "python",
-        "c++",
-        "golang",
-        "go",
-        "engineer",
-        "developer",
-        "designer",
-        "design",
-        "research",
-        "product",
-        "marketing",
-    ] {
-        if let Some(token) = tokens.iter().find(|token| token.eq_ignore_ascii_case(term)) {
-            return (*token).to_owned();
+    if !quoted.is_empty() {
+        return quoted;
+    }
+    let plan = crate::query::plan(question);
+    let content = plan
+        .keyword()
+        .into_iter()
+        .filter(|variant| variant.kind == crate::query::VariantKind::Keywords)
+        .flat_map(|variant| {
+            variant
+                .text
+                .split_whitespace()
+                .map(|word| word.trim_matches('"').to_owned())
+                .collect::<Vec<_>>()
+        });
+    let mut queries: Vec<String> = Vec::new();
+    for word in plan.entities.iter().cloned().chain(content) {
+        let lower = word.to_lowercase();
+        if word.is_empty() || matches!(lower.as_str(), "job" | "jobs") {
+            continue;
+        }
+        if !queries
+            .iter()
+            .any(|query| query.eq_ignore_ascii_case(&word))
+        {
+            queries.push(word);
         }
     }
-    question.trim().to_owned()
+    if queries.is_empty() {
+        queries.push(String::new());
+    }
+    queries
 }
 
 fn jobs_args(query: &str, page: usize, limit: usize) -> Value {
@@ -431,11 +448,21 @@ fn jobs_args(query: &str, page: usize, limit: usize) -> Value {
 
 async fn fetch_jobs(ctx: &FetchContext, source: &Source, question: &str, key: &str) -> FetchResult {
     let mut result = FetchResult::default();
-    let query = jobs_query(question);
+    let queries = jobs_queries(question);
     // Keep the page size fixed: changing it changes offset calculations upstream.
     let page_size = ctx.config.max_documents.min(WINDOW);
     result.failures.push(failure(source,"coverage","Jobs expose listing metadata only. Full descriptions, last-seen dates, and publisher status are unavailable."));
-    for page in 1..=ctx.config.max_pages {
+    // `max_pages` bounds the reads across all queries. A query moves on to its next page only
+    // while the provider says more rows exist.
+    let mut reads = 0;
+    let mut query_index = 0;
+    let mut page = 1;
+    while reads < ctx.config.max_pages
+        && query_index < queries.len()
+        && result.documents.len() < ctx.config.max_documents
+    {
+        reads += 1;
+        let query = queries[query_index].clone();
         let reply = match read(
             ctx,
             key,
@@ -463,7 +490,7 @@ async fn fetch_jobs(ctx: &FetchContext, source: &Source, question: &str, key: &s
             ));
             break;
         };
-        let meta = json!({"original_question":question,"query":query,"query_strategy":"explicit_quoted_phrase_or_first_priority_skill_or_role_else_question","pagination":reply.data["pagination"],"hint":reply.data["hint"]});
+        let meta = json!({"original_question":question,"query":query,"query_strategy":"explicit_quoted_phrase_else_names_then_content_words_one_per_request","pagination":reply.data["pagination"],"hint":reply.data["hint"]});
         let before = result.documents.len();
         let remaining = ctx.config.max_documents.saturating_sub(before);
         append_rows(source, "jobs", rows, &reply, &meta, remaining, &mut result);
@@ -493,9 +520,6 @@ async fn fetch_jobs(ctx: &FetchContext, source: &Source, question: &str, key: &s
             ));
         }
         let more = reply.data["pagination"]["hasMore"].as_bool();
-        if more == Some(false) {
-            break;
-        }
         if more.is_none() {
             result.failures.push(failure(
                 source,
@@ -505,15 +529,28 @@ async fn fetch_jobs(ctx: &FetchContext, source: &Source, question: &str, key: &s
                     reply.artifact
                 ),
             ));
-            break;
         }
-        if result.documents.len() >= ctx.config.max_documents
-            || page == ctx.config.max_pages
-            || rows.is_empty()
-        {
-            result.failures.push(failure(source,"truncation",format!("Job retrieval stopped at page {page} with hasMore=true; page or document bound, or empty page.")));
-            break;
+        if more == Some(true) && !rows.is_empty() {
+            if reads == ctx.config.max_pages || result.documents.len() >= ctx.config.max_documents {
+                result.failures.push(failure(source,"truncation",format!("Job retrieval for {query:?} stopped at page {page} with hasMore=true; page or document bound.")));
+                query_index += 1;
+                break;
+            }
+            page += 1;
+        } else {
+            query_index += 1;
+            page = 1;
         }
+    }
+    if query_index < queries.len() {
+        result.failures.push(failure(
+            source,
+            "query_limit",
+            format!(
+                "The page or document limit left job queries unsent: {:?}",
+                &queries[query_index..]
+            ),
+        ));
     }
     result
 }
@@ -838,14 +875,28 @@ mod tests {
         assert!(warning.message.contains("raw/duplicates.body"));
     }
     #[test]
-    fn q13_jobs_search_uses_rust_and_active_filter() {
-        let question =
-            "Find upcoming Stellar developer events and open Rust jobs as of 2026-09-21.";
-        let query = jobs_query(question);
-        assert_eq!(query, "Rust");
+    fn jobs_queries_try_names_first_then_content_words_without_a_term_list() {
+        let queries = jobs_queries("Which Kotlin roles are open at Acme Pay for mobile work?");
+        assert_eq!(queries[..2], ["Kotlin".to_owned(), "Acme Pay".to_owned()]);
+        assert!(queries.iter().any(|q| q == "mobile"));
         assert_eq!(
-            jobs_args(&query, 2, 5),
-            json!({"collection":"jobs","search":"Rust","status":"active","sort":"published_at","order":"DESC","page":2,"limit":5})
+            jobs_queries("List \"platform lead\" jobs"),
+            ["platform lead"]
+        );
+        assert_eq!(
+            jobs_queries("Find jobs mentioning \"alpha\" or \"beta\""),
+            ["alpha", "beta"]
+        );
+        // An unclosed quote and a long quoted span are not phrases.
+        assert_eq!(jobs_queries("Find \"Kotlin roles"), ["Kotlin", "roles"]);
+        assert_eq!(
+            jobs_queries("Find Kotlin roles. Data: \"one two three four five six\""),
+            ["Kotlin", "roles"]
+        );
+        assert_eq!(jobs_queries("List jobs"), [""]);
+        assert_eq!(
+            jobs_args("Kotlin", 2, 5),
+            json!({"collection":"jobs","search":"Kotlin","status":"active","sort":"published_at","order":"DESC","page":2,"limit":5})
         );
         assert!(sources().iter().any(|source| source.id == "lumenloop.jobs"));
     }

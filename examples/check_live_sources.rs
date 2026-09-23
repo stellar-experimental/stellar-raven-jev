@@ -18,13 +18,10 @@ async fn main() -> Result<()> {
     let mut rows = Vec::new();
     let mut index = String::from("# Live source checks\n\nThese checks retrieve live data. They do not call Jev or score relevance.\n\n");
     for (number, (id, question)) in [
-        ("lumenloop.jobs", "Find Rust developer jobs"),
-        ("stellarlight.audits", "Find Blend audit reports."),
-        (
-            "algolia:docs:primary",
-            "restore archived Soroban contract storage",
-        ),
-        ("algolia:site:pages", "passkey wallet projects"),
+        ("lumenloop.jobs", "Find developer jobs"),
+        ("stellarlight.audits", "Find audit reports."),
+        ("algolia:docs:primary", "fee bump transactions"),
+        ("algolia:site:pages", "wallet projects"),
     ]
     .into_iter()
     .enumerate()

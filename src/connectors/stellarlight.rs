@@ -52,22 +52,29 @@ struct Listing {
     paged: bool,
     query: bool,
     limit: usize,
+    /// Columns of the one-document roster. Every listing that returns its complete, unfiltered
+    /// registry in one response (`!paged && !query`) has a roster; no other listing does.
+    roster: &'static [&'static str],
+    /// Words the source says are true of every row (for example, every person in `people` is at
+    /// SDF). They cannot narrow the listing, so they are not sent as filters. Question words that
+    /// could be requested properties never go here.
+    every_row: &'static [&'static str],
 }
 
 const LISTINGS: &[Listing] = &[
-    Listing { id: "projects", path: "/api/projects/search", key: "projects", description: "Curated projects, lifecycle evidence, funding, deployments, and code references", paged: true, query: true, limit: 100 },
-    Listing { id: "repos", path: "/api/repos/search", key: "repos", description: "Indexed source repositories, code symbols, source scans, and maintenance evidence", paged: true, query: true, limit: 100 },
-    Listing { id: "skills", path: "/api/skills", key: "skills", description: "Dynamic skill, MCP, SDK, CLI, agent-kit, and tool catalog; skill Markdown is evidence only", paged: false, query: false, limit: 0 },
-    Listing { id: "partners", path: "/api/partners", key: "partners", description: "Published integration providers, anchors, ramps, auditors, and capabilities", paged: true, query: true, limit: 100 },
-    Listing { id: "audits", path: "/api/audits", key: "audits", description: "Enumerable audit report registry, auditor identity, dates, and extracted finding counts", paged: true, query: true, limit: 100 },
-    Listing { id: "rfps", path: "/api/rfps", key: "rfps", description: "SCF requests for proposals and synthetic current round context", paged: true, query: true, limit: 100 },
-    Listing { id: "hackathons", path: "/api/hackathons", key: "hackathons", description: "Curated and DoraHacks events, dates, prizes, tracks, and winners", paged: false, query: true, limit: 300 },
-    Listing { id: "builds", path: "/api/hackathons/builds", key: "builds", description: "DoraHacks prototype prior art and winning submissions; bounded listing", paged: false, query: true, limit: 100 },
-    Listing { id: "builders", path: "/api/builders", key: "builders", description: "Public Stellar Passport builder profiles and code evidence", paged: true, query: true, limit: 100 },
-    Listing { id: "people", path: "/api/people", key: "people", description: "SDF leadership, board, advisors, and staff roles", paged: true, query: true, limit: 100 },
-    Listing { id: "contracts", path: "/api/contracts", key: "contracts", description: "Evidence-gated mainnet contract registry, interfaces, and observed usage", paged: true, query: true, limit: 100 },
-    Listing { id: "rwa", path: "/api/rwa", key: "assets", description: "Tracked real-world assets, verification basis, and issuance state", paged: false, query: false, limit: 100 },
-    Listing { id: "stablecoins", path: "/api/stablecoins", key: "stablecoins", description: "Tracked stablecoins, fiat pegs, USD market capitalization, and dated usage", paged: false, query: false, limit: 100 },
+    Listing { id: "projects", path: "/api/projects/search", key: "projects", description: "Curated projects, lifecycle evidence, funding, deployments, and code references", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
+    Listing { id: "repos", path: "/api/repos/search", key: "repos", description: "Indexed source repositories, code symbols, source scans, and maintenance evidence", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
+    Listing { id: "skills", path: "/api/skills", key: "skills", description: "Dynamic skill, MCP, SDK, CLI, agent-kit, and tool catalog; skill Markdown is evidence only", paged: false, query: false, limit: 0, roster: &["slug", "kind", "name", "tagline"], every_row: &[] },
+    Listing { id: "partners", path: "/api/partners", key: "partners", description: "Published integration providers, anchors, ramps, auditors, and capabilities", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
+    Listing { id: "audits", path: "/api/audits", key: "audits", description: "Enumerable audit report registry, auditor identity, dates, and extracted finding counts", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
+    Listing { id: "rfps", path: "/api/rfps", key: "rfps", description: "SCF requests for proposals and synthetic current round context", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
+    Listing { id: "hackathons", path: "/api/hackathons", key: "hackathons", description: "Curated and DoraHacks events, dates, prizes, tracks, and winners", paged: false, query: true, limit: 300, roster: &[], every_row: &[] },
+    Listing { id: "builds", path: "/api/hackathons/builds", key: "builds", description: "DoraHacks prototype prior art and winning submissions; bounded listing", paged: false, query: true, limit: 100, roster: &[], every_row: &[] },
+    Listing { id: "builders", path: "/api/builders", key: "builders", description: "Public Stellar Passport builder profiles and code evidence", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
+    Listing { id: "people", path: "/api/people", key: "people", description: "SDF leadership, board, advisors, and staff roles", paged: true, query: true, limit: 100, roster: &[], every_row: &["sdf"] },
+    Listing { id: "contracts", path: "/api/contracts", key: "contracts", description: "Evidence-gated mainnet contract registry, interfaces, and observed usage", paged: true, query: true, limit: 100, roster: &[], every_row: &["mainnet", "deployed"] },
+    Listing { id: "rwa", path: "/api/rwa", key: "assets", description: "Tracked real-world assets, verification basis, and issuance state", paged: false, query: false, limit: 100, roster: &["symbol", "code", "name", "issuerEntity", "assetClass", "productKind", "state", "issuer", "contract", "network", "launchedAt", "verificationLevel", "verifiedAt", "basisNote"], every_row: &[] },
+    Listing { id: "stablecoins", path: "/api/stablecoins", key: "stablecoins", description: "Tracked stablecoins, fiat pegs, USD market capitalization, and dated usage", paged: false, query: false, limit: 100, roster: &["ticker", "name", "company", "peg", "basis", "assetType", "issuer", "issuerDomain", "supply", "marketCapUSD", "updatedAt", "verified", "note"], every_row: &[] },
 ];
 
 pub fn sources() -> Vec<Source> {
@@ -215,15 +222,6 @@ fn retrieval_terms(question: &str) -> Vec<String> {
         .collect()
 }
 
-fn keyword_query(question: &str) -> String {
-    let terms = retrieval_terms(question);
-    if terms.is_empty() {
-        question.to_owned()
-    } else {
-        terms.join(" ")
-    }
-}
-
 fn shared_plan_diagnostic(question: &str) -> Value {
     let plan = crate::query::plan(question);
     let variants = |items: Vec<&crate::query::Variant>| {
@@ -288,45 +286,26 @@ fn listing_queries(entry: Listing, question: &str) -> Vec<String> {
             .map(|variant| vec![variant.text.clone()])
             .unwrap_or_default();
     }
-    let collection_words: &[&str] = match entry.id {
-        "builders" => &[
-            "builder",
-            "builders",
-            "developer",
-            "developers",
-            "experience",
-            "experienced",
-        ],
-        "people" => &["people", "person", "sdf", "stellar"],
-        "contracts" => &[
-            "contract",
-            "contracts",
-            "implement",
-            "implements",
-            "deployed",
-            "live",
-            "mainnet",
-        ],
-        "rfps" => &["rfp", "rfps", "brief", "briefs", "proposals", "proposal"],
-        "audits" => &["audit", "audits", "report", "reports"],
-        "hackathons" => &["hackathon", "hackathons", "event", "events"],
-        _ => &[],
+    // A listing's own name is not a filter: "audits" in the question already chose the audits
+    // listing. Nor are words true of every row. Every other word stays, because it can be a
+    // requested property.
+    let singular = entry.id.strip_suffix('s').unwrap_or(entry.id);
+    let unfiltering = |term: &str| {
+        [entry.id, entry.key, singular, "stellar"].contains(&term)
+            || entry.every_row.contains(&term)
     };
-    if collection_words.is_empty() {
-        return vec![keyword_query(question)];
-    }
     let terms: Vec<_> = retrieval_terms(question)
         .into_iter()
-        .filter(|term| !collection_words.contains(&term.as_str()) && term != "stellar")
+        .filter(|term| !unfiltering(term))
         .collect();
     if terms.is_empty() {
         // A request for the whole collection has no entity filter.
         return vec![String::new()];
     }
     let mut queries = vec![terms.join(" ")];
-    // Contract, audit, and event queries are whole substrings; people/builders/RFPs require
-    // all terms. A zero-hit phrase can retry an original term, never an
-    // invented synonym. The fetch loop shares max_pages across these reads.
+    // Some listings match whole substrings and others require all terms. A zero-hit phrase can
+    // retry an original term, never an invented synonym. The fetch loop shares max_pages across
+    // these reads.
     for term in terms {
         if !queries.contains(&term) {
             queries.push(term);
@@ -395,10 +374,8 @@ fn skill_candidate_score(row: &Value, question: &str) -> usize {
     retrieval_terms(question)
         .iter()
         .filter(|term| {
-            ![
-                "stellar", "soroban", "skill", "skills", "build", "building", "help",
-            ]
-            .contains(&term.as_str())
+            // The corpus word and the catalog's own name match every skill.
+            !["stellar", "skill", "skills"].contains(&term.as_str())
         })
         .map(|term| {
             let singular = term
@@ -416,43 +393,9 @@ fn skill_candidate_score(row: &Value, question: &str) -> usize {
         .sum()
 }
 
-/// Registry listings whose complete row set answers roster questions.
-/// Each returns one roster document with every row, then bounded per-row documents.
-fn roster_columns(listing_id: &str) -> Option<&'static [&'static str]> {
-    match listing_id {
-        "stablecoins" => Some(&[
-            "ticker",
-            "name",
-            "company",
-            "peg",
-            "basis",
-            "assetType",
-            "issuer",
-            "issuerDomain",
-            "supply",
-            "marketCapUSD",
-            "updatedAt",
-            "verified",
-            "note",
-        ]),
-        "rwa" => Some(&[
-            "symbol",
-            "code",
-            "name",
-            "issuerEntity",
-            "assetClass",
-            "productKind",
-            "state",
-            "issuer",
-            "contract",
-            "network",
-            "launchedAt",
-            "verificationLevel",
-            "verifiedAt",
-            "basisNote",
-        ]),
-        _ => None,
-    }
+/// The roster columns of a complete-registry listing. The listing's shape decides, not its topic.
+fn roster_columns(entry: Listing) -> Option<&'static [&'static str]> {
+    (!entry.roster.is_empty()).then_some(entry.roster)
 }
 
 fn cell(value: &Value) -> String {
@@ -472,7 +415,7 @@ fn roster_document(
     url: &str,
     artifact: String,
 ) -> Option<Document> {
-    let columns = roster_columns(entry.id)?;
+    let columns = roster_columns(entry)?;
     let mut text = format!(
         "Complete {} registry from Stellar Scout. {} rows returned.\n",
         entry.id,
@@ -696,6 +639,8 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
             paged: false,
             query: true,
             limit: 25,
+            roster: &[],
+            every_row: &[],
         }
     } else {
         *LISTINGS
@@ -733,7 +678,7 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
         }
         if entry.limit > 0 {
             // A registry roster needs every row. Other listings take the remaining document allowance.
-            let limit = if roster_columns(entry.id).is_some() {
+            let limit = if roster_columns(entry).is_some() {
                 entry.limit
             } else {
                 entry
@@ -931,14 +876,30 @@ mod tests {
     }
 
     #[test]
+    fn every_complete_registry_listing_has_a_roster_and_no_other_does() {
+        for entry in LISTINGS {
+            assert_eq!(
+                !entry.roster.is_empty(),
+                !entry.paged && !entry.query,
+                "{}",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
     fn question_filters_precede_small_caps_on_searchable_listings() {
         for (id, question, expected) in [
-            ("builders", "Find builders who know Rust.", "rust"),
-            ("people", "Who is Justin Rice at SDF?", "justin rice"),
-            ("contracts", "Find live Reflector contracts.", "reflector"),
-            ("rfps", "Which RFPs ask for lending?", "lending"),
-            ("audits", "Find Blend audit reports.", "blend"),
-            ("hackathons", "Find Jaipur hackathons.", "jaipur"),
+            ("builders", "Find builders who know Kotlin.", "kotlin"),
+            ("people", "Who is Ana Example at SDF?", "ana example"),
+            (
+                "contracts",
+                "Find Acme contracts deployed on mainnet.",
+                "acme",
+            ),
+            ("rfps", "Which RFPs ask for payroll tools?", "payroll tools"),
+            ("audits", "Find Acme audits.", "acme"),
+            ("hackathons", "Find hackathons in Lisbon.", "lisbon"),
         ] {
             let entry = listing(id);
             assert!(entry.query, "{id} must filter before the server cap");
@@ -955,8 +916,8 @@ mod tests {
                 .any(|(k, v)| k == "q" && v == expected));
         }
         assert_eq!(
-            listing_queries(listing("contracts"), "Find Blend lending contracts."),
-            vec!["blend lending", "blend", "lending"]
+            listing_queries(listing("contracts"), "Find Acme lending contracts."),
+            vec!["acme lending", "acme", "lending"]
         );
         assert_eq!(
             listing_queries(listing("builders"), "Find builders."),
@@ -971,30 +932,30 @@ mod tests {
 
     #[test]
     fn migration_question_keeps_late_technical_terms_without_sentence_periods() {
-        let question = "I am moving a transaction indexer from Horizon. Find RPC history limits, pagination rules, and migration gaps.";
-        let query = keyword_query(question);
-        for term in ["horizon", "rpc", "pagination", "migration", "gaps"] {
+        let question = "I am moving a payment indexer from Widgetd. Find ZZAPI history limits, pagination rules, and migration gaps.";
+        let query = retrieval_terms(question).join(" ");
+        for term in ["widgetd", "zzapi", "pagination", "migration", "gaps"] {
             assert!(query.split_whitespace().any(|t| t == term));
         }
-        assert!(!query.contains("horizon."));
+        assert!(!query.contains("widgetd."));
         assert!(!query.split_whitespace().any(|t| t == "am"));
-        assert!(retrieval_terms("SDK v1.2.3 and SEP-41.").contains(&"v1.2.3".to_owned()));
+        assert!(retrieval_terms("SDK v1.2.3 and SEP-99.").contains(&"v1.2.3".to_owned()));
     }
 
     #[test]
     fn skill_matching_sees_the_catalog_tail_before_a_one_document_cap() {
         let mut rows: Vec<Value> = (0..20).map(|i| json!({"slug":format!("budget-{i}"),"kind":"skill-md","name":"Budget planning"})).collect();
         rows.push(
-            json!({"slug":"smart-contracts","kind":"skill-md","name":"Rust smart contracts"}),
+            json!({"slug":"widget-tooling","kind":"skill-md","name":"Kotlin widget tooling"}),
         );
         let first = ordered_candidates(
             listing("skills"),
             &rows,
-            "How do I write Rust smart contracts?",
+            "How do I build Kotlin widget tooling?",
         );
         assert_eq!(
             first.iter().take(1).next().unwrap()["slug"],
-            "smart-contracts"
+            "widget-tooling"
         );
         assert_eq!(first.len(), 21);
         assert!(!listing("skills").query);
@@ -1007,7 +968,7 @@ mod tests {
             .into_iter()
             .find(|s| s.id == "stellarlight.people")
             .unwrap();
-        let row = json!({"name":"Justin Rice","role":"VP","sourceUrl":"https://stellar.org/foundation/team"});
+        let row = json!({"name":"Ana Example","role":"Example role","sourceUrl":"https://example.org/team"});
         let first = document(
             &source,
             &row,
@@ -1105,29 +1066,34 @@ mod tests {
 
     #[test]
     fn shared_plan_is_diagnostic_and_keeps_verified_endpoint_queries() {
-        let question = "Find Blend audit reports.";
+        let question = "Find Acme audits.";
         let diagnostic = shared_plan_diagnostic(question);
         assert_eq!(diagnostic["role"], "diagnostic_only");
         assert_eq!(diagnostic["affects_requests"], false);
         assert!(diagnostic["tokens"]
             .as_array()
             .unwrap()
-            .contains(&json!("Blend")));
+            .contains(&json!("Acme")));
         assert!(diagnostic["omissions"].is_array());
         assert!(!diagnostic["keyword_variants"]
             .as_array()
             .unwrap()
             .is_empty());
-        assert_eq!(listing_queries(listing("audits"), question), vec!["blend"]);
+        assert_eq!(listing_queries(listing("audits"), question), vec!["acme"]);
         assert_eq!(
-            listing_queries(listing("hackathons"), "Find Jaipur hackathons."),
-            vec!["jaipur"]
+            listing_queries(listing("hackathons"), "Find hackathons in Lisbon."),
+            vec!["lisbon"]
+        );
+        // A word that can be a requested property stays in the filter.
+        assert_eq!(
+            listing_queries(listing("contracts"), "Find live Acme contracts.")[0],
+            "live acme"
         );
     }
 
     #[test]
     fn shared_build_query_uses_only_first_keyword_variant_without_new_requests() {
-        let question = "Find passkey wallet and account recovery sources.";
+        let question = "Find hardware wallet and account recovery sources.";
         let plan = crate::query::plan(question);
         let queries = listing_queries(listing("builds"), question);
         assert_eq!(queries, vec![plan.keyword()[0].text.clone()]);
@@ -1170,20 +1136,20 @@ mod tests {
     #[test]
     fn natural_questions_keep_technical_terms_and_select_relevant_skills() {
         assert_eq!(
-            keyword_query("Which sources can help me with SEP-41 authorization?"),
-            "sep-41 authorization"
+            retrieval_terms("Which sources can help me with SEP-99 authorization?").join(" "),
+            "sep-99 authorization"
         );
         assert_eq!(
             skill_candidate_score(
-                &json!({"slug":"scf-budget-builder","description":"SCF grant budgets"}),
-                "How do I write Rust smart contracts on Stellar?"
+                &json!({"slug":"grant-budget-planner","description":"Grant budgets"}),
+                "How do I build Kotlin widget tooling on Stellar?"
             ),
             0
         );
         assert!(
             skill_candidate_score(
-                &json!({"slug":"smart-contracts","description":"Rust smart contract development"}),
-                "How do I write Rust smart contracts on Stellar?"
+                &json!({"slug":"widget-tooling","description":"Kotlin widget tooling development"}),
+                "How do I build Kotlin widget tooling on Stellar?"
             ) > 0
         );
     }

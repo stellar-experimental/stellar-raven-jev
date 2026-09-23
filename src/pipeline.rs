@@ -34,8 +34,8 @@ struct Evidence {
     uncertain: Vec<Document>,
     omitted: Vec<Document>,
     failures: Vec<Failure>,
-    /// Intent, leading target, and stage-2 currentness answers. See `rank`.
-    rerank: serde_json::Value,
+    /// The question time intent. See `rank`.
+    intent: serde_json::Value,
     #[serde(skip)]
     timings: BTreeMap<&'static str, u64>,
 }
@@ -227,7 +227,7 @@ fn persist(
     write_json(root.join("omitted.json"), &evidence.omitted)?;
     write_json(root.join("failures.json"), &evidence.failures)?;
     write_json(root.join("usage.json"), usage)?;
-    write_json(root.join("rerank.json"), &evidence.rerank)?;
+    write_json(root.join("intent.json"), &evidence.intent)?;
     let artifacts = collect_artifacts(root)?;
     write_json(
         root.join("manifest.json"),
@@ -419,7 +419,7 @@ async fn execute(
             }
         }
     };
-    evidence.rerank = json!({"intent": intent});
+    evidence.intent = json!({"intent": intent});
     for (pass, routed) in routed.into_iter().enumerate() {
         match routed {
             Err(error) => {
@@ -688,10 +688,6 @@ async fn execute(
     evidence
         .timings
         .insert("score", run_started.elapsed().as_millis() as u64);
-    leading_target(question, &intent, &mut evidence);
-    evidence
-        .timings
-        .insert("rerank", run_started.elapsed().as_millis() as u64);
     evidence
         .scores
         .sort_by(|a, b| a.document_id.cmp(&b.document_id));
@@ -720,36 +716,6 @@ async fn execute(
 fn text_digest(text: &str) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(text.as_bytes()))
-}
-
-/// Name the leading target in code when the question is about protocol versions: the highest
-/// protocol that two provenance clusters or one official page among the selected documents mention.
-fn leading_target(question: &str, intent: &crate::rank::Intent, evidence: &mut Evidence) {
-    static PROTOCOL_QUESTION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let about_versions = PROTOCOL_QUESTION
-        .get_or_init(|| regex::Regex::new(r"(?i)\b(protocol|cap-\d+)\b").unwrap())
-        .is_match(question);
-    let selected: Vec<&Document> = evidence.selected.iter().collect();
-    let tiers: Vec<u8> = selected
-        .iter()
-        .map(|d| crate::rank::authority_tier(d, crate::search::content_scope(d)))
-        .collect();
-    let scores: BTreeMap<&str, &DocumentScore> = evidence
-        .scores
-        .iter()
-        .map(|s| (s.document_id.as_str(), s))
-        .collect();
-    // Only a question about the current state has a meaningful leading version. For a
-    // comparative or versioned question the newest version in the results says nothing about
-    // the network, and agents misread it as the current protocol.
-    let target = (about_versions && intent.kind == "current")
-        .then(|| crate::rank::leading_protocol(&selected, &tiers, &scores))
-        .flatten();
-    evidence.rerank = json!({
-        "intent": intent,
-        "target": target.map(|(version, _)| version),
-        "target_support_clusters": target.map(|(_, support)| support),
-    });
 }
 
 fn classify(evidence: &mut Evidence, config: &RunConfig, document: Document, score: DocumentScore) {

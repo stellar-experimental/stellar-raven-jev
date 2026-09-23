@@ -26,7 +26,7 @@ export JEV_OUTPUT_DIR=$HOME/.stellar-raven-jev/runs
 Then run from any directory:
 
 ```sh
-stellar-raven-jev search "How do I extend the TTL of a Soroban persistent storage entry?"
+stellar-raven-jev search "How do I rotate a signer key on a Stellar account?"
 ```
 
 It prints one compact JSON object of about 10 KB: the ten best selected results, one per URL, with `probability`, `content_scope`, `url`, `date`, `authority_tier`, `excerpt`, and `text_path`, plus a top-level `currentness` object.
@@ -39,9 +39,10 @@ Read the `text_path` file for any result you cite. The excerpt holds 400 charact
 `currentness` says how time affects the question:
 
 - `intent` is the question's time dependence (`current`, `comparative`, `versioned`, or `timeless`) with Jev's confidence.
-- `leading_protocol` is the newest protocol version that two independent sources, or one official page, mention in the results and that at least one live result covers. It is set only for current-state questions that name a protocol or a CAP. It describes the evidence, not verified network state.
+- `assessed_documents` counts the selected results that Jev also judged for currentness.
 - `newest_dated_evidence` lists the three newest dated results among the fifteen best. It is empty for a timeless question.
-- `conflicts` names official pages that still call the leading protocol planned while other sources report it live. An official page dated before the newest live report is not a conflict.
+
+The tool treats every question the same way. No code path depends on the topic of a question, and no list encodes evaluation vocabulary; only general grammar and request words are parsed. See `AGENTS.md`.
 
 Options:
 
@@ -58,7 +59,7 @@ Scores estimate relevance. They do not verify accuracy or freshness. Retrieved t
 
 | Value | Meaning |
 |---|---|
-| `structured_roster` | A complete registry table, such as all tracked stablecoins with issuers and dates |
+| `structured_roster` | A complete registry table: every row of a source listing that returns its whole registry in one response |
 | `published_markdown_main_content`, `main_visible_text` | A full page |
 | `research_chunk` | A ranked chunk of a longer document |
 | `ai_summary` | A source summary, not the source itself |
@@ -85,7 +86,7 @@ All flags work before or after the command.
 | `--output-dir` | `runs` (or `JEV_OUTPUT_DIR`) | Parent directory for run folders |
 | `--env-file` | (or `JEV_ENV_FILE`) | Explicit absolute credential file |
 
-Evaluation and test flags are accepted but hidden from `--help`. Their defaults came from the 40-question evaluation:
+Evaluation and test flags are accepted but hidden from `--help`. Their defaults are operating budgets:
 `--timeout-secs 30`, `--concurrency 16`, `--jev-concurrency 32`, `--jev-hedge-ms 2000` (`0` turns hedging off), `--fetch-deadline-secs 10`, `--max-pages 2`, `--max-documents 400`, `--per-source-documents 12`, `--max-body-bytes 8388608`, `--route-passes 2`, `--source-threshold 0.2`, `--document-threshold 0.4`, `--uncertain-threshold 0.15`, and `--fixture` (offline, fixed scores; not a measure of Jev quality).
 
 Live Jev requires a budget above zero. Missing credentials cause an explicit failure, never a silent fallback.
@@ -102,10 +103,10 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 ## How a run works
 
 1. Two routing passes ask Jev, for every source independently, whether it could hold direct or complementary evidence. Sources above the threshold in either pass are retrieved. In the same round, one Jev call classifies the question's time intent.
-2. Connectors fetch bounded documents from each selected source in parallel. Registry listings return one roster document with every row plus bounded per-row documents.
+2. Connectors fetch bounded documents from each selected source in parallel. A listing that returns its complete registry in one response also yields one roster document with every row. Substring-search endpoints get the question's names and content words; only the listing's own name and words the source says are true of every row are left out.
 3. Documents are admitted round-robin across sources up to the global limit. Each source keeps its upstream order.
 4. Jev scores each admitted document. Long documents are split into chunks scored in parallel; `probability` is the maximum chunk score and selects the document. When the intent depends on time or version, the same chunk calls also ask whether the text calls the subject live, only planned, superseded, or dated. Those answers come from the best chunk only. Each score keeps the four evidence signals in `signals` as independent per-signal maxima across chunks; they do not describe one jointly supported chunk.
-5. Selected documents are ordered by weighted reciprocal-rank fusion of relevance (the mean of the two best chunk scores, so long documents gain less from more chunks), currentness, recency, authority, and corroboration by independent sources. The intent sets the weights: a timeless question uses relevance and a little authority only. Dates, versions, authority, and corroboration are computed in code, not asked of Jev. For a confident `current` intent, live documents about the leading protocol come first and superseded or older-version documents come last. When no official page reaches the compact list, the best one takes its last slot.
+5. Selected documents are ordered by weighted reciprocal-rank fusion of relevance (the mean of the two best chunk scores, so long documents gain less from more chunks), currentness, recency, and authority. The intent sets the weights: a timeless question uses relevance and a little authority only. Dates and authority are computed in code, not asked of Jev. For a confident `current` intent, documents that Jev judges in effect now come first and superseded documents come last. When no official page reaches the compact list, the best one takes its last slot.
 6. Exact duplicates, same URL, title, and text, are scored once. The score, or the failure, is copied to every original ID with its own provenance, so counts and labels do not change.
 
 ## Evidence
@@ -123,7 +124,7 @@ With `--full-record`, a run keeps the complete audit record below, about 3 MB. E
 | `classification.json` | Selected, uncertain, and rejected document IDs, each list in order |
 | `omitted.json` | Full documents cut before scoring (duplicate IDs or the `--max-documents` limit) |
 | `scores.json`, `failures.json`, `usage.json` | Jev scores, signals, and currentness answers, every report entry, and accounted cost |
-| `rerank.json` | The question intent, the leading version target, and its support |
+| `intent.json` | The question time intent from Jev |
 | `search.json`, `search-documents/NNNN.txt` | The ranked report and the exact text files that `text_path` points to |
 | `raw/NNNNNN.body.gz`, `raw/NNNNNN.json` | Each HTTP response, gzipped with the SHA-256 of the exact bytes, and credential-free request metadata. A Jev request body is saved once, in its Jev trace; its metadata keeps the body hash. |
 | `jev/` | One audit trace per paid attempt (request, reservation, receipt, answers), one chunk record per document, and one `-cancelled.json` record per cancelled hedge request |
@@ -141,7 +142,7 @@ Sources need `LUMENLOOP_API_KEY`, `ALGOLIA_APPLICATION_ID_DOCS`, `ALGOLIA_API_KE
 
 ## Results
 
-On a 40-question development sample, two independent Grok answerers wrote answers from the compact output with at most four follow-up file reads. Two fresh Grok graders scored them against reference key facts. Mean key-fact coverage was 0.75 (0.71 and 0.79 for the two replicas). The median reader input was about 23 KB per question. Replicas differ by about 0.11 per question, so a single replica cannot resolve a smaller change.
+On a 40-question development sample, two independent Grok answerers wrote answers from the compact output with at most four follow-up file reads. Two fresh Grok graders scored them against reference key facts. Mean key-fact coverage was 0.75 (0.71 and 0.79 for the two replicas). The same sample guided development, so this number is optimistic. Only questions written before a change is tested can measure it fairly. Replicas differ by about 0.11 per question, so a single replica cannot resolve a smaller change.
 
 ## Evaluation
 

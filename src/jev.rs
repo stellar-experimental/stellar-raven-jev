@@ -940,10 +940,10 @@ pub const CURRENT_SIGNALS: [&str; 4] = ["live", "planned_only", "superseded", "d
 
 fn current_questions() -> Map<String, Value> {
     json!({
-        "live":{"type":"noul","instructions":"Does `document.text` describe the thing `user_question` asks about as already released, live, or activated?","criteria":{"true":"The text states it is released, live, activated, or in use now.","false":"The text describes it only as planned, proposed, scheduled, or does not say."}},
-        "planned_only":{"type":"noul","instructions":"Does `document.text` describe the thing `user_question` asks about only as planned, proposed, upcoming, or scheduled?"},
-        "superseded":{"type":"noul","instructions":"Does `document.text` say that the version, practice, or API it describes has been replaced, deprecated, or superseded?"},
-        "dated":{"type":"noul","instructions":"Does `document.text` give a concrete calendar date for the release, activation, or state that `user_question` asks about?"}
+        "live":{"type":"noul","instructions":"Does `document.text` describe the state `user_question` asks about as in effect now?","criteria":{"true":"The text states it is in effect now: released, live, active, held, or in use.","false":"The text describes it only as planned, proposed, or past, or does not say."}},
+        "planned_only":{"type":"noul","instructions":"Does `document.text` describe the state `user_question` asks about only as planned, proposed, upcoming, or scheduled?"},
+        "superseded":{"type":"noul","instructions":"Does `document.text` say that what it describes has since been replaced, deprecated, ended, or superseded?"},
+        "dated":{"type":"noul","instructions":"Does `document.text` give a concrete calendar date for the state `user_question` asks about?"}
     }).as_object().unwrap().clone()
 }
 

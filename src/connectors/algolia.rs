@@ -148,8 +148,6 @@ fn local_site_keyword_variant(question: &str) -> Option<String> {
         "give",
         "find",
         "information",
-        "current",
-        "latest",
         "using",
         "i",
         "we",
@@ -1333,24 +1331,22 @@ mod tests {
     #[test]
     fn site_retry_preserves_entities_without_an_empty_query() {
         assert_eq!(
-            site_keyword_variant(
-                "What companies received funding from the Stellar Enterprise Fund?"
-            ),
-            Some("Stellar Enterprise Fund".into())
+            site_keyword_variant("What companies received funding from the Stellar Widget Fund?"),
+            Some("Stellar Widget Fund".into())
         );
         assert_eq!(
-            site_keyword_variant("Tell me about USDC adoption on Stellar"),
-            Some("USDC Stellar".into())
+            site_keyword_variant("Tell me about ACMEUSD adoption on Stellar"),
+            Some("ACMEUSD Stellar".into())
         );
         assert_eq!(site_keyword_variant("What is the?"), None);
-        assert_eq!(site_keyword_variant("USDC Stellar"), None);
+        assert_eq!(site_keyword_variant("ACMEUSD Stellar"), None);
     }
     #[test]
-    fn q09_site_retry_uses_the_first_shared_keyword_within_one_retry() {
-        let question = "Find passkey wallet projects and sources on account recovery when the original device is lost.";
+    fn site_retry_uses_the_first_shared_keyword_within_one_retry() {
+        let question = "Find hardware wallet projects and sources on account recovery when the original device is lost.";
         assert_eq!(
             site_keyword_variant(question),
-            Some("passkey wallet projects".into())
+            Some("hardware wallet projects".into())
         );
         assert_eq!(
             site_keyword_variant(question).unwrap(),
@@ -1359,21 +1355,21 @@ mod tests {
     }
     #[test]
     fn site_shared_keyword_selection_preserves_the_local_entity_regression() {
-        let question = "What companies received funding from the Stellar Enterprise Fund?";
+        let question = "What companies received funding from the Stellar Widget Fund?";
         let plan = crate::query::plan(question);
-        assert_ne!(plan.keyword()[0].text, "Stellar Enterprise Fund");
+        assert_ne!(plan.keyword()[0].text, "Stellar Widget Fund");
         assert_eq!(
             site_keyword_variant(question),
-            Some("Stellar Enterprise Fund".into())
+            Some("Stellar Widget Fund".into())
         );
         assert_eq!(
-            site_keyword_variant("Tell me about USDC adoption on Stellar"),
-            local_site_keyword_variant("Tell me about USDC adoption on Stellar")
+            site_keyword_variant("Tell me about ACMEUSD adoption on Stellar"),
+            local_site_keyword_variant("Tell me about ACMEUSD adoption on Stellar")
         );
     }
     #[test]
     fn initial_query_uses_shared_content_words_and_respects_index_language() {
-        let plan = crate::query::plan("How do I restore archived Soroban contract storage?");
+        let plan = crate::query::plan("How do I rotate expired Widgetd signing keys?");
         assert_eq!(
             planned_query(
                 Index {
@@ -1382,12 +1378,11 @@ mod tests {
                 },
                 &plan
             ),
-            (
-                "restore archived Soroban contract storage".into(),
-                "keywords"
-            )
+            ("rotate expired Widgetd signing keys".into(), "keywords")
         );
-        let spanish = crate::query::plan("¿Dónde encuentro documentación sobre comisiones y simulación de transacciones en Soroban?");
+        let spanish = crate::query::plan(
+            "¿Dónde encuentro documentación sobre límites y firmas de transacciones de Widgetd?",
+        );
         assert_eq!(
             planned_query(
                 Index {
@@ -1407,21 +1402,18 @@ mod tests {
                 },
                 &spanish
             ),
-            ("Soroban".into(), "entity")
+            ("Widgetd".into(), "entity")
         );
     }
     #[test]
-    fn q01_docs_plan_separates_independent_intents_before_optional_word_noise() {
+    fn docs_plan_separates_independent_intents_before_optional_word_noise() {
         let plan = crate::query::plan(
-            "Find sources on extending contract storage lifetime and restoring archived entries.",
+            "Find sources on rotating signer keys and recovering locked accounts.",
         );
         let queries = docs_facet_queries(&plan, 2, 3);
         assert_eq!(
             queries,
-            [
-                "extending contract storage lifetime",
-                "restoring archived entries"
-            ]
+            ["rotating signer keys", "recovering locked accounts"]
         );
         for query in queries {
             let request = search_params(&query, 0, 9, false);
@@ -1433,14 +1425,14 @@ mod tests {
     fn docs_facet_budget_reserves_both_intents_and_keeps_single_intent_behavior() {
         assert_eq!(facet_document_ceiling(3, 0, 2), 1);
         assert_eq!(facet_document_ceiling(3, 1, 1), 3);
-        let broad = crate::query::plan("Find SEP-10 authentication and SEP-24 token usage sources");
+        let broad = crate::query::plan("Find SEP-99 onboarding and SEP-98 token usage sources");
         let queries = docs_facet_queries(&broad, 2, 3);
         assert_eq!(queries.len(), 2);
-        assert!(queries[0].contains("SEP-10"));
-        assert!(queries[1].contains("SEP-24"));
+        assert!(queries[0].contains("SEP-99"));
+        assert!(queries[1].contains("SEP-98"));
         assert!(docs_facet_queries(&broad, 1, 3).is_empty());
         assert!(docs_facet_queries(&broad, 2, 1).is_empty());
-        let single = crate::query::plan("How do I restore archived Soroban contract storage?");
+        let single = crate::query::plan("How do I rotate expired Widgetd signing keys?");
         assert!(docs_facet_queries(&single, 2, 3).is_empty());
     }
     #[test]

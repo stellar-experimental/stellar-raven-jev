@@ -52,8 +52,8 @@ pub struct DocumentScore {
     /// maximum of that signal over the document's chunks; different signals can come from different
     /// chunks, so the map is not one jointly supported evidence vector.
     pub signals_aggregation: String,
-    /// Byte range of the chunk with the highest usable_evidence. `current` and the code check for
-    /// the version target read this chunk only, so they never mix chunks.
+    /// Byte range of the chunk with the highest usable_evidence. `current` comes from this chunk
+    /// only, so its answers never mix chunks.
     pub best_chunk: [usize; 2],
     /// Mean of the two highest chunk usable_evidence values (one chunk: that value). Long pages
     /// get more chunks and so more chances at a high maximum; this key reduces that advantage.
