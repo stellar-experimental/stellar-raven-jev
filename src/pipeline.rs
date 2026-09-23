@@ -495,8 +495,8 @@ async fn execute(
     }
     persist(config, &evidence, &backend.usage(), "running")?;
     // Exact duplicates are scored once. Jev sees the title and the text, so both are in the key.
-    // The score fans back to every original ID with its own provenance, so counts, labels, and run
-    // status do not change.
+    // The score, or the failure, fans back to every original ID with its own provenance, so counts,
+    // labels, and run status do not change.
     let mut representatives: BTreeMap<(String, String, String), String> = BTreeMap::new();
     let mut duplicates: BTreeMap<String, Vec<Document>> = BTreeMap::new();
     let mut to_score = Vec::new();
@@ -561,7 +561,17 @@ async fn execute(
                     Some(&document.source_id),
                     format!("{}: {error}", document.id),
                 ));
+                // Each copy gets its own failure row, so per-source failure counts match a run
+                // that scored every copy separately.
                 for copy in duplicates.remove(&document.id).unwrap_or_default() {
+                    evidence.failures.push(failure(
+                        "document_score",
+                        Some(&copy.source_id),
+                        format!(
+                            "{}: not scored; the identical document {} failed: {error}",
+                            copy.id, document.id
+                        ),
+                    ));
                     evidence.uncertain.push(copy);
                 }
                 evidence.uncertain.push(document);
@@ -1071,7 +1081,7 @@ mod tests {
         assert_eq!(backend.scored.load(Ordering::SeqCst), 2);
     }
     #[tokio::test]
-    async fn failed_representative_leaves_every_duplicate_uncertain_with_provenance() {
+    async fn failed_representative_leaves_every_duplicate_uncertain_with_its_own_failure() {
         let dir = tempfile::tempdir().unwrap();
         let mut backend = mock();
         backend.shared_url = true;
@@ -1087,7 +1097,18 @@ mod tests {
         assert_eq!(backend.scored.load(Ordering::SeqCst), 1);
         assert_eq!(outcome.uncertain, 2);
         assert_eq!(outcome.selected, 0);
-        assert_eq!(outcome.failures, 1);
+        // One failure row per original ID, each naming its own source.
+        assert_eq!(outcome.failures, 2);
+        let failures: Vec<Failure> = serde_json::from_slice(
+            &std::fs::read(outcome.directory.join("failures.json")).unwrap(),
+        )
+        .unwrap();
+        let failed_sources: BTreeSet<_> = failures
+            .iter()
+            .filter(|f| f.stage == "document_score")
+            .filter_map(|f| f.source_id.as_deref())
+            .collect();
+        assert_eq!(failed_sources, BTreeSet::from(["a", "b"]));
         let uncertain: Vec<Document> = serde_json::from_slice(
             &std::fs::read(outcome.directory.join("uncertain.json")).unwrap(),
         )
