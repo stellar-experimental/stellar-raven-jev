@@ -116,7 +116,7 @@ pub fn schema() -> Value {
         "calls":{"type":"array","minItems":1,"maxItems":64,"items":{
             "type":"object","additionalProperties":false,
             "required":["operation","arguments","reason","max_documents","max_pages"],"properties":{
-                "operation":{"type":"string","enum":["connector.search","lumenloop.semantic","scout.projects"]},
+                "operation":{"type":"string","enum":["connector.search","lumenloop.semantic","scout.projects","lumenloop.vocabulary"]},
                 "arguments":{"type":"object","description":"Use the exact argument schema from list_operations."},
                 "reason":{"type":"string","minLength":1,"maxLength":2000},
                 "max_documents":{"type":"integer","minimum":1,"maximum":2000},
@@ -152,11 +152,34 @@ struct Evidence {
     retrieved: Vec<Document>,
     scores: Vec<DocumentScore>,
     omitted: Vec<Document>,
+    fetch_omitted: Vec<FetchOmission>,
     duplicates: Vec<Value>,
     failures: Vec<Failure>,
     calls: Vec<Value>,
 }
+
+#[derive(Serialize)]
+struct FetchOmission {
+    document: Document,
+    call_index: usize,
+    operation: String,
+    reason: Value,
+}
+
 impl Evidence {
+    fn record_fetch_omissions(&mut self, documents: Vec<Document>, index: usize, call: &Call) {
+        self.fetch_omitted
+            .extend(documents.into_iter().map(|document| {
+                let reason = document.provenance["admission"]["reason"].clone();
+                FetchOmission {
+                    document,
+                    call_index: index,
+                    operation: call.operation.clone(),
+                    reason,
+                }
+            }));
+    }
+
     fn failure(&mut self, stage: &str, source: Option<String>, message: impl Into<String>) {
         self.failures.push(Failure {
             stage: stage.into(),
@@ -207,6 +230,7 @@ impl Evidence {
             })
             .collect();
         write(root, "unscored.json", &unscored)?;
+        write(root, "fetch-omitted.json", &self.fetch_omitted)?;
         write(root, "scores.json", &self.scores)?;
         write(root, "failures.json", &self.failures)?;
         write(root, "duplicates.json", &self.duplicates)?;
@@ -230,6 +254,9 @@ impl Evidence {
             "answer_generated":false,"fixture_is_model_evidence":false,"probabilities_are_calibrated":false,
             "document_count":self.documents.len(),"scored_document_count":self.scores.len(),
             "omitted_document_count":self.omitted.len(),"retrieved_document_count":self.retrieved.len(),
+            "fetch_omitted_document_count":self.fetch_omitted.len(),
+            "fetch_omitted_scope":"Reported adapter omissions only; currently native LumenLoop semantic call document limits. Excludes unknown or unreturned rows and does not cover every connector.",
+            "omitted_scope":"Documents returned by adapters but omitted during subsequent plan admission. Excludes fetch-omitted.json.",
             "coverage_complete":false,"requirements_automatically_evaluated":false,
             "completeness":"Bounded planned retrieval. Inspect every call, provider warning, and omitted document.",
             "usage_scope":"Conservative accounting. Incomplete Jev traces retain reservations; inspect them before retrying."}),
@@ -327,16 +354,43 @@ pub async fn run_plan(plan: &RetrievalPlan, config: &RunConfig) -> Result<RunOut
             return Ok(result);
         }
     };
+    run_calls(plan, config, http, jev, deadline, evidence).await
+}
+
+async fn run_calls(
+    plan: &RetrievalPlan,
+    config: RunConfig,
+    http: HttpRecorder,
+    jev: JevClient,
+    deadline: tokio::time::Instant,
+    mut evidence: Evidence,
+) -> Result<RunOutcome> {
     let mut seen = BTreeSet::new();
     for (index, call) in plan.calls.iter().enumerate() {
         let mut receipt = json!({"index":index,"call":call,"state":"running"});
-        if let Some(reason) = exhausted(&http).or_else(|| {
-            (tokio::time::Instant::now() >= deadline).then_some("The plan deadline was reached")
-        }) {
-            receipt["state"] = json!("skipped_limit");
+        if let Some(reason) = jev
+            .spending_stop_reason()
+            .or_else(|| exhausted(&http))
+            .or_else(|| {
+                (tokio::time::Instant::now() >= deadline).then_some("The plan deadline was reached")
+            })
+        {
+            receipt["state"] = json!(if jev.spending_stop_reason().is_some() {
+                "skipped_spending_stop"
+            } else {
+                "skipped_limit"
+            });
             receipt["reason"] = json!(reason);
             evidence.calls.push(receipt);
-            evidence.failure("plan.limit", None, reason);
+            evidence.failure(
+                if jev.spending_stop_reason().is_some() {
+                    "plan.spending_stop"
+                } else {
+                    "plan.limit"
+                },
+                None,
+                reason,
+            );
             evidence.persist(&config, &http, &jev.usage(), "running")?;
             continue;
         }
@@ -376,6 +430,7 @@ pub async fn run_plan(plan: &RetrievalPlan, config: &RunConfig) -> Result<RunOut
                 failure
             }));
         evidence.retrieved.extend(fetched.documents.iter().cloned());
+        evidence.record_fetch_omissions(fetched.omitted_documents, index, call);
         evidence.persist(&config, &http, &jev.usage(), "running")?;
         let mut added = 0;
         for mut document in fetched.documents {
@@ -391,9 +446,13 @@ pub async fn run_plan(plan: &RetrievalPlan, config: &RunConfig) -> Result<RunOut
                 );
                 continue;
             }
-            let limit = exhausted(&http).or_else(|| {
-                (tokio::time::Instant::now() >= deadline).then_some("The plan deadline was reached")
-            });
+            let limit = jev
+                .spending_stop_reason()
+                .or_else(|| exhausted(&http))
+                .or_else(|| {
+                    (tokio::time::Instant::now() >= deadline)
+                        .then_some("The plan deadline was reached")
+                });
             if document.text.trim().is_empty()
                 || evidence.documents.len() >= plan.bounds.max_documents
                 || limit.is_some()
@@ -404,6 +463,7 @@ pub async fn run_plan(plan: &RetrievalPlan, config: &RunConfig) -> Result<RunOut
                     "The global document admission limit was reached"
                 });
                 evidence.failure("plan.omitted", Some(document.source_id.clone()), reason);
+                document.provenance["plan_omission"] = json!({"reason":reason,"call_index":index});
                 evidence.omitted.push(document);
                 continue;
             }
@@ -433,7 +493,14 @@ pub async fn run_plan(plan: &RetrievalPlan, config: &RunConfig) -> Result<RunOut
             }
             evidence.persist(&config, &http, &jev.usage(), "running")?;
         }
-        evidence.calls[index]["state"] = json!("finished");
+        evidence.calls[index]["state"] = json!(if jev.spending_stop_reason().is_some() {
+            "stopped_spending"
+        } else {
+            "finished"
+        });
+        if let Some(reason) = jev.spending_stop_reason() {
+            evidence.calls[index]["stop_reason"] = json!(reason);
+        }
         evidence.calls[index]["new_scored_documents"] = json!(added);
         evidence.persist(&config, &http, &jev.usage(), "running")?;
     }
@@ -450,6 +517,198 @@ pub async fn run_plan(plan: &RetrievalPlan, config: &RunConfig) -> Result<RunOut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_schema_exposes_every_typed_operation() {
+        let schema = schema();
+        let declared: BTreeSet<_> = schema["properties"]["calls"]["items"]["properties"]
+            ["operation"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        let catalog = crate::operations::catalog();
+        let available: BTreeSet<_> = catalog["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["operation"].as_str().unwrap())
+            .collect();
+        assert_eq!(declared, available);
+    }
+
+    #[tokio::test]
+    async fn unresolved_scoring_skips_later_source_calls_and_preserves_fetched_document() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("fetches")).unwrap();
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().to_path_buf(),
+            budget_usd: 1.0,
+            timeout_secs: 2,
+            ..RunConfig::default()
+        };
+        let http = HttpRecorder::new_bounded(dir.path(), &config, 100, 1_000_000, 10).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let jev = JevClient::loopback_for_test(
+            &config,
+            format!("http://{}/evaluate", listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 8192];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 402 Payment Required\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+            socket.shutdown().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let call = Call {
+            operation: "scout.projects".into(),
+            arguments: json!({"query":"synthetic", "limit":2}),
+            reason: "Offline regression".into(),
+            max_documents: 2,
+            max_pages: 1,
+        };
+        let plan = RetrievalPlan {
+            schema_version: 1,
+            question: "Synthetic question".into(),
+            requirements: vec![],
+            bounds: Bounds {
+                max_calls: 2,
+                max_documents: 4,
+                max_http_requests: 100,
+                max_response_bytes: 1_000_000,
+                deadline_secs: 10,
+                max_spend_usd: 1.0,
+            },
+            calls: vec![call.clone(), call],
+        };
+        run_calls(
+            &plan,
+            config,
+            http,
+            jev,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            Evidence::default(),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let read = |name: &str| -> Value {
+            serde_json::from_slice(&std::fs::read(dir.path().join(name)).unwrap()).unwrap()
+        };
+        let calls = read("calls.json");
+        assert_eq!(calls[0]["state"], "stopped_spending");
+        assert!(calls[0]["stop_reason"]
+            .as_str()
+            .unwrap()
+            .contains("unresolved"));
+        assert_eq!(calls[1]["state"], "skipped_spending_stop");
+        assert!(!dir.path().join("fetches/001.json").exists());
+        assert_eq!(read("usage.json")["requests"], 1);
+        assert_eq!(read("retrieved.json").as_array().unwrap().len(), 1);
+        assert_eq!(read("unscored.json").as_array().unwrap().len(), 1);
+        assert_eq!(read("scores.json"), json!([]));
+        assert_eq!(read("documents.json")[0]["provenance"]["fixture"], true);
+        assert_eq!(read("manifest.json")["outcome"]["status"], "partial");
+    }
+
+    #[test]
+    fn adapter_omissions_persist_separately_without_admission_or_scoring() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            fixture: true,
+            output_dir: temp.path().to_path_buf(),
+            ..RunConfig::default()
+        };
+        let http = HttpRecorder::new(temp.path(), &config).unwrap();
+        let call = Call {
+            operation: "lumenloop.semantic".into(),
+            arguments: json!({}),
+            reason: "Testing source coverage".into(),
+            max_documents: 1,
+            max_pages: 1,
+        };
+        let document = Document {
+            id: "provider:omitted".into(),
+            source_id: "lumenloop.articles".into(),
+            title: "Omitted title".into(),
+            url: "https://example.invalid/omitted".into(),
+            text: "Original text\n".into(),
+            provenance: json!({"admission":{"reason":"call_document_limit"},"original":"kept"}),
+            raw_artifacts: vec!["raw/test.body".into()],
+        };
+        let mut evidence = Evidence::default();
+        evidence.record_fetch_omissions(vec![document.clone()], 3, &call);
+        evidence.record_fetch_omissions(vec![document.clone()], 7, &call);
+        assert!(evidence.documents.is_empty());
+        assert!(evidence.retrieved.is_empty());
+        assert!(evidence.scores.is_empty());
+        assert!(evidence.omitted.is_empty());
+        let mut admitted = document.clone();
+        admitted.id = "plan:admitted".into();
+        evidence.documents.push(admitted.clone());
+        evidence.retrieved.push(admitted.clone());
+        evidence.scores.push(DocumentScore {
+            document_id: admitted.id,
+            probability: 1.0,
+            reason: "Fixture".into(),
+            signals: Default::default(),
+            signals_aggregation: String::new(),
+        });
+        let mut plan_omitted = document.clone();
+        plan_omitted.id = "plan:omitted".into();
+        evidence.omitted.push(plan_omitted.clone());
+        evidence
+            .persist(&config, &http, &Usage::default(), "partial")
+            .unwrap();
+        let read = |name: &str| -> Value {
+            serde_json::from_slice(&std::fs::read(temp.path().join(name)).unwrap()).unwrap()
+        };
+        let omitted = read("fetch-omitted.json");
+        assert_eq!(omitted.as_array().unwrap().len(), 2);
+        for (row, index) in omitted.as_array().unwrap().iter().zip([3, 7]) {
+            assert_eq!(row["document"], json!(document));
+            assert_eq!(row["call_index"], index);
+            assert_eq!(row["operation"], "lumenloop.semantic");
+            assert_eq!(row["reason"], "call_document_limit");
+        }
+        assert_eq!(read("omitted.json"), json!([plan_omitted]));
+        for name in [
+            "documents.json",
+            "retrieved.json",
+            "scores.json",
+            "selected.json",
+        ] {
+            assert_eq!(read(name).as_array().unwrap().len(), 1);
+            assert!(!read(name).to_string().contains("provider:omitted"));
+        }
+        assert_eq!(read("unscored.json"), json!([]));
+        let manifest = read("manifest.json");
+        assert_eq!(manifest["fetch_omitted_document_count"], 2);
+        assert_eq!(manifest["omitted_document_count"], 1);
+        assert_eq!(manifest["document_count"], 1);
+        assert_eq!(manifest["scored_document_count"], 1);
+        assert!(manifest["fetch_omitted_scope"]
+            .as_str()
+            .unwrap()
+            .contains("does not cover every connector"));
+        let empty = Evidence::default();
+        empty
+            .persist(&config, &http, &Usage::default(), "complete")
+            .unwrap();
+        assert_eq!(read("fetch-omitted.json"), json!([]));
+        assert_eq!(read("manifest.json")["fetch_omitted_document_count"], 0);
+    }
+
     #[test]
     fn unavailable_metrics_stop_work() {
         assert!(exhausted_metrics(&json!({"bounded":false})).is_some());

@@ -319,6 +319,7 @@ fn fixture(source: &Source, kind: &str) -> FetchResult {
     doc.raw_artifacts.clear();
     doc.provenance["fixture"] = json!(true);
     FetchResult {
+        omitted_documents: vec![],
         documents: vec![doc],
         failures: vec![],
     }

@@ -49,7 +49,8 @@ Changing only the call budget does not refresh that result.
 The response sets `reused: true` and includes the current remaining budget.
 The server also reuses failed results.
 Reword the question only when a new retrieval is intentional.
-A session permits at most 64 distinct retrieval questions or plans.
+A session permits at most 64 distinct cached tool calls.
+This includes retrieval questions, plans, and enabled experimental calls.
 `execute_plan` caches the complete validated plan. Changed queries or allowances create a distinct run.
 The server does not send progress notifications.
 The pipeline applies its configured request timeouts.
@@ -237,3 +238,146 @@ The tests make no paid Jev calls.
 Both retrieval tools share the server spending ledger.
 Read the [plan guide](service-v2/USAGE.md) and [example plan](../examples/service-plan.json).
 
+## Experimental primary Markdown recovery
+
+Start `mcp --primary-body` to enable two additional tools.
+The default tool list stays unchanged.
+This option requires evaluation before use as a default policy.
+
+`list_primary_sources` lists eligible selected and uncertain documents already published in this session.
+It returns at most eight entries per page and makes no network request.
+Each entry preserves its selected or uncertain status.
+The list follows stable document identity order, not relevance ranking.
+Pass `next_offset` as `offset` to continue.
+Finish pagination before another retrieval changes the source list.
+The list includes GitHub Markdown URLs with `main`, `master`, or 40-character hexadecimal refs.
+It does not verify source availability or resolve a branch to a commit.
+
+`resolve_primary_body` accepts `source_uri`, `git_ref`, and `git_path`.
+The URI must identify an original document part published by this session.
+The explicit ref and path must match that document's original public GitHub URL.
+The tool rejects caller URLs, local paths, redirects, and unsupported URL forms.
+Other single-segment refs can work when the caller supplies them explicitly.
+The tool preserves the original text, score, and source identity.
+It stores the new body and its hash separately.
+Recovered bodies remain explicitly unscored.
+Their original evidence status describes the original excerpt only.
+A mutable branch remains mutable after retrieval.
+
+Each session permits eight recovery attempts.
+Each attempt permits one client GET attempt, 1 MiB of retained body, and a 20-second asynchronous operation deadline.
+The HTTP client disables redirects, retries, proxies, and content decompression.
+DNS results must contain only approved public addresses and are pinned for the request.
+An operating-system DNS operation can outlive asynchronous cancellation.
+Local filesystem operations also lack a hard wall-clock bound.
+Use an outer process deadline when a strict experiment deadline is required.
+
+Recovery uses a separate HTTP allowance from retrieval plans.
+It shares the 64-call limit, 64 MiB resource limit, and 20,000-resource limit.
+It makes no Jev call and consumes no Jev allocation.
+An unresolved session spending record blocks new recovery.
+Exact repeats and document-part aliases reuse the same result, including failures.
+They do not consume another recovery attempt.
+
+The first result links to a section index and a manifest.
+It does not deliver the complete body text.
+Section resources preserve exact UTF-8 byte offsets, body hashes, and heading context.
+ATX headings outside fenced code blocks provide navigation.
+Setext headings do not create section boundaries.
+Section parts can split procedures, tables, and lists.
+Headings and parts do not certify independent claim support or complete procedures.
+Read all required context before using an excerpt.
+
+`document_complete` describes the acquired body.
+`publication_status` separately reports successful or failed resource publication.
+Local artifacts retain raw response bytes, parsed response headers, and failure records.
+An incomplete response never becomes a complete document resource.
+Fixture mode returns labeled synthetic text without DNS or HTTP activity.
+Fixture text does not reproduce the original source.
+
+## Experimental saved document pool
+
+Enable `mcp --saved-pool` to inspect saved documents from the current session.
+This flag is independent of `--primary-body`.
+Use both flags to expose both tool pairs.
+Without either flag, the default tool list and retrieval publication stay unchanged.
+The saved-pool tools make no HTTP or Jev calls.
+They can operate when further session spending is blocked.
+
+Call `list_saved_sources` with `run_uri` equal to the retrieval result's `manifest` URI:
+
+```json
+{"run_uri":"raven://<session>/<manifest>"}
+```
+
+The result contains `sources`, `total_sources`, and `next_cursor`.
+Pass `next_cursor` as `cursor` for the next page.
+Each page contains at most eight rows and fits the existing 16 KiB resource limit.
+Large metadata rows reduce the number of rows per page.
+An individual row that cannot fit causes an explicit error.
+Cursors bind to the run and the optional URL filter.
+
+Use `same_url_as` to find saved companions of an already published document part:
+
+```json
+{"run_uri":"raven://<session>/<manifest>","same_url_as":"raven://<session>/<document-part>"}
+```
+
+The server requires a document part from that exact run and session.
+It rejects metadata URIs, manifest URIs, empty original URLs, and unknown document URIs.
+It compares exact original URLs before the public URL projection.
+Different saved texts at the same URL remain separate rows.
+The server does not replace an excerpt, change its status, or score another document.
+
+The catalog contains rows from `selected.json`, `uncertain.json`, `rejected.json`, and `omitted.json`.
+It does not reconstruct other fetched records or records with no saved body.
+Rows use stable document identity order, followed by artifact order and row index.
+This order is not a relevance ranking.
+Duplicate document IDs retain separate `source_uri` values.
+Each row includes its original document ID and source ID.
+Titles, public URLs, and content scopes have explicit truncation flags.
+Saved text sizes and hashes describe the exact saved UTF-8 text.
+List rows contain only identity, title, public URL, scope, saved text size, text hash, and status fields.
+Read a row's `source_uri` to inspect its complete audit metadata resource.
+That resource also contains artifact, artifact hash, row index, record hash, and provenance hash.
+The list states fixture labels, untrusted-content labels, and status explanations once per page.
+The audit metadata resource retains these labels and explanations for each source.
+Complete provenance and raw references remain local.
+
+`admission_status` preserves the original file group.
+`evidence_status` is `unscored` for omitted rows.
+Rejected rows preserve the original relevance decision.
+Rejection does not mean factual error.
+An uncertain row can reflect a scoring failure.
+No saved-pool read creates a new score.
+Fixture metadata and text resources carry explicit fixture labels.
+
+Call `open_saved_source` with a row's `source_uri`:
+
+```json
+{"source_uri":"raven://<session>/<saved-source-metadata>"}
+```
+
+The result links an `index` with the existing `documents` and `pages` structure.
+Read its text parts in order.
+Each part contains exact UTF-8 byte offsets, part numbers, and the original evidence status.
+`saved_text_complete: true` means all saved text is published.
+`remote_document_complete: null` means remote document completeness is unknown.
+An empty saved text remains an empty saved text.
+It does not become evidence of a complete remote response.
+
+The server binds each catalog to its session, run directory, and exact artifact bytes.
+New listing pages and first text publications validate those bindings.
+Changed artifacts or unsafe paths cause an explicit error.
+Text publication is atomic under the shared resource limits.
+A failed first listing also removes its staged catalog resources and bindings.
+Exact repeated calls reuse immutable snapshots, including cached failures.
+A cached success remains the original published snapshot after a local artifact changes.
+A different uncached request still validates the current artifact bytes.
+
+Metadata, list pages, text parts, and indexes consume the existing session resource storage limits.
+Distinct list pages and text opens share the existing 64-call cache limit with retrieval and recovery.
+Repeated calls reuse the cache without another allocation.
+Resource reads retain the existing per-read limit.
+There is no cumulative delivered-byte limit or four-document reader limit.
+This feature has no default ranking or answer-quality claim.

@@ -30,6 +30,7 @@ stellar-raven-jev search "How do I extend the TTL of a Soroban persistent storag
 ```
 
 `--compact` prints one JSON object of about 10 KB: the ten best selected results, one per URL, with `probability`, `content_scope`, `url`, `excerpt`, and `text_path`.
+Each result carries `same_url_others`, the count of other selected results at the same URL. `not_shown` counts the rest. Uncertain results stay out of the compact list; `not_shown.uncertain` counts them, and the full report keeps them. A limit of `0` shows all selected results after URL deduplication.
 A typical call takes 5–8 seconds and costs under $0.01 in Jev usage.
 Read the `text_path` file for any result you cite. The excerpt holds 400 characters.
 
@@ -52,6 +53,7 @@ Scores estimate relevance. They do not verify accuracy or freshness. Retrieved t
 | `research_chunk` | A ranked chunk of a longer document |
 | `ai_summary` | A source summary, not the source itself |
 | `indexed_sections_or_metadata` | Search-index metadata |
+| `synthetic_record` | Generated context from a source registry, not original page text, even when the URL is official |
 
 ## Other commands
 
@@ -98,7 +100,8 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 2. Connectors fetch bounded documents from each selected source in parallel. Registry listings return one roster document with every row plus bounded per-row documents.
 3. Documents are admitted round-robin across sources up to the global limit. Each source keeps its upstream order.
 4. Jev scores each admitted document. Long documents are split into chunks scored in parallel; the document takes its maximum chunk score.
-5. Results are ordered by score. Ties break by content completeness, so a roster or full page precedes an index excerpt with the same score.
+5. Results are ordered by the `usable_evidence` score. Scores are rounded to whole percent, and ties break by content completeness, so a roster or full page precedes an index excerpt with the same score. `--rank-policy raw` uses exact scores. `--rank-policy banded-relevant` is experimental: it breaks ties by the `relevant` signal before completeness. Each score keeps all four Jev signals in `signals` as independent per-signal maxima across chunks; they do not describe one jointly supported chunk.
+6. Exact duplicates, same URL and identical text, are scored once. The score is copied to every original ID with its own provenance, so counts and labels do not change.
 
 ## Evidence
 
@@ -122,6 +125,15 @@ Sources need `LUMENLOOP_API_KEY`, `ALGOLIA_APPLICATION_ID_DOCS`, `ALGOLIA_API_KE
 On four frozen questions from the Raven golden set, a blinded answer test with a separate grader preferred answers written from this CLI's compact output in three of four cases against answers written from Stellar Raven's MCP responses, at 16–37 KB of evidence per question against 89–172 KB.
 Wall-clock time per question fell from 28–53 seconds to 5–6 seconds during the same work.
 These are single observations with one grader model. The evidence directories are local and not part of this repository.
+
+## Evaluation loop
+
+`eval-loop/` holds a 40-case development sample from the golden bank, a pass runner, Grok answerer and grader instructions, and per-pass result files. See [eval-loop/README.md](eval-loop/README.md). Raw run directories stay outside the repository.
+
+`eval-next/` tests direct claim support, document selection, and contextual passages on saved evidence.
+It uses six inspected diagnostic questions and 24 synthetic claims.
+See the [protocol](NEXT-EVAL-2026-09-22.md) and [report](eval-next/REPORT.md).
+These tests do not establish production superiority.
 
 ## Checks
 

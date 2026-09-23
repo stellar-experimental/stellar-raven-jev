@@ -1304,7 +1304,7 @@ mod tests {
     }
     #[test]
     fn saved_state_archival_html_excludes_scripts_and_navigation() {
-        let raw = include_str!("../../evidence/algolia/regression/state-archival.html");
+        let raw = include_str!("../../tests/fixtures/algolia/state-archival.html");
         let (text, scope) = html_article_text(raw).unwrap();
         eprintln!(
             "State Archival: raw_html_chars={} extracted_article_chars={}",
@@ -1324,7 +1324,7 @@ mod tests {
     }
     #[test]
     fn saved_state_archival_markdown_accepts_imports_in_code_fences() {
-        let raw = include_str!("../../evidence/algolia/regression/state-archival.md");
+        let raw = include_str!("../../tests/fixtures/algolia/state-archival.md");
         assert!(
             !unresolved_markdown_component(raw),
             "Code examples are not unresolved page components"
@@ -1457,7 +1457,7 @@ mod tests {
     }
     #[test]
     fn markdown_scoring_removes_metadata_without_removing_code_examples() {
-        let raw = include_str!("../../evidence/algolia/regression/state-archival.md");
+        let raw = include_str!("../../tests/fixtures/algolia/state-archival.md");
         let text = markdown_for_scoring(raw).unwrap();
         eprintln!(
             "State Archival: raw_markdown_chars={} scoring_markdown_chars={}",

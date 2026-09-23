@@ -117,6 +117,19 @@ fn write_metadata(path: &Path, value: &Value) -> Result<()> {
 }
 
 impl HttpRecorder {
+    #[cfg(test)]
+    pub(crate) fn loopback_for_test(run_dir: &Path, config: &RunConfig) -> Result<Self> {
+        let mut recorder = Self::new_bounded(run_dir, config, 64, 1024 * 1024, 10)?;
+        // Offline tests must not inherit a proxy or relax production URL rules.
+        recorder.client = Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .build()?;
+        recorder.allow_loopback = true;
+        Ok(recorder)
+    }
+
     pub fn run_dir(&self) -> &Path {
         &self.root
     }

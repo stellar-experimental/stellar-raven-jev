@@ -425,6 +425,7 @@ pub fn write_run_index(root: &Path) -> Result<()> {
         "usage.json",
         "documents.json",
         "omitted.json",
+        "fetch-omitted.json",
     ] {
         if root.join(name).is_file() {
             writeln!(index, "- [{}]({name})", label(name))?;
@@ -496,6 +497,25 @@ mod tests {
         );
     }
     #[test]
+    fn index_links_fetch_omissions_only_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        base(root, &[]);
+        write_run_index(root).unwrap();
+        assert!(!std::fs::read_to_string(root.join("INDEX.md"))
+            .unwrap()
+            .contains("fetch-omitted.json"));
+        save(
+            root,
+            "fetch-omitted.json",
+            json!([{"document":{"text":"omitted private body"}}]),
+        );
+        write_run_index(root).unwrap();
+        let index = std::fs::read_to_string(root.join("INDEX.md")).unwrap();
+        assert!(index.contains("[fetch-omitted.json](fetch-omitted.json)"));
+        assert!(!index.contains("omitted private body"));
+    }
+    #[test]
     fn classifies_only_explicit_stages_and_keeps_unknown_or_mixed_reports_visible() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -564,11 +584,15 @@ mod tests {
                     document_id: "a".into(),
                     probability: 0.98765,
                     reason: "saved reason".into(),
+                    signals: Default::default(),
+                    signals_aggregation: Default::default(),
                 },
                 DocumentScore {
                     document_id: "b".into(),
                     probability: 0.76,
                     reason: "other saved reason".into(),
+                    signals: Default::default(),
+                    signals_aggregation: Default::default(),
                 },
             ],
         );
@@ -650,6 +674,8 @@ mod tests {
             document_id: "a".into(),
             probability: 0.9,
             reason: "test".into(),
+            signals: Default::default(),
+            signals_aggregation: Default::default(),
         };
         save(root, "scores.json", vec![&score, &score]);
         write_run_index(root).unwrap();

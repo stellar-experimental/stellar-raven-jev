@@ -1,4 +1,5 @@
-//! Three retrieval operations. Query text is data. Endpoints stay fixed.
+//! Typed retrieval operations. Query text is data. Endpoints stay fixed.
+mod vocabulary;
 use crate::types::{Document, Failure, FetchResult};
 use anyhow::{bail, Context, Result};
 use reqwest::Method;
@@ -93,7 +94,8 @@ pub fn catalog() -> serde_json::Value {
                 "provider_limit": 100,
                 "text_scope": "The complete project row. codeReferences are separate documents when the response includes them.",
                 "continuation_supported": true
-            }
+            },
+            vocabulary::catalog_entry()
         ]
     })
 }
@@ -106,6 +108,7 @@ pub fn validate(operation: &str, arguments: &serde_json::Value) -> Result<()> {
         "connector.search" => validate_connector(map),
         "lumenloop.semantic" => validate_semantic(map),
         "scout.projects" => validate_projects(map),
+        "lumenloop.vocabulary" => vocabulary::validate(map),
         _ => bail!("unknown operation: {operation}"),
     }
 }
@@ -126,6 +129,7 @@ pub async fn fetch(
         "connector.search" => fetch_connector(ctx, arguments).await,
         "lumenloop.semantic" => fetch_semantic(ctx, arguments, lumenloop_key().as_deref()).await,
         "scout.projects" => fetch_projects(ctx, arguments).await,
+        "lumenloop.vocabulary" => vocabulary::fetch(ctx, arguments).await,
         _ => bail!("unknown operation: {operation}"),
     }
 }
@@ -633,6 +637,21 @@ fn collect_semantic(
     if omitted > 0 {
         failure(result, "lumenloop.semantic", format!("The document limit omitted {omitted} returned records after alternating requested collections. Complete provider rows remain in {artifact}."));
     }
+    for document in groups.into_iter().flatten() {
+        retain_semantic_omission(result, document);
+    }
+}
+
+fn retain_semantic_omission(result: &mut FetchResult, mut document: Document) {
+    if !document.provenance.is_object() {
+        document.provenance = json!({"source_provenance":document.provenance});
+    }
+    let mut admission = json!({"reason":"call_document_limit"});
+    if let Some(prior) = document.provenance.get("admission") {
+        admission["prior_admission"] = prior.clone();
+    }
+    document.provenance["admission"] = admission;
+    result.omitted_documents.push(document);
 }
 
 fn note_unparsed_payload(result: &mut FetchResult, payload: &SemanticPayload, artifact: &str) {
@@ -1222,6 +1241,7 @@ async fn request_json(
 fn fixture_semantic(arguments: &Value) -> FetchResult {
     let query = arguments["query"].as_str().unwrap_or("");
     FetchResult {
+        omitted_documents: vec![],
         documents: vec![Document {
             id: "lumenloop.semantic:fixture".into(),
             source_id: "lumenloop.semantic".into(),
@@ -1251,6 +1271,7 @@ fn fixture_projects(arguments: &Value) -> FetchResult {
     let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0);
     let filters = sent_filters(query, status, awarded, limit, offset);
     FetchResult {
+        omitted_documents: vec![],
         documents: vec![Document {
             id: "stellarlight.projects:fixture-operation".into(),
             source_id: "stellarlight.projects".into(),
@@ -1345,6 +1366,103 @@ mod tests {
     }
 
     #[test]
+    fn semantic_omissions_preserve_parsed_rows_without_changing_admission() {
+        let arguments = json!({"query":"storage","types":["research","articles","av"],"limit":10});
+        let data = json!({
+            "research":[{"id":1,"summary":"r1"},{"id":2,"summary":"r2"}],
+            "articles":[{"id":3,"summary":"a1"},{"id":4,"summary":"a2"}],
+            "av":[{"id":5,"summary":"v1"},{"id":6,"summary":"v2"}]
+        });
+        let metadata = search_metadata(&data);
+        let parsed: Vec<_> = ["research", "articles", "av"]
+            .iter()
+            .flat_map(|kind| {
+                data[kind].as_array().unwrap().iter().map(|row| {
+                    semantic_document(kind, row, "raw/test.body", &metadata, 10).unwrap()
+                })
+            })
+            .collect();
+        let payloads = vec![SemanticPayload {
+            block_index: None,
+            data,
+        }];
+        let mut full = FetchResult::default();
+        collect_semantic(&mut full, &arguments, &payloads, "raw/test.body", 10, 6);
+        let expected: Vec<_> = [0, 2, 4, 1, 3, 5].iter().map(|i| &parsed[*i]).collect();
+        assert_eq!(
+            serde_json::to_value(&full.documents).unwrap(),
+            json!(expected)
+        );
+        assert!(full.omitted_documents.is_empty());
+        assert!(full.failures.is_empty());
+        for cap in 0..6 {
+            let mut result = FetchResult::default();
+            collect_semantic(&mut result, &arguments, &payloads, "raw/test.body", 10, cap);
+            assert_eq!(
+                serde_json::to_value(&result.documents).unwrap(),
+                json!(&expected[..cap])
+            );
+            assert_eq!(result.omitted_documents.len(), 6 - cap);
+            for omitted in &result.omitted_documents {
+                assert!(!result.documents.iter().any(|d| d.id == omitted.id));
+                assert_eq!(
+                    omitted.provenance["admission"]["reason"],
+                    "call_document_limit"
+                );
+                let mut original = omitted.clone();
+                original
+                    .provenance
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("admission");
+                let parsed = parsed.iter().find(|d| d.id == omitted.id).unwrap();
+                assert_eq!(serde_json::to_value(original).unwrap(), json!(parsed));
+            }
+            assert_eq!(result.failures.len(), 1);
+            assert_eq!(result.failures[0].message, format!("The document limit omitted {} returned records after alternating requested collections. Complete provider rows remain in raw/test.body.", 6 - cap));
+        }
+    }
+
+    #[test]
+    fn semantic_omission_keeps_existing_provenance_and_provider_identity() {
+        let document = Document {
+            id: "provider:same".into(),
+            source_id: "lumenloop.articles".into(),
+            title: "Original".into(),
+            url: "https://example.invalid/one".into(),
+            text: "Exact UTF-8: naïve\n".into(),
+            provenance: json!({"admission":{"reason":"prior","other":7},"record_id":"same"}),
+            raw_artifacts: vec!["raw/original.body".into()],
+        };
+        let mut result = FetchResult::default();
+        result.documents.push(document.clone());
+        retain_semantic_omission(&mut result, document.clone());
+        let omitted = &result.omitted_documents[0];
+        assert_eq!(omitted.id, document.id);
+        assert_eq!(omitted.text, document.text);
+        assert_eq!(omitted.raw_artifacts, document.raw_artifacts);
+        assert_eq!(
+            omitted.provenance["admission"]["prior_admission"],
+            document.provenance["admission"]
+        );
+        assert_eq!(omitted.provenance["record_id"], "same");
+        let mut scalar = document;
+        scalar.provenance = json!("original scalar");
+        retain_semantic_omission(&mut result, scalar);
+        assert_eq!(
+            result.omitted_documents[1].provenance["source_provenance"],
+            "original scalar"
+        );
+    }
+
+    #[test]
+    fn archived_fetch_result_defaults_to_no_reported_omissions() {
+        let result: FetchResult =
+            serde_json::from_value(json!({"documents":[],"failures":[]})).unwrap();
+        assert!(result.omitted_documents.is_empty());
+    }
+
+    #[test]
     fn mixed_date_bounds_compare_utc_instants() {
         assert!(validate(
             "lumenloop.semantic",
@@ -1377,13 +1495,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_lists_the_three_operations() {
+    fn catalog_lists_the_four_operations() {
         let catalog = catalog();
         let operations = catalog["operations"].as_array().unwrap();
-        assert_eq!(operations.len(), 3);
+        assert_eq!(operations.len(), 4);
         assert_eq!(operations[0]["operation"], "connector.search");
         assert_eq!(operations[1]["operation"], "lumenloop.semantic");
         assert_eq!(operations[2]["operation"], "scout.projects");
+        assert_eq!(operations[3]["operation"], "lumenloop.vocabulary");
         assert_eq!(operations[1]["provider_limit"], 100);
         assert_eq!(operations[1]["continuation_supported"], false);
         assert_eq!(operations[2]["provider_limit"], 100);

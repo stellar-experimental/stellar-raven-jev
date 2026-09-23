@@ -26,3 +26,12 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+# Evaluation harnesses, findings, and session notes stay local.
+/eval-*/
+/EVIDENCE-EXPERIMENT.md
+/NEXT-EVAL-*.md
+/PASSAGE-REQUIREMENTS-NOTES.md
+/REVIEW-*.md
+/examples/repack_evidence.py
+/examples/test_repack_evidence.py

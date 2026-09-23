@@ -494,8 +494,36 @@ async fn execute(
         evidence.failures.push(failure("document_limit",Some(source_id),format!("Omitted {count} fetched documents from scoring; inspect omitted.json and --max-documents")));
     }
     persist(config, &evidence, &backend.usage(), "running")?;
+    // Exact duplicates are scored once. Jev sees the title and the text, so both are in the key.
+    // The score fans back to every original ID with its own provenance, so counts, labels, and run
+    // status do not change.
+    let mut representatives: BTreeMap<(String, String, String), String> = BTreeMap::new();
+    let mut duplicates: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+    let mut to_score = Vec::new();
+    for document in evidence.documents.clone() {
+        if document.url.is_empty() {
+            to_score.push(document);
+            continue;
+        }
+        // A tuple key, not a joined string: a separator can appear inside either field.
+        let key = (
+            document.url.clone(),
+            document.title.clone(),
+            text_digest(&document.text),
+        );
+        match representatives.get(&key) {
+            Some(representative) => duplicates
+                .entry(representative.clone())
+                .or_default()
+                .push(document),
+            None => {
+                representatives.insert(key, document.id.clone());
+                to_score.push(document);
+            }
+        }
+    }
     // Keep Jev budget and retry accounting inside JevClient. Do not cancel its paid requests externally.
-    let scoring = stream::iter(evidence.documents.clone())
+    let scoring = stream::iter(to_score)
         .map(|document| async move {
             let result = backend.score_document(question, &document).await;
             (document, result)
@@ -516,14 +544,16 @@ async fn execute(
             Ok(score)
         }) {
             Ok(score) => {
-                if score.probability >= config.document_threshold {
-                    evidence.selected.push(document);
-                } else if score.probability >= config.uncertain_threshold {
-                    evidence.uncertain.push(document);
-                } else {
-                    evidence.rejected.push(document);
+                for copy in duplicates.remove(&document.id).unwrap_or_default() {
+                    let mut copied = score.clone();
+                    copied.document_id = copy.id.clone();
+                    copied.reason = format!(
+                        "Score copied from {} (same URL, title, and text). {}",
+                        document.id, score.reason
+                    );
+                    classify(&mut evidence, config, copy, copied);
                 }
-                evidence.scores.push(score);
+                classify(&mut evidence, config, document, score);
             }
             Err(error) => {
                 evidence.failures.push(failure(
@@ -531,6 +561,9 @@ async fn execute(
                     Some(&document.source_id),
                     format!("{}: {error}", document.id),
                 ));
+                for copy in duplicates.remove(&document.id).unwrap_or_default() {
+                    evidence.uncertain.push(copy);
+                }
                 evidence.uncertain.push(document);
             }
         }
@@ -567,6 +600,22 @@ async fn execute(
     Ok(outcome)
 }
 
+fn text_digest(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn classify(evidence: &mut Evidence, config: &RunConfig, document: Document, score: DocumentScore) {
+    if score.probability >= config.document_threshold {
+        evidence.selected.push(document);
+    } else if score.probability >= config.uncertain_threshold {
+        evidence.uncertain.push(document);
+    } else {
+        evidence.rejected.push(document);
+    }
+    evidence.scores.push(score);
+}
+
 fn validate_routes(sources: &[Source], scores: &[SourceScore]) -> Result<()> {
     let expected: BTreeSet<_> = sources.iter().map(|s| s.id.as_str()).collect();
     let actual: BTreeSet<_> = scores.iter().map(|s| s.source_id.as_str()).collect();
@@ -600,6 +649,10 @@ mod tests {
         ranked: bool,
         fill_source_limit: bool,
         stall_a: bool,
+        shared_url: bool,
+        distinct_title: bool,
+        distinct_text: bool,
+        nul_collision: bool,
     }
     #[async_trait]
     impl Backend for Mock {
@@ -638,12 +691,26 @@ mod tests {
                 return Ok(FetchResult::default());
             }
             let mut result = FetchResult {
+                omitted_documents: vec![],
                 documents: vec![Document {
                     id: "same-id".into(),
                     source_id: source.id.clone(),
-                    title: "full".into(),
-                    url: "https://example.org".into(),
-                    text: "Full available document body".into(),
+                    title: if self.distinct_title {
+                        format!("full {}", source.id)
+                    } else {
+                        "full".into()
+                    },
+                    // Distinct URLs per source unless a test asks for exact duplicates.
+                    url: if self.shared_url {
+                        "https://example.org".into()
+                    } else {
+                        format!("https://example.org/{}", source.id)
+                    },
+                    text: if self.distinct_text {
+                        format!("Full available document body from {}", source.id)
+                    } else {
+                        "Full available document body".into()
+                    },
                     provenance: json!({"fixture":true}),
                     raw_artifacts: vec![],
                 }],
@@ -655,12 +722,23 @@ mod tests {
                 second.id = "a".into();
                 result.documents.push(second);
             }
+            if self.nul_collision {
+                // (title "a", text "b\0c") and (title "a\0b", text "c") join to the same bytes.
+                let (title, text) = if source.id == "a" {
+                    ("a", "b\u{0}c")
+                } else {
+                    ("a\u{0}b", "c")
+                };
+                result.documents[0].title = title.into();
+                result.documents[0].text = text.into();
+            }
             if self.fill_source_limit {
                 let template = result.documents[0].clone();
                 result.documents = (0..ctx.config.max_documents)
                     .map(|index| {
                         let mut document = template.clone();
                         document.id = index.to_string();
+                        document.url = format!("{}/{index}", template.url);
                         document
                     })
                     .collect();
@@ -676,6 +754,8 @@ mod tests {
                 document_id: document.id.clone(),
                 probability: 0.8,
                 reason: "fixture".into(),
+                signals: Default::default(),
+                signals_aggregation: Default::default(),
             })
         }
         fn usage(&self) -> Usage {
@@ -694,6 +774,10 @@ mod tests {
             ranked: false,
             fill_source_limit: false,
             stall_a: false,
+            shared_url: false,
+            distinct_title: false,
+            distinct_text: false,
+            nul_collision: false,
         }
     }
     fn sources() -> Vec<Source> {
@@ -913,6 +997,106 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected[0].source_id, "b");
+    }
+    #[tokio::test]
+    async fn exact_duplicates_score_once_and_fan_back_to_every_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = mock();
+        backend.shared_url = true;
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().into(),
+            ..Default::default()
+        };
+        // Sources a and b both return an identical document at the same URL.
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, "complete");
+        assert_eq!(outcome.selected, 2);
+        assert_eq!(backend.scored.load(Ordering::SeqCst), 1);
+        let scores: Vec<DocumentScore> =
+            serde_json::from_slice(&std::fs::read(outcome.directory.join("scores.json")).unwrap())
+                .unwrap();
+        assert_eq!(scores.len(), 2);
+        let copied = scores
+            .iter()
+            .find(|s| s.reason.starts_with("Score copied from"))
+            .unwrap();
+        assert_eq!(copied.probability, 0.8);
+        assert!(copied.reason.contains("a::same-id"));
+        assert_eq!(copied.document_id, "b::same-id");
+    }
+    #[tokio::test]
+    async fn same_url_with_different_title_or_text_is_scored_separately() {
+        // Jev sees the title with the text, so a different title is different scoring input.
+        for (distinct_title, distinct_text) in [(true, false), (false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut backend = mock();
+            backend.shared_url = true;
+            backend.distinct_title = distinct_title;
+            backend.distinct_text = distinct_text;
+            let config = RunConfig {
+                fixture: true,
+                output_dir: dir.path().into(),
+                ..Default::default()
+            };
+            let outcome = run_with_backend("question", &config, &sources(), &backend)
+                .await
+                .unwrap();
+            assert_eq!(outcome.selected, 2);
+            assert_eq!(backend.scored.load(Ordering::SeqCst), 2);
+            let scores: Vec<DocumentScore> = serde_json::from_slice(
+                &std::fs::read(outcome.directory.join("scores.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(scores.iter().all(|s| !s.reason.starts_with("Score copied")));
+        }
+    }
+    #[tokio::test]
+    async fn dedup_key_is_not_fooled_by_separator_bytes_inside_title_or_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = mock();
+        backend.shared_url = true;
+        backend.nul_collision = true;
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        assert_eq!(outcome.selected, 2);
+        assert_eq!(backend.scored.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn failed_representative_leaves_every_duplicate_uncertain_with_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = mock();
+        backend.shared_url = true;
+        backend.fail_score = true;
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        assert_eq!(backend.scored.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.uncertain, 2);
+        assert_eq!(outcome.selected, 0);
+        assert_eq!(outcome.failures, 1);
+        let uncertain: Vec<Document> = serde_json::from_slice(
+            &std::fs::read(outcome.directory.join("uncertain.json")).unwrap(),
+        )
+        .unwrap();
+        let sources_seen: BTreeSet<_> = uncertain.iter().map(|d| d.source_id.as_str()).collect();
+        assert_eq!(sources_seen, BTreeSet::from(["a", "b"]));
+        assert!(uncertain
+            .iter()
+            .all(|d| d.provenance == json!({"fixture":true})));
     }
     #[tokio::test]
     async fn route_failure_does_not_silently_fallback() {

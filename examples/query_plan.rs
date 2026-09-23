@@ -804,6 +804,7 @@ async fn execute(plan: &Plan, output: &Path, fixture: bool) -> Result<Value, Str
         let result = match connectors::fetch(&ctx, &source, &call.query).await {
             Ok(result) => result,
             Err(error) => FetchResult {
+                omitted_documents: vec![],
                 documents: Vec::new(),
                 failures: vec![Failure {
                     stage: "fetch".into(),
@@ -1228,6 +1229,7 @@ mod tests {
                 max_pages: 1,
             },
             result: FetchResult {
+                omitted_documents: vec![],
                 documents,
                 failures: Vec::new(),
             },

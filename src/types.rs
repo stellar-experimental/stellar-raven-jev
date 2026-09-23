@@ -31,6 +31,9 @@ pub struct Failure {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FetchResult {
     pub documents: Vec<Document>,
+    /// Parsed documents explicitly omitted by an adapter, not unreturned provider rows.
+    #[serde(default)]
+    pub omitted_documents: Vec<Document>,
     pub failures: Vec<Failure>,
 }
 
@@ -46,6 +49,14 @@ pub struct DocumentScore {
     pub document_id: String,
     pub probability: f64,
     pub reason: String,
+    /// Every Jev signal for the document. Empty for older runs and fixtures.
+    #[serde(default)]
+    pub signals: std::collections::BTreeMap<String, f64>,
+    /// How `signals` was built. `independent_max_per_signal_across_chunks` means each value is the
+    /// maximum of that signal over the document's chunks; different signals can come from different
+    /// chunks, so the map is not one jointly supported evidence vector.
+    #[serde(default)]
+    pub signals_aggregation: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

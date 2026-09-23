@@ -87,6 +87,30 @@ enum Command {
         /// bounded by --limit, with report counts. The saved search.json stays complete.
         #[arg(long)]
         compact: bool,
+        /// Result ordering: banded rounds scores to whole percent before secondary keys; raw does not.
+        #[arg(long, value_enum, default_value = "banded")]
+        rank_policy: stellar_raven_jev::search::RankPolicy,
+    },
+    /// Rebuild the search report from a saved run directory without retrieval or scoring.
+    Report {
+        directory: PathBuf,
+        /// Name for the replayed output files, so the original search.json stays unchanged.
+        #[arg(long, default_value = "replay")]
+        variant: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        full_text: bool,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long)]
+        compact: bool,
+        /// Fill missing per-signal maxima from the run's Jev audit traces, labeled as a projection.
+        #[arg(long)]
+        signals_from_traces: bool,
+        /// Result ordering: banded rounds scores to whole percent before secondary keys; raw does not.
+        #[arg(long, value_enum, default_value = "banded")]
+        rank_policy: stellar_raven_jev::search::RankPolicy,
     },
     /// List typed operation schemas and retrieval capabilities.
     Operations,
@@ -103,7 +127,14 @@ enum Command {
     /// Check local settings and authentication presence without network requests.
     Doctor,
     /// Serve local MCP over stdio. The budget applies to the complete server session.
-    Mcp,
+    Mcp {
+        /// Enable experimental, session-bound primary Markdown body recovery.
+        #[arg(long)]
+        primary_body: bool,
+        /// Inspect and read already saved classified documents without network or scoring.
+        #[arg(long)]
+        saved_pool: bool,
+    },
 }
 
 fn report(outcome: &RunOutcome) -> Result<()> {
@@ -255,7 +286,7 @@ async fn main() -> Result<()> {
         );
         dotenvy::from_path(path)
             .map_err(|_| anyhow::anyhow!("Cannot load the explicit JEV_ENV_FILE or --env-file"))?;
-    } else if matches!(cli.command, Command::Mcp) {
+    } else if matches!(cli.command, Command::Mcp { .. }) {
         // An MCP host can start in another project's working directory.
         // Load credentials only from its explicit trusted configuration.
     } else {
@@ -295,6 +326,7 @@ async fn main() -> Result<()> {
             full_text,
             limit,
             compact,
+            rank_policy,
         } => {
             eprintln!(
                 "Retrieving and scoring sources. Full evidence will remain in the run directory."
@@ -302,7 +334,13 @@ async fn main() -> Result<()> {
             let outcome =
                 stellar_raven_jev::pipeline::run_question_scoped(&question, &config, resources)
                     .await?;
-            let report = stellar_raven_jev::search::build_report(&outcome, full_text)?;
+            let report = stellar_raven_jev::search::build_report_variant(
+                &outcome,
+                full_text,
+                None,
+                false,
+                rank_policy,
+            )?;
             if compact {
                 let projection = stellar_raven_jev::search::compact_report(&report, limit);
                 println!("{}", serde_json::to_string(&projection)?);
@@ -313,6 +351,37 @@ async fn main() -> Result<()> {
             }
             if outcome.status != "complete" {
                 std::process::exit(if outcome.status == "partial" { 2 } else { 1 });
+            }
+        }
+        Command::Report {
+            directory,
+            variant,
+            json,
+            full_text,
+            limit,
+            compact,
+            signals_from_traces,
+            rank_policy,
+        } => {
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
+            let mut outcome: RunOutcome = serde_json::from_value(manifest["outcome"].clone())
+                .context("manifest.json lacks a run outcome")?;
+            outcome.directory = directory;
+            let report = stellar_raven_jev::search::build_report_variant(
+                &outcome,
+                full_text,
+                Some(&variant),
+                signals_from_traces,
+                rank_policy,
+            )?;
+            if compact {
+                let projection = stellar_raven_jev::search::compact_report(&report, limit);
+                println!("{}", serde_json::to_string(&projection)?);
+            } else if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", stellar_raven_jev::search::render_text(&report, limit));
             }
         }
         Command::Operations => println!(
@@ -341,7 +410,18 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Mcp => stellar_raven_jev::mcp::serve(config).await?,
+        Command::Mcp {
+            primary_body,
+            saved_pool,
+        } => {
+            if saved_pool {
+                stellar_raven_jev::mcp::serve_with_options(config, primary_body, true).await?
+            } else if primary_body {
+                stellar_raven_jev::mcp::serve_with_primary_body(config).await?
+            } else {
+                stellar_raven_jev::mcp::serve(config).await?
+            }
+        }
         Command::Ask { question } => {
             let outcome = run_question(&question, &config).await?;
             report(&outcome)?;
@@ -426,6 +506,30 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_saved_pool_flag_is_independent() {
+        for (flags, primary, saved) in [
+            (vec![], false, false),
+            (vec!["--primary-body"], true, false),
+            (vec!["--saved-pool"], false, true),
+            (vec!["--primary-body", "--saved-pool"], true, true),
+        ] {
+            let mut args = vec!["stellar-raven-jev", "mcp", "--fixture", "--budget-usd", "0"];
+            args.extend(flags);
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.command {
+                Command::Mcp {
+                    primary_body,
+                    saved_pool,
+                } => {
+                    assert_eq!(primary_body, primary);
+                    assert_eq!(saved_pool, saved);
+                }
+                _ => panic!("Expected MCP"),
+            }
+        }
+    }
 
     fn profile_env(key: &str) -> Option<String> {
         match key {
