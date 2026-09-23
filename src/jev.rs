@@ -129,6 +129,12 @@ pub struct JevClient {
 }
 
 impl JevClient {
+    /// Tests of circuit mechanics open it at the first unresolved attempt.
+    #[cfg(test)]
+    pub(crate) fn open_circuit_after_for_test(&self, attempts: u32) {
+        self.ledger.lock().unwrap().unresolved_stop_after = attempts;
+    }
+
     #[cfg(test)]
     pub(crate) fn loopback_for_test(config: &RunConfig, url: String) -> Result<Self> {
         let mut offline = config.clone();
@@ -693,6 +699,8 @@ impl JevClient {
                     trace["accounting"] =
                         json!("Full reservation retained; provider completion is unknown.");
                     self.write_audit(&audit_name, &trace)?;
+                    // Accounted by retain_unresolved; the drop guard must not stop the client again.
+                    pending.finished = true;
                     bail!("Jev transport failed; the reservation remains charged. Audit: jev/{audit_name}.json");
                 }
             };
@@ -709,6 +717,7 @@ impl JevClient {
                 trace["state"] = json!("http_error");
                 trace["accounting"] = json!("Full reservation retained; no usage receipt.");
                 let path = self.write_audit(&audit_name, &trace)?;
+                pending.finished = true;
                 bail!("Jev returned HTTP {}. Audit: {path}", response.status);
             }
             // Parse raw bytes to detect duplicate JSON keys before serde_json can erase them.
@@ -2183,6 +2192,75 @@ mod tests {
             assert!(!client.stop_on_authentication_failure(status).unwrap());
         }
         assert!(client.reserve().is_ok());
+    }
+
+    #[tokio::test]
+    async fn one_upstream_block_page_does_not_stop_later_scoring_through_evaluate() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        const BLOCK: &str = r#"{"errors":[{"message":"Payment error from model using BYOK: <title>Attention Required! | Cloudflare</title>"}]}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/evaluate", listener.local_addr().unwrap());
+        let client = JevClient::loopback_for_test(
+            &RunConfig {
+                output_dir: dir.path().to_path_buf(),
+                budget_usd: 1.0,
+                timeout_secs: 2,
+                ..RunConfig::default()
+            },
+            url,
+        )
+        .unwrap();
+        let reservation = client.backend.reservation().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                ("402 Payment Required", BLOCK.to_string()),
+                ("200 OK", response().to_string()),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut input = [0; 16384];
+                assert!(socket.read(&mut input).await.unwrap() > 0);
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let questions = || {
+            Map::from_iter([
+                ("a".into(), json!({"type":"noul"})),
+                ("b".into(), json!({"type":"noul"})),
+            ])
+        };
+        let first = client
+            .evaluate(json!({"fixture":1}), questions(), json!({}))
+            .await;
+        assert!(first.unwrap_err().to_string().contains("HTTP 402"));
+        assert!(
+            client.spending_stop_reason().is_none(),
+            "one unresolved attempt must not stop the client"
+        );
+        let (answers, _) = client
+            .evaluate(json!({"fixture":2}), questions(), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(answers.len(), 2);
+        server.await.unwrap();
+        let ledger = client.ledger.lock().unwrap();
+        assert_eq!(ledger.in_flight, 0);
+        assert_eq!(ledger.consecutive_unresolved, 0);
+        let settled = client
+            .backend
+            .cost_nanos(100 + MAX_INPUT_TOKENS * (client.backend.upstream_attempts() - 1))
+            .unwrap();
+        assert_eq!(
+            ledger.accounted_nanos,
+            reservation + settled,
+            "the failed attempt keeps its full reservation"
+        );
     }
 
     async fn evaluate_one(client: &JevClient) -> Result<(BTreeMap<String, f64>, String)> {

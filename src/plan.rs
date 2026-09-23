@@ -558,6 +558,8 @@ mod tests {
             format!("http://{}/evaluate", listener.local_addr().unwrap()),
         )
         .unwrap();
+        // This test covers plan gating after the circuit opens, so it opens at one attempt.
+        jev.open_circuit_after_for_test(1);
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut bytes = [0; 8192];
