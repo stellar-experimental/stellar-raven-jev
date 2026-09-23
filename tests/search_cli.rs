@@ -16,7 +16,10 @@ fn failed_initialization_still_returns_a_json_report_and_failure_exit() {
     let temp = tempfile::tempdir().unwrap();
     let output = cli()
         .current_dir(temp.path())
-        .env("JEV_BACKEND", "invalid")
+        // No Cloudflare settings: Jev cannot start, and the run fails at initialization.
+        .env_remove("CLOUDFLARE_ACCOUNT_ID")
+        .env_remove("CLOUDFLARE_API_TOKEN")
+        .env_remove("JEV_CLOUDFLARE_AUTH_PROFILE")
         .args(["search", "Stellar RPC", "--resources", "agentic", "--json"])
         .output()
         .unwrap();
@@ -98,15 +101,6 @@ fn agentic_search_filters_before_routing_and_delivers_exact_text() {
         assert_eq!(row["text_bytes"], text.len());
         assert!(row.get("document_path").is_none());
     }
-    for gone in [
-        "INDEX.md",
-        "documents",
-        "selected.json",
-        "uncertain.json",
-        "rejected.json",
-    ] {
-        assert!(!root.join(gone).exists(), "{gone} is no longer written");
-    }
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
     assert!(manifest["artifacts"]["files"]
@@ -158,16 +152,6 @@ fn default_search_prints_compact_json_and_keeps_a_light_record() {
     let replay = cli().arg("report").arg(root).output().unwrap();
     assert_eq!(replay.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&replay.stderr).contains("--full-record"));
-    // The old --compact flag is still accepted.
-    let legacy = cli()
-        .args(["--fixture", "--output-dir"])
-        .arg(temp.path())
-        .args(["search", "Stellar RPC events", "--compact"])
-        .output()
-        .unwrap();
-    assert!(matches!(legacy.status.code(), Some(0 | 2)));
-    let legacy: Value = serde_json::from_slice(&legacy.stdout).unwrap();
-    assert_eq!(legacy["compact"], true);
 }
 
 #[test]

@@ -46,13 +46,11 @@ pub struct DocumentScore {
     pub document_id: String,
     pub probability: f64,
     pub reason: String,
-    /// Every Jev signal for the document. Empty for older runs and fixtures.
-    #[serde(default)]
+    /// Every Jev signal for the document. Empty for fixtures.
     pub signals: std::collections::BTreeMap<String, f64>,
     /// How `signals` was built. `independent_max_per_signal_across_chunks` means each value is the
     /// maximum of that signal over the document's chunks; different signals can come from different
     /// chunks, so the map is not one jointly supported evidence vector.
-    #[serde(default)]
     pub signals_aggregation: String,
 }
 
@@ -73,9 +71,7 @@ pub struct RunConfig {
     pub concurrency: usize,
     pub max_pages: usize,
     pub max_documents: usize,
-    #[serde(default = "default_per_source_documents")]
     pub per_source_documents: usize,
-    #[serde(default = "default_fetch_deadline_secs")]
     pub fetch_deadline_secs: u64,
     pub max_body_bytes: usize,
     pub route_passes: usize,
@@ -84,20 +80,7 @@ pub struct RunConfig {
     pub uncertain_threshold: f64,
     /// Write the full audit record (raw HTTP bodies, Jev traces, document store, and
     /// classification) instead of only the report and the text files it names.
-    #[serde(default = "default_full_record")]
     pub full_record: bool,
-}
-
-fn default_full_record() -> bool {
-    true
-}
-
-fn default_per_source_documents() -> usize {
-    12
-}
-
-fn default_fetch_deadline_secs() -> u64 {
-    10
 }
 
 impl Default for RunConfig {
@@ -110,8 +93,8 @@ impl Default for RunConfig {
             concurrency: 16,
             max_pages: 2,
             max_documents: 400,
-            per_source_documents: default_per_source_documents(),
-            fetch_deadline_secs: default_fetch_deadline_secs(),
+            per_source_documents: 12,
+            fetch_deadline_secs: 10,
             max_body_bytes: 8 * 1024 * 1024,
             route_passes: 2,
             source_threshold: 0.2,
@@ -126,20 +109,4 @@ impl Default for RunConfig {
 pub struct FetchContext {
     pub http: crate::http::HttpRecorder,
     pub config: RunConfig,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn old_run_config_defaults_per_source_documents_to_twelve() {
-        let mut value = serde_json::to_value(RunConfig::default()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("per_source_documents");
-        let config: RunConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(config.per_source_documents, 12);
-    }
 }

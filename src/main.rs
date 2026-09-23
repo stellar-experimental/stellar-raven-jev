@@ -83,9 +83,6 @@ enum Command {
         /// every scored document, and routing. By default only the report and its text files stay.
         #[arg(long)]
         full_record: bool,
-        /// Accepted for compatibility; compact output is the default.
-        #[arg(long, hide = true)]
-        compact: bool,
         /// Result ordering: banded rounds scores to whole percent before secondary keys; raw does not.
         #[arg(long, value_enum, default_value = "banded", hide = true)]
         rank_policy: stellar_raven_jev::search::RankPolicy,
@@ -105,9 +102,6 @@ enum Command {
         /// Results in the compact output, one per URL. Zero shows all selected results.
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        /// Accepted for compatibility; compact output is the default.
-        #[arg(long, hide = true)]
-        compact: bool,
         /// Result ordering: banded rounds scores to whole percent before secondary keys; raw does not.
         #[arg(long, value_enum, default_value = "banded", hide = true)]
         rank_policy: stellar_raven_jev::search::RankPolicy,
@@ -195,8 +189,7 @@ fn profile_doctor_check(
     if config.fixture {
         return Ok(None);
     }
-    let backend = env("JEV_BACKEND").unwrap_or_else(|| "cloudflare".into());
-    if backend != "cloudflare" || env("CLOUDFLARE_API_TOKEN").is_some() {
+    if env("CLOUDFLARE_API_TOKEN").is_some() {
         return Ok(None);
     }
     let Some(profile) = env("JEV_CLOUDFLARE_AUTH_PROFILE") else {
@@ -300,7 +293,6 @@ async fn main() -> Result<()> {
             full_text,
             limit,
             full_record,
-            compact: _,
             rank_policy,
         } => {
             config.full_record = full_record;
@@ -332,12 +324,10 @@ async fn main() -> Result<()> {
             json,
             full_text,
             limit,
-            compact: _,
             rank_policy,
         } => {
             anyhow::ensure!(
-                directory.join("documents.json").is_file()
-                    || directory.join("selected.json").is_file(),
+                directory.join("documents.json").is_file(),
                 "report needs a run saved with --full-record; {} holds only the search report",
                 directory.display()
             );
@@ -411,7 +401,6 @@ mod tests {
 
     fn profile_env(key: &str) -> Option<String> {
         match key {
-            "JEV_BACKEND" => Some("cloudflare".into()),
             "CLOUDFLARE_ACCOUNT_ID" => Some("00000000000000000000000000000000".into()),
             "JEV_CLOUDFLARE_AUTH_PROFILE" => Some("personal".into()),
             _ => None,

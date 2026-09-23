@@ -118,24 +118,19 @@ With `--full-record`, a run keeps the complete audit record below, about 3 MB. E
 | `jev/` | One audit trace per paid attempt (request, reservation, receipt, answers) and one chunk record per document |
 | `manifest.json` | The outcome, configuration, `phase_ms` timings, and file and byte totals |
 
-`report` also replays full runs saved before this layout, which used `selected.json` and `uncertain.json`.
 `manifest.json` records `phase_ms` for routing, fetching, scoring, and finalization.
 Run directories use owner-only permissions on Unix. Raw responses can contain private source content.
 
 ## Configuration
 
-Jev runs through Cloudflare Workers AI. Set `CLOUDFLARE_ACCOUNT_ID` and either `CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_AUTH_PROFILE` (a Wrangler profile). `JEV_GATEWAY_ID` is optional and defaults to `default`. `JEV_BACKEND`, when set, must be `cloudflare`.
+Jev runs through Cloudflare Workers AI. Set `CLOUDFLARE_ACCOUNT_ID` and either `CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_AUTH_PROFILE` (a Wrangler profile). `JEV_GATEWAY_ID` is optional and defaults to `default`.
 
 With a Wrangler profile, each run obtains its token through `wrangler auth token --profile NAME --json`. The token stays in memory. The profile token must belong to the pinned account; a mismatch produces HTTP 401 on every Jev call.
 Sources need `LUMENLOOP_API_KEY`, `ALGOLIA_APPLICATION_ID_DOCS`, `ALGOLIA_API_KEY_DOCS`, `ALGOLIA_APPLICATION_ID_SITE`, and `ALGOLIA_API_KEY_SITE`. Stellar Scout needs no credential.
 
-## Results so far
+## Results
 
-On four frozen questions from the Raven golden set, a blinded answer test with a separate grader preferred answers written from this CLI's compact output in three of four cases against answers written from Stellar Raven's MCP responses, at 16–37 KB of evidence per question against 89–172 KB.
-Wall-clock time per question fell from 28–53 seconds to 5–6 seconds during the same work.
-These are single observations with one grader model. The evidence directories are local and not part of this repository.
-
-On a 40-question development sample, two independent Grok answerers wrote answers from the compact output with at most four follow-up file reads. Two fresh Grok graders scored them against reference key facts. Mean key-fact coverage was 0.75 (0.71 and 0.79 for the two replicas). The median reader input was about 23 KB per question. Two defects fixed on 2026-09-23 caused the earlier figure of 0.51: budget starvation of parallel scoring, and a failure circuit that one upstream block page opened. Replicas differ by about 0.11 per question, so a single replica cannot resolve a smaller change.
+On a 40-question development sample, two independent Grok answerers wrote answers from the compact output with at most four follow-up file reads. Two fresh Grok graders scored them against reference key facts. Mean key-fact coverage was 0.75 (0.71 and 0.79 for the two replicas). The median reader input was about 23 KB per question. Replicas differ by about 0.11 per question, so a single replica cannot resolve a smaller change.
 
 ## Evaluation
 

@@ -58,17 +58,10 @@ fn validate_variant(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Selected and uncertain documents in their saved order. Current runs store each admitted
-/// document once in documents.json and list IDs by status in classification.json. Runs saved
-/// before that layout keep full documents in selected.json and uncertain.json.
+/// Selected and uncertain documents in their saved order: each admitted document is stored once
+/// in documents.json, and classification.json lists IDs by status.
 fn classified(root: &Path) -> Result<Vec<(&'static str, Vec<Document>)>> {
     let statuses = ["selected", "uncertain"];
-    if !root.join("classification.json").is_file() {
-        return statuses
-            .into_iter()
-            .map(|status| Ok((status, read(root, &format!("{status}.json"))?)))
-            .collect();
-    }
     let classification: Value = read(root, "classification.json")?;
     let mut documents: BTreeMap<String, Document> = BTreeMap::new();
     for document in read::<Vec<Document>>(root, "documents.json")? {
@@ -100,7 +93,7 @@ fn classified(root: &Path) -> Result<Vec<(&'static str, Vec<Document>)>> {
 
 /// Rebuild the report from saved documents and scores. With a variant name, output goes to
 /// `search-<variant>.json` and `search-documents-<variant>/`, so the original presentation stays.
-/// This lets a newer ranking be replayed on an older run without new retrieval or scoring.
+/// This lets a ranking change be replayed on a saved run without new retrieval or scoring.
 pub fn build_report_variant(
     outcome: &RunOutcome,
     full_text: bool,
@@ -356,8 +349,11 @@ mod tests {
         write("scores.json", &json!([score("a", 0.5), score("b", 0.9)]));
         write("failures.json", &json!([]));
         write("omitted.json", &json!([]));
-        write("selected.json", &json!([doc("a"), doc("b")]));
-        write("uncertain.json", &json!([]));
+        write("documents.json", &json!([doc("a"), doc("b")]));
+        write(
+            "classification.json",
+            &json!({"selected":["a","b"],"uncertain":[],"rejected":[]}),
+        );
         std::fs::write(root.join("search.json"), b"original").unwrap();
         let outcome = RunOutcome {
             directory: root.to_path_buf(),

@@ -74,9 +74,9 @@ struct Ledger {
     unresolved_stop_after: u32,
 }
 
-/// One upstream block page (HTTP 402 wrapping a Cloudflare challenge) used to stop every later
-/// score in a run. Each unresolved attempt still retains its full reservation, so the budget stays
-/// a hard ceiling; three in a row means a systematic failure and stops the client.
+/// Unresolved attempts in a row before the client stops. A single upstream block page (HTTP 402
+/// wrapping a Cloudflare challenge) is transient and must not end a run. Each unresolved attempt
+/// retains its full reservation, so the budget stays a hard ceiling.
 const UNRESOLVED_STOP_AFTER: u32 = 3;
 
 // A dropped future cannot release a possibly spent reservation. This guard also
@@ -401,8 +401,8 @@ impl JevClient {
     }
 
     /// Reserve, and wait while unsettled reservations are what fills the budget. Each in-flight
-    /// attempt ends in `settle`, `retain_unresolved`, or a stop flag, and each wakes this wait. Without this, parallel
-    /// scoring under a small budget failed every document after the first `concurrency` of them.
+    /// attempt ends in `settle`, `retain_unresolved`, or a stop flag, and each wakes this wait. Parallel
+    /// scoring under a small budget therefore waits for room instead of failing.
     async fn reserve_waiting(&self) -> Result<u64> {
         loop {
             let notified = self.settled.notified();
@@ -762,12 +762,6 @@ fn backend_from(
     env: impl Fn(&str) -> Option<String>,
     resolve: impl FnOnce(&str) -> Result<String>,
 ) -> Result<Backend> {
-    if let Some(mode) = env("JEV_BACKEND") {
-        ensure!(
-            mode == "cloudflare",
-            "JEV_BACKEND must be cloudflare; the proxy and typesafe backends were removed"
-        );
-    }
     let account = env("CLOUDFLARE_ACCOUNT_ID")
         .ok_or_else(|| anyhow!("Missing Jev configuration: CLOUDFLARE_ACCOUNT_ID"))?;
     ensure!(
@@ -1097,7 +1091,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_cloudflare_is_selected_and_it_runs_each_request_once() {
+    fn cloudflare_backend_reads_its_settings_and_runs_each_request_once() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |key: &str| {
                 pairs
@@ -1108,37 +1102,16 @@ mod tests {
         };
         let no_profile = |_: &str| -> Result<String> { panic!("static token needs no profile") };
         const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
-        // Unset backend with a leftover proxy URL still selects Cloudflare.
-        for pairs in [
-            &[
-                ("JEV_PROXY_URL", "https://old-proxy.example/evaluate"),
+        let backend = backend_from(
+            env(&[
                 ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT),
                 ("CLOUDFLARE_API_TOKEN", "t"),
-            ][..],
-            &[
-                ("JEV_BACKEND", "cloudflare"),
-                ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT),
-                ("CLOUDFLARE_API_TOKEN", "t"),
-            ][..],
-        ] {
-            let backend = backend_from(env(pairs), no_profile).unwrap();
-            assert_eq!(backend.name(), "cloudflare");
-        }
-        for removed in ["proxy", "typesafe"] {
-            let pairs: &'static [(&str, &str)] = if removed == "proxy" {
-                &[("JEV_BACKEND", "proxy"), ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT)]
-            } else {
-                &[
-                    ("JEV_BACKEND", "typesafe"),
-                    ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT),
-                ]
-            };
-            let error = backend_from(env(pairs), no_profile)
-                .err()
-                .unwrap()
-                .to_string();
-            assert!(error.contains("must be cloudflare"), "{removed}: {error}");
-        }
+            ]),
+            no_profile,
+        )
+        .unwrap();
+        assert_eq!(backend.name(), "cloudflare");
+        assert!(backend_from(env(&[("CLOUDFLARE_API_TOKEN", "t")]), no_profile).is_err());
         let dir = tempfile::tempdir().unwrap();
         let mut client = client(dir.path(), 0.0);
         client.backend = offline_cloudflare();
