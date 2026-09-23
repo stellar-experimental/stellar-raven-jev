@@ -188,6 +188,13 @@ impl HttpRecorder {
         Ok(recorder)
     }
 
+    /// A clone with its own request limit that shares the run folder and the raw-file sequence.
+    pub fn with_concurrency(&self, concurrency: usize) -> Self {
+        let mut clone = self.clone();
+        clone.semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+        clone
+    }
+
     pub fn run_dir(&self) -> &Path {
         &self.root
     }
@@ -257,20 +264,23 @@ impl HttpRecorder {
         headers: Vec<(String, String)>,
         body: Option<Value>,
     ) -> Result<HttpResponse> {
-        self.request_recorded(method, url, headers, body, true)
+        self.request_recorded(method, url, headers, body, true, None)
             .await
     }
 
     /// For a caller that saves the exact request body in its own audit record (the Jev trace).
     /// The metadata keeps the body's SHA-256 and size, so the one full copy stays verifiable.
+    /// `sent`, when given, is notified once the request holds its concurrency permit, so a caller
+    /// can time the request itself and not its queue wait.
     pub async fn request_body_recorded_elsewhere(
         &self,
         method: Method,
         url: &str,
         headers: Vec<(String, String)>,
         body: Option<Value>,
+        sent: Option<&tokio::sync::Notify>,
     ) -> Result<HttpResponse> {
-        self.request_recorded(method, url, headers, body, false)
+        self.request_recorded(method, url, headers, body, false, sent)
             .await
     }
 
@@ -281,6 +291,7 @@ impl HttpRecorder {
         headers: Vec<(String, String)>,
         body: Option<Value>,
         record_body: bool,
+        sent: Option<&tokio::sync::Notify>,
     ) -> Result<HttpResponse> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let prefix = format!("raw/{sequence:06}");
@@ -347,6 +358,9 @@ impl HttpRecorder {
                 write_metadata(&metadata_path, &record.metadata)?;
             }
             let _permit = self.semaphore.acquire().await?;
+            if let Some(sent) = sent {
+                sent.notify_one();
+            }
             // Wall-clock start after the permit, so timelines separate queue wait from transfer.
             record.metadata["queued_ms"] = json!(started.elapsed().as_millis() as u64);
             record.metadata["started_unix_ms"] = json!(std::time::SystemTime::now()

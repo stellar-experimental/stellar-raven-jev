@@ -34,6 +34,10 @@ struct Cli {
     timeout_secs: u64,
     #[arg(long, global = true, hide = true, default_value_t = 16)]
     concurrency: usize,
+    #[arg(long, global = true, hide = true, default_value_t = 32)]
+    jev_concurrency: usize,
+    #[arg(long, global = true, hide = true, default_value_t = 2000)]
+    jev_hedge_ms: u64,
     #[arg(long, global = true, hide = true, default_value_t = 2)]
     max_pages: usize,
     /// Scoring admission limit across all sources. The default is above the largest fetch seen
@@ -83,9 +87,6 @@ enum Command {
         /// every scored document, and routing. By default only the report and its text files stay.
         #[arg(long)]
         full_record: bool,
-        /// Result ordering: banded rounds scores to whole percent before secondary keys; raw does not.
-        #[arg(long, value_enum, default_value = "banded", hide = true)]
-        rank_policy: stellar_raven_jev::search::RankPolicy,
     },
     /// Rebuild the report from a run saved with --full-record, without retrieval or scoring.
     Report {
@@ -102,9 +103,6 @@ enum Command {
         /// Results in the compact output, one per URL. Zero shows all selected results.
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        /// Result ordering: banded rounds scores to whole percent before secondary keys; raw does not.
-        #[arg(long, value_enum, default_value = "banded", hide = true)]
-        rank_policy: stellar_raven_jev::search::RankPolicy,
     },
     /// Check local settings and authentication presence without network requests.
     Doctor,
@@ -264,6 +262,8 @@ async fn main() -> Result<()> {
         budget_usd: cli.budget_usd,
         timeout_secs: cli.timeout_secs,
         concurrency: cli.concurrency,
+        jev_concurrency: cli.jev_concurrency,
+        jev_hedge_ms: cli.jev_hedge_ms,
         max_pages: cli.max_pages,
         max_documents: cli.max_documents,
         per_source_documents: cli.per_source_documents,
@@ -293,18 +293,13 @@ async fn main() -> Result<()> {
             full_text,
             limit,
             full_record,
-            rank_policy,
         } => {
             config.full_record = full_record;
             let outcome =
                 stellar_raven_jev::pipeline::run_question_scoped(&question, &config, resources)
                     .await?;
-            let report = stellar_raven_jev::search::build_report_variant(
-                &outcome,
-                full_text,
-                None,
-                rank_policy,
-            )?;
+            let report =
+                stellar_raven_jev::search::build_report_variant(&outcome, full_text, None)?;
             print_report(&report, json, limit)?;
             // Clean up after printing, so a cleanup error never loses a paid result.
             if !full_record {
@@ -324,7 +319,6 @@ async fn main() -> Result<()> {
             json,
             full_text,
             limit,
-            rank_policy,
         } => {
             anyhow::ensure!(
                 directory.join("documents.json").is_file(),
@@ -340,7 +334,6 @@ async fn main() -> Result<()> {
                 &outcome,
                 full_text,
                 Some(&variant),
-                rank_policy,
             )?;
             print_report(&report, json, limit)?;
         }

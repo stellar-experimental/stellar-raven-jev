@@ -52,6 +52,15 @@ pub struct DocumentScore {
     /// maximum of that signal over the document's chunks; different signals can come from different
     /// chunks, so the map is not one jointly supported evidence vector.
     pub signals_aggregation: String,
+    /// Byte range of the chunk with the highest usable_evidence. `current` and the code check for
+    /// the version target read this chunk only, so they never mix chunks.
+    pub best_chunk: [usize; 2],
+    /// Mean of the two highest chunk usable_evidence values (one chunk: that value). Long pages
+    /// get more chunks and so more chances at a high maximum; this key reduces that advantage.
+    pub usable_top2_mean: f64,
+    /// Currentness answers (`live`, `planned_only`, `superseded`, `dated`) from the best chunk,
+    /// asked in the same call as the evidence questions when the question depends on time.
+    pub current: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -60,6 +69,8 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
+    /// Hedge requests sent for slow calls. They are included in `requests`.
+    pub hedged_requests: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,6 +80,11 @@ pub struct RunConfig {
     pub budget_usd: f64,
     pub timeout_secs: u64,
     pub concurrency: usize,
+    /// Concurrent Jev requests. Separate from source concurrency: source APIs have rate limits.
+    pub jev_concurrency: usize,
+    /// Send one hedge request for a Jev call still unanswered after this many milliseconds.
+    /// Zero turns hedging off.
+    pub jev_hedge_ms: u64,
     pub max_pages: usize,
     pub max_documents: usize,
     pub per_source_documents: usize,
@@ -91,6 +107,8 @@ impl Default for RunConfig {
             budget_usd: 0.0,
             timeout_secs: 30,
             concurrency: 16,
+            jev_concurrency: 32,
+            jev_hedge_ms: 2000,
             max_pages: 2,
             max_documents: 400,
             per_source_documents: 12,

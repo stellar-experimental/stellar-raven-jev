@@ -34,6 +34,8 @@ struct Evidence {
     uncertain: Vec<Document>,
     omitted: Vec<Document>,
     failures: Vec<Failure>,
+    /// Intent, leading target, and stage-2 currentness answers. See `rank`.
+    rerank: serde_json::Value,
     #[serde(skip)]
     timings: BTreeMap<&'static str, u64>,
 }
@@ -52,7 +54,13 @@ pub trait Backend: Send + Sync {
         source: &Source,
         question: &str,
     ) -> Result<FetchResult>;
-    async fn score_document(&self, question: &str, document: &Document) -> Result<DocumentScore>;
+    async fn score_document(
+        &self,
+        question: &str,
+        document: &Document,
+        currentness: bool,
+    ) -> Result<DocumentScore>;
+    async fn classify_intent(&self, question: &str) -> Result<BTreeMap<String, f64>>;
     fn usage(&self) -> Usage;
 }
 
@@ -77,8 +85,18 @@ impl Backend for LiveBackend {
     ) -> Result<FetchResult> {
         connectors::fetch(ctx, source, question).await
     }
-    async fn score_document(&self, question: &str, document: &Document) -> Result<DocumentScore> {
-        self.jev.score_document(question, document).await
+    async fn score_document(
+        &self,
+        question: &str,
+        document: &Document,
+        currentness: bool,
+    ) -> Result<DocumentScore> {
+        self.jev
+            .score_document(question, document, currentness)
+            .await
+    }
+    async fn classify_intent(&self, question: &str) -> Result<BTreeMap<String, f64>> {
+        self.jev.classify_intent(question).await
     }
     fn usage(&self) -> Usage {
         self.jev.usage()
@@ -92,6 +110,7 @@ pub fn validate_config(config: &RunConfig) -> Result<()> {
     for (flag, value) in [
         ("timeout-secs", config.timeout_secs as usize),
         ("concurrency", config.concurrency),
+        ("jev-concurrency", config.jev_concurrency),
         ("max-pages", config.max_pages),
         ("max-documents", config.max_documents),
         ("per-source-documents", config.per_source_documents),
@@ -208,6 +227,7 @@ fn persist(
     write_json(root.join("omitted.json"), &evidence.omitted)?;
     write_json(root.join("failures.json"), &evidence.failures)?;
     write_json(root.join("usage.json"), usage)?;
+    write_json(root.join("rerank.json"), &evidence.rerank)?;
     let artifacts = collect_artifacts(root)?;
     write_json(
         root.join("manifest.json"),
@@ -312,7 +332,7 @@ pub async fn run_question_scoped(
             "excluded_source_ids":registry.iter().filter(|s| !scope.includes(s)).map(|s| &s.id).collect::<Vec<_>>(),
         }),
     )?;
-    let jev = match JevClient::new(&config, &http) {
+    let jev = match JevClient::new(&config, &http.with_concurrency(config.jev_concurrency)) {
         Ok(jev) => jev,
         Err(error) => {
             let mut evidence = Evidence {
@@ -379,10 +399,27 @@ async fn execute(
     let mut maxima: BTreeMap<String, f64> = BTreeMap::new();
     let mut valid_passes = 0;
     // Passes are independent. Run them together, then record results in pass order.
-    let routed = futures::future::join_all(
-        (0..config.route_passes).map(|pass| backend.route(question, sources, pass)),
-    )
-    .await;
+    // The intent question is independent of routing, so it runs alongside the routing passes.
+    let (routed, intent) = futures::join!(
+        futures::future::join_all(
+            (0..config.route_passes).map(|pass| backend.route(question, sources, pass)),
+        ),
+        backend.classify_intent(question)
+    );
+    let intent = match intent {
+        Ok(answers) => crate::rank::Intent::from_answers(&answers),
+        Err(error) => {
+            evidence
+                .failures
+                .push(failure("intent", None, error.to_string()));
+            crate::rank::Intent {
+                kind: "timeless".into(),
+                confidence: 0.0,
+                versioned: 0.0,
+            }
+        }
+    };
+    evidence.rerank = json!({"intent": intent});
     for (pass, routed) in routed.into_iter().enumerate() {
         match routed {
             Err(error) => {
@@ -586,12 +623,15 @@ async fn execute(
         }
     }
     // Keep Jev budget and retry accounting inside JevClient. Do not cancel its paid requests externally.
+    let currentness = intent.asks_currentness();
     let scoring = stream::iter(to_score)
         .map(|document| async move {
-            let result = backend.score_document(question, &document).await;
+            let result = backend
+                .score_document(question, &document, currentness)
+                .await;
             (document, result)
         })
-        .buffer_unordered(config.concurrency);
+        .buffer_unordered(config.jev_concurrency);
     tokio::pin!(scoring);
     // A full checkpoint rewrites every artifact. Jev audit files already record each paid attempt,
     // so checkpoint on an interval instead of after every score.
@@ -648,6 +688,10 @@ async fn execute(
     evidence
         .timings
         .insert("score", run_started.elapsed().as_millis() as u64);
+    leading_target(question, &intent, &mut evidence);
+    evidence
+        .timings
+        .insert("rerank", run_started.elapsed().as_millis() as u64);
     evidence
         .scores
         .sort_by(|a, b| a.document_id.cmp(&b.document_id));
@@ -676,6 +720,33 @@ async fn execute(
 fn text_digest(text: &str) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+/// Name the leading target in code when the question is about protocol versions: the highest
+/// protocol that two provenance clusters or one official page among the selected documents mention.
+fn leading_target(question: &str, intent: &crate::rank::Intent, evidence: &mut Evidence) {
+    static PROTOCOL_QUESTION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let about_versions = PROTOCOL_QUESTION
+        .get_or_init(|| regex::Regex::new(r"(?i)\b(protocol|cap-\d+)\b").unwrap())
+        .is_match(question);
+    let selected: Vec<&Document> = evidence.selected.iter().collect();
+    let tiers: Vec<u8> = selected
+        .iter()
+        .map(|d| crate::rank::authority_tier(d, crate::search::content_scope(d)))
+        .collect();
+    let scores: BTreeMap<&str, &DocumentScore> = evidence
+        .scores
+        .iter()
+        .map(|s| (s.document_id.as_str(), s))
+        .collect();
+    let target = (about_versions && intent.asks_currentness())
+        .then(|| crate::rank::leading_protocol(&selected, &tiers, &scores))
+        .flatten();
+    evidence.rerank = json!({
+        "intent": intent,
+        "target": target.map(|(version, _)| version),
+        "target_support_clusters": target.map(|(_, support)| support),
+    });
 }
 
 fn classify(evidence: &mut Evidence, config: &RunConfig, document: Document, score: DocumentScore) {
@@ -837,7 +908,12 @@ mod tests {
             }
             Ok(result)
         }
-        async fn score_document(&self, _: &str, document: &Document) -> Result<DocumentScore> {
+        async fn score_document(
+            &self,
+            _: &str,
+            document: &Document,
+            currentness: bool,
+        ) -> Result<DocumentScore> {
             self.scored.fetch_add(1, Ordering::SeqCst);
             if self.fail_score {
                 bail!("actual scoring failure");
@@ -848,7 +924,21 @@ mod tests {
                 reason: "fixture".into(),
                 signals: Default::default(),
                 signals_aggregation: Default::default(),
+                best_chunk: [0, document.text.len()],
+                usable_top2_mean: 0.8,
+                current: if currentness {
+                    BTreeMap::from([("live".into(), 0.9), ("dated".into(), 0.5)])
+                } else {
+                    BTreeMap::new()
+                },
             })
+        }
+        async fn classify_intent(&self, _: &str) -> Result<BTreeMap<String, f64>> {
+            Ok(BTreeMap::from([
+                ("intent=current".into(), 0.9),
+                ("intent#confidence".into(), 0.9),
+                ("versioned".into(), 0.9),
+            ]))
         }
         fn usage(&self) -> Usage {
             Usage::default()

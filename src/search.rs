@@ -5,43 +5,32 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 fn read<T: serde::de::DeserializeOwned>(root: &Path, name: &str) -> Result<T> {
     Ok(serde_json::from_slice(&std::fs::read(root.join(name))?)?)
 }
 
-/// How results are ordered. `Banded` rounds scores to whole percent so near-ties fall to content
-/// completeness, then ID; `Raw` orders by the exact score and uses those keys only on exact ties.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RankPolicy {
-    #[default]
-    Banded,
-    Raw,
-}
-
-impl RankPolicy {
-    fn key(self, value: f64) -> f64 {
-        match self {
-            Self::Banded => (value * 100.0).round(),
-            Self::Raw => value,
-        }
-    }
-}
-
-/// Ordering for one policy over (usable_evidence, scope rank, id). Higher scores first.
-/// Missing scores sort last. Pure, so tests can check inversions without a run directory.
-pub fn compare_ranked(
-    policy: RankPolicy,
-    a: (Option<f64>, u8, &str),
-    b: (Option<f64>, u8, &str),
+/// Uncertain documents: length-normalized relevance in whole-percent bands, then content
+/// completeness, then ID. Selected documents are ordered by `rank::rank`.
+fn uncertain_order(
+    scores: &BTreeMap<&str, &DocumentScore>,
+    a: &Document,
+    b: &Document,
 ) -> std::cmp::Ordering {
-    let key = |v: Option<f64>| v.map(|v| policy.key(v)).unwrap_or(-1.0);
-    key(b.0)
-        .total_cmp(&key(a.0))
-        .then(b.1.cmp(&a.1))
-        .then(a.2.cmp(b.2))
+    let key = |d: &Document| {
+        scores
+            .get(d.id.as_str())
+            .map(|s| (s.usable_top2_mean * 100.0).round())
+            .unwrap_or(-1.0)
+    };
+    key(b)
+        .total_cmp(&key(a))
+        .then(scope_rank(b).cmp(&scope_rank(a)))
+        .then(a.id.cmp(&b.id))
 }
 
 /// A variant name becomes part of two output paths. Only plain characters are allowed.
@@ -98,7 +87,6 @@ pub fn build_report_variant(
     outcome: &RunOutcome,
     full_text: bool,
     variant: Option<&str>,
-    rank_policy: RankPolicy,
 ) -> Result<Value> {
     let root = outcome.directory.canonicalize()?;
     if let Some(name) = variant {
@@ -121,20 +109,38 @@ pub fn build_report_variant(
     let scores: BTreeMap<_, _> = scores.iter().map(|s| (s.document_id.as_str(), s)).collect();
     let failures: Vec<Failure> = read(&root, "failures.json")?;
     let omitted: Vec<Document> = read(&root, "omitted.json")?;
+    let rerank: Value = read(&root, "rerank.json")?;
+    // A run that failed before intent classification ranks as timeless, with no confidence.
+    let intent: crate::rank::Intent = if rerank["intent"].is_null() {
+        crate::rank::Intent {
+            kind: "timeless".into(),
+            confidence: 0.0,
+            versioned: 0.0,
+        }
+    } else {
+        serde_json::from_value(rerank["intent"].clone())
+            .context("rerank.json has an invalid question intent")?
+    };
+    let target = rerank["target"].as_u64().map(|t| t as u32);
+    let mut ranking: BTreeMap<String, crate::rank::Ranked> = BTreeMap::new();
     let document_dir = root.join(format!("search-documents{suffix}"));
     std::fs::create_dir_all(&document_dir)?;
     let mut results = Vec::new();
     for (status, mut documents) in classified(&root)? {
-        // Order by usable_evidence, then content completeness, then ID. The rank policy decides
-        // whether near-ties count as ties.
-        documents.sort_by(|a, b| {
-            let probability = |d: &Document| scores.get(d.id.as_str()).map(|s| s.probability);
-            compare_ranked(
-                rank_policy,
-                (probability(a), scope_rank(a), &a.id),
-                (probability(b), scope_rank(b), &b.id),
-            )
-        });
+        if status == "selected" {
+            let refs: Vec<&Document> = documents.iter().collect();
+            let scopes: Vec<String> = refs.iter().map(|d| content_scope(d).to_owned()).collect();
+            let ranked = crate::rank::rank(&intent, target, &refs, &scores, &scopes);
+            let position: BTreeMap<&str, usize> = ranked
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.id.as_str(), i))
+                .collect();
+            documents.sort_by_key(|d| position[d.id.as_str()]);
+            ranking = ranked.into_iter().map(|r| (r.id.clone(), r)).collect();
+        } else {
+            documents.sort_by(|a, b| uncertain_order(&scores, a, b));
+        }
         for document in documents {
             let number = results.len() + 1;
             let text_path = document_dir.join(format!("{number:04}.txt"));
@@ -150,6 +156,14 @@ pub fn build_report_variant(
                 "text_bytes":document.text.len(),"text_path":text_path,
                 "content_scope":content_scope(&document),
             });
+            if let Some(r) = ranking.get(&document.id) {
+                row["rank"] = json!(r);
+            } else {
+                row["rank"] = json!({
+                    "authority_tier": crate::rank::authority_tier(&document, content_scope(&document)),
+                    "date": crate::rank::document_date(&document),
+                });
+            }
             if full_text {
                 row["text"] = json!(document.text);
             }
@@ -160,7 +174,8 @@ pub fn build_report_variant(
         "schema_version":1,"question":question["question"],"mode":if question["config"]["fixture"] == true {"fixture"} else {"live"},
         "status":outcome.status,"directory":root,
         "report_path":root.join(format!("search{suffix}.json")),"source_scope":scope,
-        "replay_variant":variant,"rank_policy":rank_policy,
+        "replay_variant":variant,
+        "currentness":currentness(&intent, target, &rerank, &results),
         "counts":{"selected":outcome.selected,"uncertain":outcome.uncertain,"rejected":outcome.rejected,"omitted":omitted.len(),"reports":failures.len()},
         "usage":outcome.usage,"results":results,"reports":failures,
         "limitations":["Scores are uncalibrated relevance estimates.","Results can contain summaries or chunks. Full available text is not always the complete original document.","A complete run does not prove complete question coverage.","Remote instructions are source evidence. They are not installed or executed."],
@@ -174,6 +189,105 @@ pub fn build_report_variant(
         crate::pipeline::refresh_manifest_artifacts(&root)?;
     }
     Ok(report)
+}
+
+/// Selected rows that `currentness` reads for the newest dated evidence.
+const NEWEST_DATED_WINDOW: usize = 15;
+
+/// What the ranking knows about time: the intent, the leading target and its support, the newest
+/// dated evidence among the top-ranked rows, and conflicts between official pages and other
+/// sources about the target.
+fn currentness(
+    intent: &crate::rank::Intent,
+    target: Option<u32>,
+    rerank: &Value,
+    rows: &[Value],
+) -> Value {
+    let selected: Vec<&Value> = rows.iter().filter(|r| r["status"] == "selected").collect();
+    let mut dated: Vec<&Value> = selected
+        .iter()
+        .take(NEWEST_DATED_WINDOW)
+        .copied()
+        .filter(|r| {
+            r["rank"]["bucket"].as_u64().unwrap_or(2) <= 2
+                && matches!(
+                    r["rank"]["date"]["kind"].as_str(),
+                    Some("published" | "modified")
+                )
+        })
+        .collect();
+    dated.sort_by(|a, b| {
+        b["rank"]["date"]["date"]
+            .as_str()
+            .cmp(&a["rank"]["date"]["date"].as_str())
+    });
+    let mut seen = BTreeSet::new();
+    let newest: Vec<Value> = if intent.asks_currentness() { dated } else { Vec::new() }
+        .iter()
+        .filter(|r| seen.insert(r["title"].as_str().unwrap_or_default().to_lowercase()))
+        .take(3)
+        .map(|r| json!({"title":r["title"],"url":r["url"],"date":r["rank"]["date"]["date"],"authority_tier":r["rank"]["authority_tier"]}))
+        .collect();
+    let mut conflicts = Vec::new();
+    if let Some(t) = target {
+        let signal = |r: &Value, k: &str| r["rank"]["current"][k].as_f64().unwrap_or(0.0);
+        let mentions = |r: &Value| {
+            r["rank"]["protocols"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|v| v.as_u64() == Some(t as u64)))
+        };
+        let titles = |rows: Vec<&&Value>| -> Vec<String> {
+            let mut titles: Vec<String> = Vec::new();
+            for title in rows.iter().filter_map(|r| r["title"].as_str()) {
+                if !titles.iter().any(|t| t.eq_ignore_ascii_case(title)) && titles.len() < 5 {
+                    titles.push(title.to_owned());
+                }
+            }
+            titles
+        };
+        let live: Vec<&&Value> = selected
+            .iter()
+            .filter(|r| r["rank"]["about_target"] == true && signal(r, "live") >= 0.5)
+            .collect();
+        let newest_live = live
+            .iter()
+            .filter_map(|r| r["rank"]["date"]["date"].as_str())
+            .max();
+        // An official page written before the newest live report is expected to call the
+        // target planned. Only an undated or newer one conflicts.
+        let official_planned = titles(
+            selected
+                .iter()
+                .filter(|r| r["rank"]["authority_tier"] == 1 && mentions(r))
+                .filter(|r| signal(r, "planned_only") >= 0.5 && signal(r, "live") < 0.5)
+                .filter(
+                    |r| match (r["rank"]["date"]["date"].as_str(), newest_live) {
+                        (Some(date), Some(newest)) => date >= newest,
+                        _ => true,
+                    },
+                )
+                .collect(),
+        );
+        let reported_live = titles(live);
+        if !official_planned.is_empty() && !reported_live.is_empty() {
+            conflicts.push(json!({
+                "target": format!("Protocol {t}"),
+                "official_describe_as_planned": official_planned,
+                "others_report_live": reported_live,
+            }));
+        }
+    }
+    json!({
+        "intent": intent,
+        "target": target.map(|t| format!("Protocol {t}")),
+        "target_support_clusters": rerank["target_support_clusters"],
+        "assessed_documents": selected
+            .iter()
+            .filter(|r| r["rank"]["current"].as_object().is_some_and(|c| !c.is_empty()))
+            .count(),
+        "newest_dated_evidence": newest,
+        "conflicts": conflicts,
+    })
 }
 
 /// Higher is more complete. Rosters and full bodies beat excerpts and catalog metadata.
@@ -201,7 +315,7 @@ fn scope_rank(document: &Document) -> u8 {
 /// A Scout row that says `synthetic: true` is generated context, not original page text, even when
 /// it carries an official URL. It is reported as `synthetic_record` from the preserved provenance,
 /// so saved runs show it on replay without any change to the stored text or provenance.
-fn content_scope(document: &Document) -> &str {
+pub(crate) fn content_scope(document: &Document) -> &str {
     if document.provenance["row"]["synthetic"] == true {
         return "synthetic_record";
     }
@@ -214,7 +328,7 @@ fn content_scope(document: &Document) -> &str {
 /// Project the full report into a small agent response. The saved `search.json` stays complete.
 /// Keeps the highest-ranked selected result per URL. Uncertain rows stay in the full report only.
 pub fn compact_report(report: &Value, limit: usize) -> Value {
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     let mut duplicate_urls = 0usize;
     let mut results = Vec::new();
     let rows: Vec<&Value> = report["results"].as_array().into_iter().flatten().collect();
@@ -227,18 +341,96 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
             }
         }
     }
-    let unique_selected = url_counts.len()
-        + rows
-            .iter()
-            .filter(|row| {
-                row["status"] == "selected" && row["url"].as_str().unwrap_or_default().is_empty()
-            })
-            .count();
-    // `results` is already ordered by status, then by descending score.
-    for row in &rows {
-        if row["status"] != "selected" {
+    // `results` is already ordered: selected by rank, then uncertain. A selected row without a URL
+    // that has the same title as a row with a URL is a copy of it: the row with the URL takes the
+    // better position, and the copy counts as a duplicate.
+    let selected: Vec<&Value> = rows
+        .iter()
+        .copied()
+        .filter(|r| r["status"] == "selected")
+        .collect();
+    let title_key = |r: &Value| -> Option<String> {
+        let key: String = r["title"]
+            .as_str()?
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        (key.chars().count() >= 12).then_some(key)
+    };
+    let url_of = |r: &Value| r["url"].as_str().unwrap_or_default().to_owned();
+    let mut order: Vec<&Value> = Vec::new();
+    let mut moved = BTreeSet::new();
+    for (i, row) in selected.iter().enumerate() {
+        if moved.contains(&i) {
             continue;
         }
+        let copy_of = url_of(row)
+            .is_empty()
+            .then(|| title_key(row))
+            .flatten()
+            .and_then(|key| {
+                selected
+                    .iter()
+                    .position(|o| !url_of(o).is_empty() && title_key(o).as_ref() == Some(&key))
+            });
+        match copy_of {
+            Some(j) if j > i && moved.insert(j) => order.push(selected[j]),
+            Some(_) => duplicate_urls += 1,
+            None => order.push(row),
+        }
+    }
+    duplicate_urls += moved.len();
+    let unique_selected =
+        url_counts.len() + order.iter().filter(|row| url_of(row).is_empty()).count();
+    // Among rows that share a URL, the one with the best authority tier stands for the URL, at the
+    // position of the first one. An official page thus never hides behind a summary of itself.
+    let tier = |r: &Value| r["rank"]["authority_tier"].as_u64().unwrap_or(3);
+    let mut best: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, row) in order.iter().enumerate() {
+        let url = url_of(row);
+        if url.is_empty() {
+            continue;
+        }
+        let entry = best.entry(url).or_insert(i);
+        if tier(row) < tier(order[*entry]) {
+            *entry = i;
+        }
+    }
+    let mut first: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, row) in order.iter().enumerate() {
+        let url = url_of(row);
+        if !url.is_empty() {
+            first.entry(url).or_insert(i);
+        }
+    }
+    for (url, i) in &first {
+        order.swap(*i, best[url]);
+    }
+    // When no official page makes the display, the best-ranked official page that is not
+    // superseded takes the last slot.
+    if limit != 0 {
+        let mut shown_urls = BTreeSet::new();
+        let shown: Vec<usize> = (0..order.len())
+            .filter(|&i| {
+                let url = order[i]["url"].as_str().unwrap_or_default();
+                url.is_empty() || shown_urls.insert(url.to_owned())
+            })
+            .take(limit)
+            .collect();
+        let official = |r: &Value| {
+            r["rank"]["authority_tier"] == 1 && r["rank"]["bucket"].as_u64().unwrap_or(2) <= 2
+        };
+        if shown.len() == limit && !shown.iter().any(|&i| official(order[i])) {
+            if let Some(pick) = (shown[limit - 1] + 1..order.len())
+                .find(|&i| official(order[i]) && !shown_urls.contains(&url_of(order[i])))
+            {
+                let row = order.remove(pick);
+                order.insert(shown[limit - 1], row);
+            }
+        }
+    }
+    for row in order {
         let url = row["url"].as_str().unwrap_or_default();
         if !url.is_empty() && !seen.insert(url.to_owned()) {
             duplicate_urls += 1;
@@ -253,6 +445,8 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
             "probability":row["probability"],"excerpt":row["excerpt"],
             "text_bytes":row["text_bytes"],"text_path":row["text_path"],
             "content_scope":row["content_scope"],
+            "date":matches!(row["rank"]["date"]["kind"].as_str(), Some("published" | "modified")).then(|| &row["rank"]["date"]["date"]),
+            "authority_tier":row["rank"]["authority_tier"],
             "same_url_others":url_counts.get(url).map(|n| n.saturating_sub(1)).unwrap_or(0),
         });
         if let Some(text) = row.get("text") {
@@ -270,6 +464,7 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
         "schema_version":1,"compact":true,"question":report["question"],"mode":report["mode"],
         "status":report["status"],"counts":report["counts"],"usage":report["usage"],
         "source_scope":report["source_scope"]["scope"],
+        "currentness":report["currentness"],
         "results":results,
         "not_shown":{
             "selected_beyond_limit":unique_selected.saturating_sub(results.len()),
@@ -285,39 +480,6 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
 mod tests {
     use super::*;
 
-    #[test]
-    fn raw_policy_never_inverts_exact_scores_and_banded_breaks_near_ties_by_completeness() {
-        use std::cmp::Ordering::*;
-        // A 0.984 index excerpt against a 0.976 complete page.
-        let excerpt = (Some(0.984), 1, "x");
-        let page = (Some(0.976), 4, "y");
-        assert_eq!(
-            compare_ranked(RankPolicy::Raw, excerpt, page),
-            Less,
-            "raw keeps the higher score first"
-        );
-        assert_eq!(
-            compare_ranked(RankPolicy::Banded, excerpt, page),
-            Greater,
-            "banded lets completeness decide inside 0.98"
-        );
-        for policy in [RankPolicy::Raw, RankPolicy::Banded] {
-            // Exact ties fall to completeness, then ID.
-            assert_eq!(
-                compare_ranked(policy, (Some(0.98), 1, "a"), (Some(0.98), 4, "b")),
-                Greater
-            );
-            assert_eq!(
-                compare_ranked(policy, (Some(0.5), 0, "a"), (Some(0.5), 0, "b")),
-                Less
-            );
-            assert_eq!(
-                compare_ranked(policy, (None, 0, "a"), (Some(0.1), 0, "b")),
-                Greater,
-                "missing score sorts last"
-            );
-        }
-    }
     #[test]
     fn a_replay_variant_writes_its_own_report_and_leaves_the_original() {
         let dir = tempfile::tempdir().unwrap();
@@ -340,6 +502,9 @@ mod tests {
             reason: "fixture".into(),
             signals: BTreeMap::from([("usable_evidence".into(), p)]),
             signals_aggregation: "independent_max_per_signal_across_chunks".into(),
+            best_chunk: [0, 0],
+            usable_top2_mean: p,
+            current: BTreeMap::new(),
         };
         write(
             "question.json",
@@ -349,6 +514,10 @@ mod tests {
         write("scores.json", &json!([score("a", 0.5), score("b", 0.9)]));
         write("failures.json", &json!([]));
         write("omitted.json", &json!([]));
+        write(
+            "rerank.json",
+            &json!({"intent":{"kind":"timeless","confidence":1.0,"versioned":0.0}}),
+        );
         write("documents.json", &json!([doc("a"), doc("b")]));
         write(
             "classification.json",
@@ -364,7 +533,7 @@ mod tests {
             failures: 0,
             usage: Default::default(),
         };
-        let report = build_report_variant(&outcome, false, Some("t"), RankPolicy::Raw).unwrap();
+        let report = build_report_variant(&outcome, false, Some("t")).unwrap();
         assert_eq!(report["results"][0]["id"], "b");
         assert_eq!(report["results"][0]["signals"]["usable_evidence"], 0.9);
         assert!(root.join("search-t.json").exists());
@@ -374,7 +543,7 @@ mod tests {
             b"original"
         );
         assert!(
-            build_report_variant(&outcome, false, Some("t"), RankPolicy::Raw).is_err(),
+            build_report_variant(&outcome, false, Some("t")).is_err(),
             "an existing variant is never overwritten"
         );
     }
@@ -398,6 +567,10 @@ mod tests {
         write("scores.json", &json!([]));
         write("failures.json", &json!([]));
         write("omitted.json", &json!([]));
+        write(
+            "rerank.json",
+            &json!({"intent":{"kind":"timeless","confidence":1.0,"versioned":0.0}}),
+        );
         write("documents.json", &json!([doc("r"), doc("u"), doc("s")]));
         write(
             "classification.json",
@@ -412,7 +585,7 @@ mod tests {
             failures: 0,
             usage: Default::default(),
         };
-        let report = build_report_variant(&outcome, false, Some("n"), RankPolicy::Banded).unwrap();
+        let report = build_report_variant(&outcome, false, Some("n")).unwrap();
         let rows = report["results"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "rejected documents stay out of the report");
         assert_eq!(
@@ -427,7 +600,7 @@ mod tests {
             "classification.json",
             &json!({"selected":["missing"],"uncertain":[],"rejected":[]}),
         );
-        assert!(build_report_variant(&outcome, false, Some("m"), RankPolicy::Banded).is_err());
+        assert!(build_report_variant(&outcome, false, Some("m")).is_err());
     }
 
     #[test]
@@ -498,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_html_article_wins_a_score_tie_against_catalog_metadata() {
+    fn uncertain_ties_break_by_completeness_then_id() {
         let document = |id: &str, scope: &str| Document {
             id: id.into(),
             source_id: "algolia:docs".into(),
@@ -510,17 +683,23 @@ mod tests {
         };
         let article = document("z", "article_visible_text");
         let catalog = document("a", "catalog_metadata");
-        for policy in [RankPolicy::Banded, RankPolicy::Raw] {
-            assert_eq!(
-                compare_ranked(
-                    policy,
-                    (Some(0.98), scope_rank(&article), &article.id),
-                    (Some(0.98), scope_rank(&catalog), &catalog.id),
-                ),
-                std::cmp::Ordering::Less,
-                "The complete article must sort before catalog metadata under {policy:?}"
-            );
-        }
+        let score = |id: &str| DocumentScore {
+            document_id: id.into(),
+            probability: 0.3,
+            reason: String::new(),
+            signals: BTreeMap::new(),
+            signals_aggregation: String::new(),
+            best_chunk: [0, 0],
+            usable_top2_mean: 0.3,
+            current: BTreeMap::new(),
+        };
+        let (sa, sc) = (score("z"), score("a"));
+        let scores = BTreeMap::from([("z", &sa), ("a", &sc)]);
+        assert_eq!(
+            uncertain_order(&scores, &article, &catalog),
+            std::cmp::Ordering::Less,
+            "the complete article sorts before catalog metadata"
+        );
     }
     #[test]
     fn compact_projection_keeps_best_url_drops_uncertain_and_counts_reports() {
@@ -607,5 +786,53 @@ mod tests {
         assert_eq!(compact["results"].as_array().unwrap().len(), 2);
         assert_eq!(compact["results"][1]["title"], "second");
         assert!(compact["not_shown"]["uncertain"].is_null());
+        // A URL-less copy of a titled row yields its position to the row with the URL.
+        let copies = json!({"results":[
+            {"title":"Weekly Roundup: Sep 11","url":"","status":"selected"},
+            {"title":"Other page title","url":"https://x/1","status":"selected"},
+            {"title":"weekly roundup sep 11","url":"https://x/r","status":"selected"},
+            {"title":"Weekly Roundup: Sep 11","url":"","status":"selected"}
+        ]});
+        let compact = compact_report(&copies, 0);
+        let urls: Vec<_> = compact["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["url"].as_str().unwrap())
+            .collect();
+        assert_eq!(urls, ["https://x/r", "https://x/1"]);
+        assert_eq!(compact["not_shown"]["duplicate_urls"], 2);
+        assert_eq!(compact["not_shown"]["selected_beyond_limit"], 0);
+    }
+
+    #[test]
+    fn a_promoted_official_row_replaces_a_shown_copy_of_its_url() {
+        let row = |title: &str, url: &str, tier: u8| json!({"title":title,"url":url,"status":"selected","rank":{"authority_tier":tier,"bucket":2}});
+        let report = json!({"results":[
+            row("synthetic copy","https://developers.stellar.org/a",4),
+            row("blog","https://x/b",3),
+            row("official","https://developers.stellar.org/a",1)
+        ]});
+        let compact = compact_report(&report, 2);
+        let tiers: Vec<_> = compact["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["authority_tier"].as_u64().unwrap())
+            .collect();
+        assert_eq!(tiers, [1, 3]);
+        assert_eq!(compact["not_shown"]["duplicate_urls"], 1);
+        // The official copy inside the window, with a limit the list does not fill.
+        let report = json!({"results":[
+            row("synthetic copy","https://developers.stellar.org/a",4),
+            row("official","https://developers.stellar.org/a",1),
+            row("blog","https://x/b",3)
+        ]});
+        for limit in [2, 10, 0] {
+            let compact = compact_report(&report, limit);
+            assert_eq!(compact["results"][0]["authority_tier"], 1);
+            assert_eq!(compact["results"][0]["title"], "official");
+            assert_eq!(compact["not_shown"]["duplicate_urls"], 1);
+        }
     }
 }

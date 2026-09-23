@@ -29,10 +29,19 @@ Then run from any directory:
 stellar-raven-jev search "How do I extend the TTL of a Soroban persistent storage entry?"
 ```
 
-It prints one compact JSON object of about 10 KB: the ten best selected results, one per URL, with `probability`, `content_scope`, `url`, `excerpt`, and `text_path`.
-Each result carries `same_url_others`, the count of other selected results at the same URL. `not_shown` counts the rest. Uncertain results stay out of the compact list; `not_shown.uncertain` counts them, and the full report keeps them. A limit of `0` shows all selected results after URL deduplication.
-A typical call takes about 10 seconds and costs about $0.02 in Jev usage.
+It prints one compact JSON object of about 10 KB: the ten best selected results, one per URL, with `probability`, `content_scope`, `url`, `date`, `authority_tier`, `excerpt`, and `text_path`, plus a top-level `currentness` object.
+Each result carries `same_url_others`, the count of other selected results at the same URL. `not_shown` counts the rest. Uncertain results stay out of the compact list; `not_shown.uncertain` counts them, and the full report keeps them. A limit of `0` shows all selected results after URL deduplication. A result without a URL that has the same title as a result with a URL counts as a duplicate, and the result with the URL takes the better position.
+A typical call takes about 12 seconds and costs about $0.02 in Jev usage.
 Read the `text_path` file for any result you cite. The excerpt holds 400 characters.
+
+`date` is the publication or modification date found in the source metadata or text, or null. `authority_tier` is 1 for official Stellar pages and repositories, 2 for other Stellar-run sites and other GitHub repositories, 3 for everything else, and 4 for summaries, generated records, and social or video posts.
+
+`currentness` says how time affects the question:
+
+- `intent` is the question's time dependence (`current`, `comparative`, `versioned`, or `timeless`) with Jev's confidence.
+- `target` is the newest protocol version that two independent sources, or one official page, mention and that at least one live document covers. It is set only for questions that name a protocol or a CAP.
+- `newest_dated_evidence` lists the three newest dated results among the fifteen best. It is empty for a timeless question.
+- `conflicts` names official pages that still call the target planned while other sources report it live. An official page dated before the newest live report is not a conflict.
 
 Options:
 
@@ -77,7 +86,7 @@ All flags work before or after the command.
 | `--env-file` | (or `JEV_ENV_FILE`) | Explicit absolute credential file |
 
 Evaluation and test flags are accepted but hidden from `--help`. Their defaults came from the 40-question evaluation:
-`--timeout-secs 30`, `--concurrency 16`, `--fetch-deadline-secs 10`, `--max-pages 2`, `--max-documents 400`, `--per-source-documents 12`, `--max-body-bytes 8388608`, `--route-passes 2`, `--source-threshold 0.2`, `--document-threshold 0.4`, `--uncertain-threshold 0.15`, `--rank-policy banded` (or `raw`), and `--fixture` (offline, fixed scores; not a measure of Jev quality).
+`--timeout-secs 30`, `--concurrency 16`, `--jev-concurrency 32`, `--jev-hedge-ms 2000` (`0` turns hedging off), `--fetch-deadline-secs 10`, `--max-pages 2`, `--max-documents 400`, `--per-source-documents 12`, `--max-body-bytes 8388608`, `--route-passes 2`, `--source-threshold 0.2`, `--document-threshold 0.4`, `--uncertain-threshold 0.15`, and `--fixture` (offline, fixed scores; not a measure of Jev quality).
 
 Live Jev requires a budget above zero. Missing credentials cause an explicit failure, never a silent fallback.
 
@@ -86,16 +95,17 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 - Each Jev attempt first reserves a worst-case cost (65,536 input tokens, about $0.003) and settles to the reported cost when it ends. The budget is a hard ceiling on reserved plus settled cost.
 - When attempts still in flight fill the budget, the next attempt waits for one to settle. It fails at once only when nothing is in flight.
 - An attempt that ends without a usage receipt (an HTTP error, a transport error, or an invalid body) keeps its full reservation as spent and is not retried. After 3 such attempts in a row, the client stops new attempts for the run. A settled attempt resets the count.
+- A Jev call without an answer 2 seconds after its request is sent gets one identical hedge request, if the budget has room without waiting. Queue wait does not count. The first valid answer wins, and the other request is cancelled. If one attempt fails, the other one decides. Identical requests report identical input tokens, so the cancelled request is charged the winner's input tokens. `usage.hedged_requests` counts hedges. Jev latency has a heavy tail (p95 about 1.3 s, p99 about 10 s) that a request sent a moment later does not repeat. On 24 interleaved runs, hedging cut the median run from 14.7 s to 12.0 s and the slowest from 32.2 s to 15.4 s, for about 7% more cost. The selected sets agreed across arms as closely as within one arm.
 - HTTP 401 or 403 stops the client at once.
 - A document whose scoring fails is listed as `uncertain` in `classification.json`, with a `failures.json` entry.
 
 ## How a run works
 
-1. Two routing passes ask Jev, for every source independently, whether it could hold direct or complementary evidence. Sources above the threshold in either pass are retrieved.
+1. Two routing passes ask Jev, for every source independently, whether it could hold direct or complementary evidence. Sources above the threshold in either pass are retrieved. In the same round, one Jev call classifies the question's time intent.
 2. Connectors fetch bounded documents from each selected source in parallel. Registry listings return one roster document with every row plus bounded per-row documents.
 3. Documents are admitted round-robin across sources up to the global limit. Each source keeps its upstream order.
-4. Jev scores each admitted document. Long documents are split into chunks scored in parallel; the document takes its maximum chunk score.
-5. Results are ordered by the `usable_evidence` score. Scores are rounded to whole percent, and ties break by content completeness, so a roster or full page precedes an index excerpt with the same score. `--rank-policy raw` uses exact scores. Each score keeps all four Jev signals in `signals` as independent per-signal maxima across chunks; they do not describe one jointly supported chunk.
+4. Jev scores each admitted document. Long documents are split into chunks scored in parallel; `probability` is the maximum chunk score and selects the document. When the intent depends on time or version, the same chunk calls also ask whether the text calls the subject live, only planned, superseded, or dated. Those answers come from the best chunk only. Each score keeps the four evidence signals in `signals` as independent per-signal maxima across chunks; they do not describe one jointly supported chunk.
+5. Selected documents are ordered by weighted reciprocal-rank fusion of relevance (the mean of the two best chunk scores, so long documents gain less from more chunks), currentness, recency, authority, and corroboration by independent sources. The intent sets the weights: a timeless question uses relevance and a little authority only. Dates, versions, authority, and corroboration are computed in code, not asked of Jev. For a confident `current` intent, live documents about the target come first and superseded or older-version documents come last. When no official page reaches the compact list, the best one takes its last slot.
 6. Exact duplicates, same URL, title, and text, are scored once. The score, or the failure, is copied to every original ID with its own provenance, so counts and labels do not change.
 
 ## Evidence
@@ -112,10 +122,11 @@ With `--full-record`, a run keeps the complete audit record below, about 3 MB. E
 | `documents.json` | Each admitted document once, with its exact text and provenance |
 | `classification.json` | Selected, uncertain, and rejected document IDs, each list in order |
 | `omitted.json` | Full documents cut before scoring (duplicate IDs or the `--max-documents` limit) |
-| `scores.json`, `failures.json`, `usage.json` | Jev scores and signals, every report entry, and accounted cost |
+| `scores.json`, `failures.json`, `usage.json` | Jev scores, signals, and currentness answers, every report entry, and accounted cost |
+| `rerank.json` | The question intent, the leading version target, and its support |
 | `search.json`, `search-documents/NNNN.txt` | The ranked report and the exact text files that `text_path` points to |
 | `raw/NNNNNN.body.gz`, `raw/NNNNNN.json` | Each HTTP response, gzipped with the SHA-256 of the exact bytes, and credential-free request metadata. A Jev request body is saved once, in its Jev trace; its metadata keeps the body hash. |
-| `jev/` | One audit trace per paid attempt (request, reservation, receipt, answers) and one chunk record per document |
+| `jev/` | One audit trace per paid attempt (request, reservation, receipt, answers), one chunk record per document, and one `-cancelled.json` record per cancelled hedge request |
 | `manifest.json` | The outcome, configuration, `phase_ms` timings, and file and byte totals |
 
 `manifest.json` records `phase_ms` for routing, fetching, scoring, and finalization.
