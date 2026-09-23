@@ -82,6 +82,8 @@ struct Ledger {
     stopped: bool,
     authentication_failed: bool,
     unresolved_usage: bool,
+    /// Reservations not yet settled. Every attempt ends in `settle` or a stop flag.
+    in_flight: u64,
 }
 
 // A dropped future cannot release a possibly spent reservation. This guard also
@@ -101,6 +103,8 @@ impl Drop for PendingAttempt<'_> {
             } else {
                 ledger.unresolved_usage = true;
             }
+            drop(ledger);
+            self.client.settled.notify_waiters();
         }
     }
 }
@@ -109,6 +113,8 @@ pub struct JevClient {
     http: HttpRecorder,
     backend: Backend,
     ledger: Mutex<Ledger>,
+    /// Wakes reservations that wait for in-flight attempts to settle or stop.
+    settled: tokio::sync::Notify,
     audit_dir: PathBuf,
 }
 
@@ -157,6 +163,7 @@ impl JevClient {
                 budget_nanos: (config.budget_usd * NANOS_PER_USD).floor() as u64,
                 ..Ledger::default()
             }),
+            settled: tokio::sync::Notify::new(),
         };
         client.write_audit("accounting-policy", &json!({
             "backend": client.backend.name(), "run_budget_usd": config.budget_usd,
@@ -462,7 +469,30 @@ impl JevClient {
         Ok(format!("jev/{filename}"))
     }
 
+    /// Reserve without waiting. Fails when the budget cannot cover another attempt now.
+    #[cfg(test)]
     fn reserve(&self) -> Result<u64> {
+        self.reserve_now(false)?
+            .context("Jev budget cannot cover another complete attempt")
+    }
+
+    /// Reserve, and wait while unsettled reservations are what fills the budget. Each in-flight
+    /// attempt ends in `settle` or a stop flag, and both wake this wait. Without this, parallel
+    /// scoring under a small budget failed every document after the first `concurrency` of them.
+    async fn reserve_waiting(&self) -> Result<u64> {
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(reservation) = self.reserve_now(true)? {
+                return Ok(reservation);
+            }
+            notified.await;
+        }
+    }
+
+    /// `Ok(None)` means: wait, because in-flight reservations may still settle below budget.
+    fn reserve_now(&self, may_wait: bool) -> Result<Option<u64>> {
         let reservation = self.backend.reservation()?;
         let mut ledger = self
             .ledger
@@ -484,14 +514,18 @@ impl JevClient {
             .accounted_nanos
             .checked_add(reservation)
             .context("Jev accounting overflow")?;
-        ensure!(
-            next <= ledger.budget_nanos,
-            "Jev budget cannot cover another complete attempt"
-        );
+        if next > ledger.budget_nanos {
+            ensure!(
+                may_wait && ledger.in_flight > 0,
+                "Jev budget cannot cover another complete attempt"
+            );
+            return Ok(None);
+        }
         ledger.accounted_nanos = next;
+        ledger.in_flight += 1;
         ledger.usage.requests += 1;
         ledger.usage.cost_usd = next as f64 / NANOS_PER_USD;
-        Ok(reservation)
+        Ok(Some(reservation))
     }
 
     /// Terminal client state, shared by all scoring futures and plan gates.
@@ -515,6 +549,7 @@ impl JevClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .unresolved_usage = true;
+        self.settled.notify_waiters();
     }
 
     fn stop_on_authentication_failure(&self, status: u16) -> Result<bool> {
@@ -525,6 +560,7 @@ impl JevClient {
             .lock()
             .map_err(|_| anyhow!("Jev accounting lock failed"))?
             .authentication_failed = true;
+        self.settled.notify_waiters();
         Ok(true)
     }
 
@@ -570,6 +606,9 @@ impl JevClient {
         if result.is_err() {
             ledger.stopped = true;
         }
+        ledger.in_flight = ledger.in_flight.saturating_sub(1);
+        drop(ledger);
+        self.settled.notify_waiters();
         result
     }
 
@@ -595,7 +634,7 @@ impl JevClient {
         // statuses. A new attempt would spend while earlier usage is unresolved.
         {
             let attempt = 0;
-            let reservation = self.reserve()?;
+            let reservation = self.reserve_waiting().await?;
             let mut pending = PendingAttempt {
                 client: self,
                 receipt_accounted: false,
@@ -1768,6 +1807,72 @@ mod tests {
         );
         assert_eq!(client.usage().requests, 1);
         assert!(client.usage().cost_usd <= 0.004);
+    }
+
+    #[tokio::test]
+    async fn a_full_budget_of_in_flight_reservations_makes_the_next_attempt_wait_not_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = client(dir.path(), 0.004);
+        client.backend = Backend::TypeSafe {
+            token: "offline-placeholder".into(),
+        };
+        let client = Arc::new(client);
+        // One reservation fills the budget. With nothing in flight, the next one fails at once.
+        let first = client.reserve_waiting().await.unwrap();
+        let waiter = {
+            let client = client.clone();
+            tokio::spawn(async move { client.reserve_waiting().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the second attempt waits for the first"
+        );
+        // A small real cost frees the budget; the waiter then reserves.
+        client.settle(first, 1000, 10).unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("settlement wakes the waiter")
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.usage().requests, 2);
+        client.settle(second, 1000, 10).unwrap();
+        assert!(client.usage().cost_usd <= 0.004);
+        // Nothing in flight and no room: fail immediately instead of waiting forever.
+        let tiny = client_with_budget_nanos(dir.path(), 1);
+        assert!(tiny.reserve_waiting().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_stop_wakes_waiting_reservations_with_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = client(dir.path(), 0.004);
+        client.backend = Backend::TypeSafe {
+            token: "offline-placeholder".into(),
+        };
+        let client = Arc::new(client);
+        let _held = client.reserve_waiting().await.unwrap();
+        let waiter = {
+            let client = client.clone();
+            tokio::spawn(async move { client.reserve_waiting().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+        client.stop_on_unresolved_usage();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("a stop wakes the waiter")
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    fn client_with_budget_nanos(dir: &Path, nanos: u64) -> JevClient {
+        let mut client = client(dir, 0.0);
+        client.backend = Backend::TypeSafe {
+            token: "offline-placeholder".into(),
+        };
+        client.ledger.lock().unwrap().budget_nanos = nanos;
+        client
     }
 
     #[test]
