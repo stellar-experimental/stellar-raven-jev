@@ -13,16 +13,13 @@ use stellar_raven_jev::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Retrieve source documents with Jev and save complete run evidence. No answer generation."
+    about = "Retrieve and rank Stellar source documents with Jev for agents. No answer generation."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    #[arg(
-        long,
-        global = true,
-        help = "Use deterministic offline fixtures. This does not test live Jev."
-    )]
+    /// Use deterministic offline fixtures. This does not test live Jev.
+    #[arg(long, global = true, hide = true)]
     fixture: bool,
     /// Load an explicit absolute credential file. Also accepts JEV_ENV_FILE.
     #[arg(long, global = true)]
@@ -33,30 +30,30 @@ struct Cli {
     /// Maximum Jev allocation for one question. Also accepts JEV_BUDGET_USD.
     #[arg(long, global = true, env = "JEV_BUDGET_USD", default_value_t = 0.0)]
     budget_usd: f64,
-    #[arg(long, global = true, default_value_t = 30)]
+    #[arg(long, global = true, hide = true, default_value_t = 30)]
     timeout_secs: u64,
-    #[arg(long, global = true, default_value_t = 16)]
+    #[arg(long, global = true, hide = true, default_value_t = 16)]
     concurrency: usize,
-    #[arg(long, global = true, default_value_t = 2)]
+    #[arg(long, global = true, hide = true, default_value_t = 2)]
     max_pages: usize,
     /// Scoring admission limit across all sources. The default is above the largest fetch seen
     /// in the 40-case development pass (342), so every fetched document is normally scored.
-    #[arg(long, global = true, default_value_t = 400)]
+    #[arg(long, global = true, hide = true, default_value_t = 400)]
     max_documents: usize,
-    #[arg(long, global = true, default_value_t = 12)]
+    #[arg(long, global = true, hide = true, default_value_t = 12)]
     per_source_documents: usize,
     /// Wall-clock limit for the whole retrieval stage. Unfinished connectors are recorded and dropped.
-    #[arg(long, global = true, default_value_t = 10)]
+    #[arg(long, global = true, hide = true, default_value_t = 10)]
     fetch_deadline_secs: u64,
-    #[arg(long, global = true, default_value_t = 8388608)]
+    #[arg(long, global = true, hide = true, default_value_t = 8388608)]
     max_body_bytes: usize,
-    #[arg(long, global = true, default_value_t = 2)]
+    #[arg(long, global = true, hide = true, default_value_t = 2)]
     route_passes: usize,
-    #[arg(long, global = true, default_value_t = 0.2)]
+    #[arg(long, global = true, hide = true, default_value_t = 0.2)]
     source_threshold: f64,
-    #[arg(long, global = true, default_value_t = 0.4)]
+    #[arg(long, global = true, hide = true, default_value_t = 0.4)]
     document_threshold: f64,
-    #[arg(long, global = true, default_value_t = 0.15)]
+    #[arg(long, global = true, hide = true, default_value_t = 0.15)]
     uncertain_threshold: f64,
 }
 
@@ -67,49 +64,67 @@ enum Command {
         #[arg(long, value_enum, default_value = "all")]
         resources: connectors::SourceScope,
     },
-    /// Look up Stellar sources and print titles, links, excerpts, and saved text paths.
+    /// Look up Stellar sources. Prints compact JSON: ranked results with URLs, excerpts, and text paths.
     Search {
         question: String,
         /// Select source families before routing. Agentic excludes general ecosystem content.
         #[arg(long, value_enum, default_value = "all")]
         resources: connectors::SourceScope,
-        /// Print one JSON object containing every selected and uncertain result.
+        /// Print the full ranked report, with every selected and uncertain result.
         #[arg(long)]
         json: bool,
         /// Include full available text in output. Original sources may contain only summaries.
         #[arg(long)]
         full_text: bool,
-        /// Maximum displayed text results. Zero shows all. JSON always includes all results.
+        /// Results in the compact output, one per URL. Zero shows all selected results.
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        /// Print a small JSON projection for agents: selected results only, one per URL,
-        /// bounded by --limit, with report counts. The saved search.json stays complete.
+        /// Save the full audit record for evaluation and replay: raw HTTP bodies, Jev traces,
+        /// every scored document, and routing. By default only the report and its text files stay.
         #[arg(long)]
+        full_record: bool,
+        /// Accepted for compatibility; compact output is the default.
+        #[arg(long, hide = true)]
         compact: bool,
         /// Result ordering: banded rounds scores to whole percent before secondary keys; raw does not.
-        #[arg(long, value_enum, default_value = "banded")]
+        #[arg(long, value_enum, default_value = "banded", hide = true)]
         rank_policy: stellar_raven_jev::search::RankPolicy,
     },
-    /// Rebuild the search report from a saved run directory without retrieval or scoring.
+    /// Rebuild the report from a run saved with --full-record, without retrieval or scoring.
     Report {
         directory: PathBuf,
         /// Name for the replayed output files, so the original search.json stays unchanged.
         #[arg(long, default_value = "replay")]
         variant: String,
+        /// Print the full ranked report instead of the compact output.
         #[arg(long)]
         json: bool,
+        /// Include full available text in output.
         #[arg(long)]
         full_text: bool,
+        /// Results in the compact output, one per URL. Zero shows all selected results.
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        #[arg(long)]
+        /// Accepted for compatibility; compact output is the default.
+        #[arg(long, hide = true)]
         compact: bool,
         /// Result ordering: banded rounds scores to whole percent before secondary keys; raw does not.
-        #[arg(long, value_enum, default_value = "banded")]
+        #[arg(long, value_enum, default_value = "banded", hide = true)]
         rank_policy: stellar_raven_jev::search::RankPolicy,
     },
     /// Check local settings and authentication presence without network requests.
     Doctor,
+}
+
+/// Compact JSON by default; the full ranked report with --json.
+fn print_report(report: &serde_json::Value, json: bool, limit: usize) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(report)?);
+    } else {
+        let projection = stellar_raven_jev::search::compact_report(report, limit);
+        println!("{}", serde_json::to_string(&projection)?);
+    }
+    Ok(())
 }
 
 fn source_credentials(present: impl Fn(&str) -> bool) -> serde_json::Value {
@@ -250,7 +265,7 @@ async fn main() -> Result<()> {
     } else {
         dotenvy::dotenv().ok();
     }
-    let config = RunConfig {
+    let mut config = RunConfig {
         fixture: cli.fixture,
         output_dir: cli.output_dir,
         budget_usd: cli.budget_usd,
@@ -265,6 +280,7 @@ async fn main() -> Result<()> {
         source_threshold: cli.source_threshold,
         document_threshold: cli.document_threshold,
         uncertain_threshold: cli.uncertain_threshold,
+        full_record: true,
     };
     validate_config(&config)?;
     match cli.command {
@@ -283,12 +299,11 @@ async fn main() -> Result<()> {
             json,
             full_text,
             limit,
-            compact,
+            full_record,
+            compact: _,
             rank_policy,
         } => {
-            eprintln!(
-                "Retrieving and scoring sources. Full evidence will remain in the run directory."
-            );
+            config.full_record = full_record;
             let outcome =
                 stellar_raven_jev::pipeline::run_question_scoped(&question, &config, resources)
                     .await?;
@@ -298,13 +313,14 @@ async fn main() -> Result<()> {
                 None,
                 rank_policy,
             )?;
-            if compact {
-                let projection = stellar_raven_jev::search::compact_report(&report, limit);
-                println!("{}", serde_json::to_string(&projection)?);
-            } else if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                print!("{}", stellar_raven_jev::search::render_text(&report, limit));
+            print_report(&report, json, limit)?;
+            // Clean up after printing, so a cleanup error never loses a paid result.
+            if !full_record {
+                if let Err(error) =
+                    stellar_raven_jev::pipeline::keep_report_only(&outcome.directory)
+                {
+                    eprintln!("Run folder cleanup failed; intermediate files remain: {error}");
+                }
             }
             if outcome.status != "complete" {
                 std::process::exit(if outcome.status == "partial" { 2 } else { 1 });
@@ -316,9 +332,15 @@ async fn main() -> Result<()> {
             json,
             full_text,
             limit,
-            compact,
+            compact: _,
             rank_policy,
         } => {
+            anyhow::ensure!(
+                directory.join("documents.json").is_file()
+                    || directory.join("selected.json").is_file(),
+                "report needs a run saved with --full-record; {} holds only the search report",
+                directory.display()
+            );
             let manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
             let mut outcome: RunOutcome = serde_json::from_value(manifest["outcome"].clone())
@@ -330,14 +352,7 @@ async fn main() -> Result<()> {
                 Some(&variant),
                 rank_policy,
             )?;
-            if compact {
-                let projection = stellar_raven_jev::search::compact_report(&report, limit);
-                println!("{}", serde_json::to_string(&projection)?);
-            } else if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                print!("{}", stellar_raven_jev::search::render_text(&report, limit));
-            }
+            print_report(&report, json, limit)?;
         }
         Command::Doctor => {
             let directory =

@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, fmt::Write as _, path::Path};
+use std::{collections::BTreeMap, path::Path};
 
 fn read<T: serde::de::DeserializeOwned>(root: &Path, name: &str) -> Result<T> {
     Ok(serde_json::from_slice(&std::fs::read(root.join(name))?)?)
@@ -286,81 +286,6 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
         "full_report_path":report["report_path"],
         "limitations":report["limitations"],
     })
-}
-
-// Keep untrusted source text from sending terminal control sequences.
-fn plain(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
-pub fn render_text(report: &Value, limit: usize) -> String {
-    let mut output = String::new();
-    let field = |v: &Value| plain(v.as_str().unwrap_or("unknown"));
-    let _ = writeln!(
-        output,
-        "Question: {}\nStatus: {} ({})",
-        field(&report["question"]),
-        field(&report["status"]),
-        field(&report["mode"])
-    );
-    let _ = writeln!(
-        output,
-        "Selected: {} | Uncertain: {} | Rejected: {} | Omitted: {} | Reports: {}",
-        report["counts"]["selected"],
-        report["counts"]["uncertain"],
-        report["counts"]["rejected"],
-        report["counts"]["omitted"],
-        report["counts"]["reports"]
-    );
-    let _ = writeln!(
-        output,
-        "Sources: {}\n{}",
-        field(&report["source_scope"]["scope"]),
-        field(&report["source_scope"]["description"])
-    );
-    if let Some(results) = report["results"].as_array() {
-        let shown = if limit == 0 {
-            results.len()
-        } else {
-            limit.min(results.len())
-        };
-        let _ = writeln!(output, "\nShowing {shown} of {} selected or uncertain documents. The display limit does not change retrieval.", results.len());
-        for (i, row) in results.iter().take(shown).enumerate() {
-            let _ = writeln!(
-                output,
-                "\n{}. {} [{}; score {}]\n   {}\n   Source: {}\n   {}\n   Text: {}",
-                i + 1,
-                field(&row["title"]),
-                field(&row["status"]),
-                row["probability"],
-                field(&row["url"]),
-                field(&row["source_id"]),
-                field(row.get("text").unwrap_or(&row["excerpt"])),
-                field(&row["text_path"])
-            );
-        }
-    }
-    let _ = writeln!(
-        output,
-        "\nScores estimate relevance. Check source dates and complete text before use."
-    );
-    let _ = writeln!(output, "Source responses can contain only summaries or chunks. Read document provenance for content scope.");
-    let _ = writeln!(
-        output,
-        "Reports: {}/failures.json\nJSON: {}\nJev cost: ${}",
-        field(&report["directory"]),
-        field(&report["report_path"]),
-        report["usage"]["cost_usd"]
-    );
-    output
 }
 
 #[cfg(test)]
@@ -686,18 +611,5 @@ mod tests {
         assert_eq!(compact["results"].as_array().unwrap().len(), 2);
         assert_eq!(compact["results"][1]["title"], "second");
         assert!(compact["not_shown"]["uncertain"].is_null());
-    }
-
-    #[test]
-    fn text_output_removes_terminal_controls_without_changing_json_evidence() {
-        let malicious = "title\u{1b}]52;c;payload\u{7}\n\u{202e}é";
-        let report =
-            json!({"question":malicious,"results":[{"title":malicious,"excerpt":malicious}]});
-        let rendered = render_text(&report, 0);
-        assert!(!rendered.contains('\u{1b}'));
-        assert!(!rendered.contains('\u{7}'));
-        assert!(!rendered.contains('\u{202e}'));
-        assert!(rendered.contains('é'));
-        assert_eq!(report["question"], malicious);
     }
 }

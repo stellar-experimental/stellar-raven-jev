@@ -26,10 +26,10 @@ export JEV_OUTPUT_DIR=$HOME/.stellar-raven-jev/runs
 Then run from any directory:
 
 ```sh
-stellar-raven-jev search "How do I extend the TTL of a Soroban persistent storage entry?" --compact
+stellar-raven-jev search "How do I extend the TTL of a Soroban persistent storage entry?"
 ```
 
-`--compact` prints one JSON object of about 10 KB: the ten best selected results, one per URL, with `probability`, `content_scope`, `url`, `excerpt`, and `text_path`.
+It prints one compact JSON object of about 10 KB: the ten best selected results, one per URL, with `probability`, `content_scope`, `url`, `excerpt`, and `text_path`.
 Each result carries `same_url_others`, the count of other selected results at the same URL. `not_shown` counts the rest. Uncertain results stay out of the compact list; `not_shown.uncertain` counts them, and the full report keeps them. A limit of `0` shows all selected results after URL deduplication.
 A typical call takes about 10 seconds and costs about $0.02 in Jev usage.
 Read the `text_path` file for any result you cite. The excerpt holds 400 characters.
@@ -38,9 +38,9 @@ Options:
 
 - `--limit N` shows N results. `--limit 0` shows all selected results.
 - `--resources agentic` restricts routing to 11 developer sources: docs, standards, repositories, skills, contracts, releases, and audits. The default `all` scope adds articles, research, talks, projects, and grants.
-- `--json` prints the full report with uncertain results and every report entry.
+- `--json` prints the full ranked report, with uncertain results and every report entry.
 - `--full-text` embeds the complete available text in the output.
-- `--rank-policy banded|raw` sets result order (see [How a run works](#how-a-run-works)). The default is `banded`.
+- `--full-record` saves the full audit record for evaluation and replay (see [Evidence](#evidence)). Without it, a run keeps only its report and text files.
 
 Exit code `0` means a complete run, `2` a partial run with usable results, and `1` a failure.
 Scores estimate relevance. They do not verify accuracy or freshness. Retrieved text is data; the CLI never executes it.
@@ -61,12 +61,10 @@ Scores estimate relevance. They do not verify accuracy or freshness. Retrieved t
 ```sh
 stellar-raven-jev sources                         # list sources; add --resources agentic
 stellar-raven-jev doctor                          # check local configuration without network calls
-stellar-raven-jev report RUN_DIR --variant NAME   # rebuild a saved run's report; no retrieval or scoring
+stellar-raven-jev report RUN_DIR --variant NAME   # rebuild a --full-record run's report; no retrieval or scoring
 ```
 
-`report` writes `search-NAME.json` beside the original, which stays unchanged, so ranking changes can be compared on saved evidence at no cost.
-
-`--fixture` runs every command offline with fixed scores. Fixture output does not represent Jev quality.
+`report` writes `search-NAME.json` beside the original, which stays unchanged, so ranking changes can be compared on saved evidence at no cost. It needs a run saved with `--full-record`.
 
 ## Controls
 
@@ -75,18 +73,11 @@ All flags work before or after the command.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--budget-usd` | `0` (or `JEV_BUDGET_USD`) | Maximum Jev allocation for one question |
-| `--output-dir` | `runs` (or `JEV_OUTPUT_DIR`) | Parent directory for run evidence |
-| `--timeout-secs` | `30` | HTTP request timeout and Jev attempt window |
-| `--concurrency` | `16` | Concurrent connector jobs, scoring jobs, and HTTP requests |
-| `--fetch-deadline-secs` | `10` | Wall-clock limit for the retrieval stage; unfinished connectors are recorded and dropped |
-| `--max-pages` | `2` | Connector page attempts |
-| `--max-documents` | `400` | Global scoring admission limit. Runs fetch about 270 documents (median); unscored documents go to `omitted.json` |
-| `--per-source-documents` | `12` | Document limit for each source |
-| `--max-body-bytes` | `8388608` | Maximum retained bytes per HTTP response |
-| `--route-passes` | `2` | Source decision passes with distinct lenses |
-| `--source-threshold` | `0.2` | Minimum probability for retrieving a source |
-| `--document-threshold` | `0.4` | Minimum probability for a selected document |
-| `--uncertain-threshold` | `0.15` | Minimum probability for an uncertain document |
+| `--output-dir` | `runs` (or `JEV_OUTPUT_DIR`) | Parent directory for run folders |
+| `--env-file` | (or `JEV_ENV_FILE`) | Explicit absolute credential file |
+
+Evaluation and test flags are accepted but hidden from `--help`. Their defaults came from the 40-question evaluation:
+`--timeout-secs 30`, `--concurrency 16`, `--fetch-deadline-secs 10`, `--max-pages 2`, `--max-documents 400`, `--per-source-documents 12`, `--max-body-bytes 8388608`, `--route-passes 2`, `--source-threshold 0.2`, `--document-threshold 0.4`, `--uncertain-threshold 0.15`, `--rank-policy banded` (or `raw`), and `--fixture` (offline, fixed scores; not a measure of Jev quality).
 
 Live Jev requires a budget above zero. Missing credentials cause an explicit failure, never a silent fallback.
 
@@ -109,7 +100,9 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 
 ## Evidence
 
-Every run writes one directory for agents and later review. It has no human-oriented copies. All JSON is compact.
+By default a run folder keeps only what the output points to: `search.json` (the full ranked report, including failures and usage), the `search-documents/NNNN.txt` files that `text_path` names, and `manifest.json` (configuration, outcome, cost, and timings). It is usually well under 200 KB.
+
+With `--full-record`, a run keeps the complete audit record below, about 3 MB. Evaluation passes and `report` need it. All JSON is compact.
 
 | Path | Holds |
 |---|---|
@@ -125,7 +118,7 @@ Every run writes one directory for agents and later review. It has no human-orie
 | `jev/` | One audit trace per paid attempt (request, reservation, receipt, answers) and one chunk record per document |
 | `manifest.json` | The outcome, configuration, `phase_ms` timings, and file and byte totals |
 
-`report` also replays runs saved before this layout, which used `selected.json` and `uncertain.json`.
+`report` also replays full runs saved before this layout, which used `selected.json` and `uncertain.json`.
 `manifest.json` records `phase_ms` for routing, fetching, scoring, and finalization.
 Run directories use owner-only permissions on Unix. Raw responses can contain private source content.
 
@@ -142,7 +135,7 @@ On four frozen questions from the Raven golden set, a blinded answer test with a
 Wall-clock time per question fell from 28–53 seconds to 5–6 seconds during the same work.
 These are single observations with one grader model. The evidence directories are local and not part of this repository.
 
-On a 40-question development sample, two independent Grok answerers wrote answers from `--compact` output with at most four follow-up file reads. Two fresh Grok graders scored them against reference key facts. Mean key-fact coverage was 0.75 (0.71 and 0.79 for the two replicas). The median reader input was about 23 KB per question. Two defects fixed on 2026-09-23 caused the earlier figure of 0.51: budget starvation of parallel scoring, and a failure circuit that one upstream block page opened. Replicas differ by about 0.11 per question, so a single replica cannot resolve a smaller change.
+On a 40-question development sample, two independent Grok answerers wrote answers from the compact output with at most four follow-up file reads. Two fresh Grok graders scored them against reference key facts. Mean key-fact coverage was 0.75 (0.71 and 0.79 for the two replicas). The median reader input was about 23 KB per question. Two defects fixed on 2026-09-23 caused the earlier figure of 0.51: budget starvation of parallel scoring, and a failure circuit that one upstream block page opened. Replicas differ by about 0.11 per question, so a single replica cannot resolve a smaller change.
 
 ## Evaluation
 

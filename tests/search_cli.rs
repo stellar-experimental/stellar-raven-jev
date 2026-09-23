@@ -50,6 +50,7 @@ fn agentic_search_filters_before_routing_and_delivers_exact_text() {
             "--full-text",
             "--limit",
             "1",
+            "--full-record",
         ])
         .output()
         .unwrap();
@@ -116,7 +117,7 @@ fn agentic_search_filters_before_routing_and_delivers_exact_text() {
 }
 
 #[test]
-fn text_display_limit_preserves_all_saved_results_and_all_source_default() {
+fn default_search_prints_compact_json_and_keeps_a_light_record() {
     let temp = tempfile::tempdir().unwrap();
     let output = cli()
         .args(["--fixture", "--output-dir"])
@@ -125,13 +126,12 @@ fn text_display_limit_preserves_all_saved_results_and_all_source_default() {
         .output()
         .unwrap();
     assert!(matches!(output.status.code(), Some(0 | 2)));
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("Showing 1 of "));
-    assert!(!text.contains("\n2. "));
-    let report_path = text
-        .lines()
-        .find_map(|line| line.strip_prefix("JSON: "))
-        .unwrap();
+    let compact: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(compact["compact"], true);
+    assert_eq!(compact["results"].as_array().unwrap().len(), 1);
+    let text_path = compact["results"][0]["text_path"].as_str().unwrap();
+    assert!(std::path::Path::new(text_path).is_file());
+    let report_path = std::path::Path::new(compact["full_report_path"].as_str().unwrap());
     let report: Value = serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
     assert_eq!(
         report["source_scope"]["eligible_source_ids"]
@@ -142,6 +142,32 @@ fn text_display_limit_preserves_all_saved_results_and_all_source_default() {
     );
     assert!(report["results"].as_array().unwrap().len() > 1);
     assert!(report["results"][0].get("text").is_none());
+    // The light record keeps only the report, its text files, and the manifest.
+    let root = report_path.parent().unwrap();
+    let mut names: Vec<String> = std::fs::read_dir(root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["manifest.json", "search-documents", "search.json"]);
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["record"], "light");
+    assert_eq!(manifest["config"]["full_record"], false);
+    // A light record cannot be replayed, and says why.
+    let replay = cli().arg("report").arg(root).output().unwrap();
+    assert_eq!(replay.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&replay.stderr).contains("--full-record"));
+    // The old --compact flag is still accepted.
+    let legacy = cli()
+        .args(["--fixture", "--output-dir"])
+        .arg(temp.path())
+        .args(["search", "Stellar RPC events", "--compact"])
+        .output()
+        .unwrap();
+    assert!(matches!(legacy.status.code(), Some(0 | 2)));
+    let legacy: Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    assert_eq!(legacy["compact"], true);
 }
 
 #[test]

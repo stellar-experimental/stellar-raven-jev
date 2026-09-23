@@ -82,6 +82,14 @@ pub struct RunConfig {
     pub source_threshold: f64,
     pub document_threshold: f64,
     pub uncertain_threshold: f64,
+    /// Write the full audit record (raw HTTP bodies, Jev traces, document store, and
+    /// classification) instead of only the report and the text files it names.
+    #[serde(default = "default_full_record")]
+    pub full_record: bool,
+}
+
+fn default_full_record() -> bool {
+    true
 }
 
 fn default_per_source_documents() -> usize {
@@ -109,6 +117,7 @@ impl Default for RunConfig {
             source_threshold: 0.2,
             document_threshold: 0.4,
             uncertain_threshold: 0.15,
+            full_record: true,
         }
     }
 }

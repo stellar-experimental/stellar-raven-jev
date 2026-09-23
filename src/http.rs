@@ -120,6 +120,8 @@ fn write_metadata(path: &Path, value: &Value) -> Result<()> {
 /// Finalizes one raw HTTP record on every exit, including a cancelled request future: it gzips
 /// the retained body, hashes the exact bytes, and only then points the metadata at `.body.gz`.
 struct RawRecord {
+    /// False for a light record: nothing is written, and the body stays in memory only.
+    enabled: bool,
     root: PathBuf,
     prefix: String,
     metadata: Value,
@@ -129,6 +131,9 @@ struct RawRecord {
 impl RawRecord {
     fn finish(&mut self) -> Result<()> {
         self.finished = true;
+        if !self.enabled {
+            return Ok(());
+        }
         let streamed = self.root.join(format!("{}.body", self.prefix));
         if streamed.is_file() {
             let bytes = std::fs::read(&streamed)?;
@@ -188,7 +193,9 @@ impl HttpRecorder {
     }
 
     pub fn new(run_dir: &Path, config: &RunConfig) -> Result<Self> {
-        std::fs::create_dir_all(run_dir.join("raw"))?;
+        if config.full_record {
+            std::fs::create_dir_all(run_dir.join("raw"))?;
+        }
         Ok(Self {
             client: Client::builder()
                 .redirect(Policy::none())
@@ -282,6 +289,7 @@ impl HttpRecorder {
         // including cancellation, and only then points the metadata at the compressed file.
         let streaming_artifact = format!("{prefix}.body");
         let mut record = RawRecord {
+            enabled: self.config.full_record,
             root: self.root.clone(),
             prefix: prefix.clone(),
             metadata: json!({"method": method.as_str(), "body_artifact": streaming_artifact,
@@ -335,7 +343,9 @@ impl HttpRecorder {
             {
                 bail!("Request URL must use HTTPS");
             }
-            write_metadata(&metadata_path, &record.metadata)?;
+            if record.enabled {
+                write_metadata(&metadata_path, &record.metadata)?;
+            }
             let _permit = self.semaphore.acquire().await?;
             // Wall-clock start after the permit, so timelines separate queue wait from transfer.
             record.metadata["queued_ms"] = json!(started.elapsed().as_millis() as u64);
@@ -398,7 +408,11 @@ impl HttpRecorder {
                 .collect();
             record.metadata["response_headers"] = json!(response_headers);
             // Synchronous chunk writes: a cancelled request leaves no write pending.
-            let mut file = std::fs::File::create(self.root.join(&streaming_artifact))?;
+            let mut file = if record.enabled {
+                Some(std::fs::File::create(self.root.join(&streaming_artifact))?)
+            } else {
+                None
+            };
             let mut stream = response.bytes_stream();
             let mut bytes = Vec::new();
             while let Some(chunk) = stream.next().await {
@@ -413,22 +427,30 @@ impl HttpRecorder {
                     counters.1 += retain_count as u64;
                 }
                 let retained = &chunk[..retain_count];
-                std::io::Write::write_all(&mut file, retained)?;
+                if let Some(file) = file.as_mut() {
+                    std::io::Write::write_all(file, retained)?;
+                }
                 bytes.extend_from_slice(retained);
                 record.metadata["retained_bytes"] = json!(bytes.len());
                 if retain_count < chunk.len().min(available) {
-                    std::io::Write::flush(&mut file)?;
+                    if let Some(file) = file.as_mut() {
+                        std::io::Write::flush(file)?;
+                    }
                     bail!("HTTP response byte limit reached; retained body is incomplete");
                 }
                 if chunk.len() > available {
-                    std::io::Write::flush(&mut file)?;
+                    if let Some(file) = file.as_mut() {
+                        std::io::Write::flush(file)?;
+                    }
                     bail!(
                         "Response exceeds --max-body-bytes {}; retained body is incomplete",
                         self.config.max_body_bytes
                     );
                 }
             }
-            std::io::Write::flush(&mut file)?;
+            if let Some(file) = file.as_mut() {
+                std::io::Write::flush(file)?;
+            }
             record.metadata["complete"] = json!(true);
             if (300..400).contains(&status) {
                 bail!("HTTP redirect {status} refused; credentials were not forwarded");

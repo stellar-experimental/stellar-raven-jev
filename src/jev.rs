@@ -109,6 +109,8 @@ pub struct JevClient {
     /// Wakes reservations that wait for in-flight attempts to settle or stop.
     settled: tokio::sync::Notify,
     audit_dir: PathBuf,
+    /// False for a light record: accounting still runs in memory, but no trace files are written.
+    record: bool,
 }
 
 impl JevClient {
@@ -147,11 +149,14 @@ impl JevClient {
             backend_from_env()?
         };
         let audit_dir = http.run_dir().join("jev");
-        std::fs::create_dir_all(&audit_dir).context("Cannot create the Jev audit directory")?;
+        if config.full_record {
+            std::fs::create_dir_all(&audit_dir).context("Cannot create the Jev audit directory")?;
+        }
         let client = Self {
             http: http.clone(),
             backend,
             audit_dir,
+            record: config.full_record,
             ledger: Mutex::new(Ledger {
                 budget_nanos: (config.budget_usd * NANOS_PER_USD).floor() as u64,
                 unresolved_stop_after: UNRESOLVED_STOP_AFTER,
@@ -376,6 +381,12 @@ impl JevClient {
 
     fn write_audit(&self, name: &str, data: &Value) -> Result<String> {
         let filename = format!("{name}.json");
+        if !self.record {
+            // A light record keeps no traces; say so instead of naming a missing file.
+            return Ok(format!(
+                "unrecorded (run with --full-record to keep jev/{filename})"
+            ));
+        }
         let path = self.audit_dir.join(&filename);
         let bytes = serde_json::to_vec(data)?;
         std::fs::write(path, bytes).context("Cannot save the Jev audit trace")?;

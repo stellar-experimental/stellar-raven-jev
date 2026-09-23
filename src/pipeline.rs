@@ -178,6 +178,19 @@ fn persist(
     status: &str,
 ) -> Result<RunOutcome> {
     let root = &config.output_dir;
+    let outcome = RunOutcome {
+        directory: root.clone(),
+        status: status.into(),
+        selected: evidence.selected.len(),
+        rejected: evidence.rejected.len(),
+        uncertain: evidence.uncertain.len(),
+        failures: evidence.failures.len(),
+        usage: usage.clone(),
+    };
+    // A light record keeps no mid-run checkpoints; the final write feeds the report.
+    if status == "running" && !config.full_record {
+        return Ok(outcome);
+    }
     write_json(root.join("routes.json"), &evidence.routes)?;
     write_json(
         root.join("source-decisions.json"),
@@ -195,20 +208,12 @@ fn persist(
     write_json(root.join("omitted.json"), &evidence.omitted)?;
     write_json(root.join("failures.json"), &evidence.failures)?;
     write_json(root.join("usage.json"), usage)?;
-    let outcome = RunOutcome {
-        directory: root.clone(),
-        status: status.into(),
-        selected: evidence.selected.len(),
-        rejected: evidence.rejected.len(),
-        uncertain: evidence.uncertain.len(),
-        failures: evidence.failures.len(),
-        usage: usage.clone(),
-    };
     let artifacts = collect_artifacts(root)?;
     write_json(
         root.join("manifest.json"),
         &json!({
             "schema_version": 1, "outcome": outcome, "mode": if config.fixture { "offline-fixture" } else { "live-jev" },
+            "record": if config.full_record { "full" } else { "light" },
             "fixture_is_model_evidence": false, "answer_generated": false, "probabilities_are_calibrated": false,
             "config": config, "artifacts": artifacts, "document_count": evidence.documents.len(),
             "scored_document_count": evidence.scores.len(), "omitted_document_count": evidence.omitted.len(),
@@ -247,6 +252,35 @@ fn collect_artifacts(root: &Path) -> Result<serde_json::Value> {
         }
     }
     Ok(json!({"files":files,"directories":directories}))
+}
+
+/// The default light record: keep only manifest.json, search.json, and the search-documents
+/// text files that the report's text_path fields name. Run after the report is built.
+pub fn keep_report_only(root: &Path) -> Result<()> {
+    anyhow::ensure!(
+        root.join("search.json").is_file() && root.join("manifest.json").is_file(),
+        "The report must exist before the run folder is reduced to it"
+    );
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(
+            name.to_str(),
+            Some("manifest.json" | "search.json" | "search-documents")
+        ) {
+            continue;
+        }
+        if entry.path().is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+    manifest["record"] = json!("light");
+    manifest["artifacts"] = collect_artifacts(root)?;
+    write_json(root.join("manifest.json"), &manifest)
 }
 
 pub(crate) fn refresh_manifest_artifacts(root: &Path) -> Result<()> {
@@ -426,7 +460,7 @@ async fn execute(
             Err(_) => {
                 // Dropping the stream cancels the unfinished connectors. Completed raw responses remain.
                 for source_id in selected.iter().filter(|id| !finished.contains(*id)) {
-                    evidence.failures.push(failure("fetch_deadline", Some(source_id), format!("Connector did not finish within --fetch-deadline-secs {}; its documents were not admitted. Completed raw responses remain under raw/.", config.fetch_deadline_secs)));
+                    evidence.failures.push(failure("fetch_deadline", Some(source_id), format!("Connector did not finish within --fetch-deadline-secs {}; its documents were not admitted.{}", config.fetch_deadline_secs, if config.full_record { " Completed raw responses remain under raw/." } else { "" })));
                 }
                 break;
             }
@@ -488,7 +522,7 @@ async fn execute(
                         "deduplication",
                         Some(&document.source_id),
                         format!(
-                            "Duplicate document ID {} retained in omitted.json",
+                            "Duplicate document ID {} was not scored (kept in omitted.json with --full-record)",
                             document.id
                         ),
                     ));
@@ -509,7 +543,18 @@ async fn execute(
         *omitted_counts.entry(&document.source_id).or_default() += 1;
     }
     for (source_id, count) in omitted_counts {
-        evidence.failures.push(failure("document_limit",Some(source_id),format!("Omitted {count} fetched documents from scoring; inspect omitted.json and --max-documents")));
+        evidence.failures.push(failure(
+            "document_limit",
+            Some(source_id),
+            format!(
+                "Omitted {count} fetched documents from scoring; see --max-documents{}",
+                if config.full_record {
+                    " and omitted.json"
+                } else {
+                    ""
+                }
+            ),
+        ));
     }
     persist(config, &evidence, &backend.usage(), "running")?;
     // Exact duplicates are scored once. Jev sees the title and the text, so both are in the key.
