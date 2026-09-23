@@ -83,7 +83,7 @@ fn parse_date(text: &str) -> Option<(String, i64)> {
     let [iso, named, slashed] = PATTERNS.get_or_init(|| {
         [
             Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})").unwrap(),
-            Regex::new(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.? (\d{1,2}),? (\d{4})\b").unwrap(),
+            Regex::new(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.? (\d{1,2})(?:st|nd|rd|th)?,? (\d{4})\b").unwrap(),
             Regex::new(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b").unwrap(),
         ]
     });
@@ -142,6 +142,19 @@ pub fn document_date(document: &Document) -> Option<DocDate> {
         if let Some((date, days)) = path(p, keys).and_then(parse_date) {
             return Some(DocDate { date, kind, days });
         }
+    }
+    // An Algolia site record carries the page's own date field.
+    if let Some((date, days)) = p["records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|record| record["date"].as_str().and_then(parse_date))
+    {
+        return Some(DocDate {
+            date,
+            kind: "published",
+            days,
+        });
     }
     // `created_at` is an upload time for recordings and an ingestion time where the connector says
     // so. Elsewhere (research, proposals) it is when the item was written.
@@ -394,6 +407,16 @@ mod tests {
         );
         av.source_id = "lumenloop.av".into();
         assert_eq!(document_date(&av).unwrap().kind, "upload_metadata");
+        let record = doc(
+            "r",
+            "",
+            "t",
+            "",
+            json!({"records":[{"object_id":"1","date":"2024-06-18"}]}),
+        );
+        assert_eq!(document_date(&record).unwrap().date, "2024-06-18");
+        let ordinal = doc("o", "", "t", "Published on June 18th, 2024", json!({}));
+        assert_eq!(document_date(&ordinal).unwrap().date, "2024-06-18");
         let scf = doc("e", "", "t", "Date: 31/08/2026", json!({}));
         assert_eq!(document_date(&scf).unwrap().date, "2026-08-31");
         assert!(civil_days(2026, 9, 16).unwrap() > civil_days(2026, 8, 13).unwrap());

@@ -656,6 +656,26 @@ fn html_article_text(text: &str) -> Option<(String, &'static str)> {
                     "sr-only" | "visually-hidden" | "table-of-contents" | "theme-doc-toc-mobile"
                 )
             });
+        // An empty <time> element is filled in by page scripts. Its machine-readable value is the
+        // only copy of the date, so it becomes text.
+        if tag == "time" && !hidden && !stack.iter().any(|(_, hidden)| *hidden) {
+            if let Some(value) = attrs.get("datetime").filter(|v| !v.trim().is_empty()) {
+                let empty = lower[at..].trim_start().starts_with("</time");
+                if empty {
+                    for (scope, buffer) in [
+                        ("article", &mut article),
+                        ("main", &mut main),
+                        ("body", &mut body),
+                    ] {
+                        if stack.iter().any(|(name, _)| name == scope) {
+                            buffer.push(' ');
+                            buffer.push_str(value.trim());
+                            buffer.push(' ');
+                        }
+                    }
+                }
+            }
+        }
         if !raw.ends_with('/')
             && !matches!(
                 tag.as_str(),
@@ -1434,6 +1454,16 @@ mod tests {
         assert!(docs_facet_queries(&broad, 2, 1).is_empty());
         let single = crate::query::plan("How do I rotate expired Widgetd signing keys?");
         assert!(docs_facet_queries(&single, 2, 3).is_empty());
+    }
+    #[test]
+    fn an_empty_time_element_keeps_its_machine_readable_date() {
+        let raw = r#"<html><body><article><p>Publishing date</p><time dateTime="2024-06-18T11:00:00.000Z" class="x"></time><p>Posted <time datetime="2020-01-01">January 1</time></p></article></body></html>"#;
+        let (text, _) = html_article_text(raw).unwrap();
+        assert!(
+            text.contains("Publishing date\n2024-06-18T11:00:00.000Z"),
+            "{text}"
+        );
+        assert!(text.contains("Posted January 1") && !text.contains("2020-01-01"));
     }
     #[test]
     fn extraction_removes_hidden_content_and_keeps_article_heading() {
