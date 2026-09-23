@@ -10,7 +10,7 @@ It returns ranked evidence with URLs, excerpts, and paths to the full text. It d
 cargo install --path . --locked
 ```
 
-Copy `.env.example` to `.env` and fill in the source credentials and one Jev backend.
+Copy `.env.example` to `.env` and fill in the source and Cloudflare credentials.
 The CLI loads `.env` from the working directory or its parents, or from `--env-file` / `JEV_ENV_FILE`.
 
 ## Use from an agent
@@ -61,16 +61,10 @@ Scores estimate relevance. They do not verify accuracy or freshness. Retrieved t
 ```sh
 stellar-raven-jev sources                         # list sources; add --resources agentic
 stellar-raven-jev doctor                          # check local configuration without network calls
-stellar-raven-jev ask "QUESTION"                  # retrieve and save evidence; print counts as JSON
-stellar-raven-jev chat                            # one question per line
 stellar-raven-jev report RUN_DIR --variant NAME   # rebuild a saved run's report; no retrieval or scoring
-stellar-raven-jev operations                      # typed operation schemas for plans
-stellar-raven-jev plan examples/service-plan.json # run an agent-authored retrieval plan
 ```
 
 `report` writes `search-NAME.json` beside the original, which stays unchanged, so ranking changes can be compared on saved evidence at no cost.
-
-Plans let a calling agent choose native filters, repeated queries, and unequal source allowances. Jev still scores every document against the original question. See the [plan guide](docs/service-v2/USAGE.md).
 
 `--fixture` runs every command offline with fixed scores. Fixture output does not represent Jev quality.
 
@@ -121,11 +115,7 @@ Run directories use owner-only permissions on Unix. Raw responses can contain pr
 
 ## Configuration
 
-| Backend | Settings |
-|---|---|
-| Cloudflare | `JEV_BACKEND=cloudflare`, `CLOUDFLARE_ACCOUNT_ID`, and either `CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_AUTH_PROFILE` (a Wrangler profile); optional `JEV_GATEWAY_ID` |
-| TypeSafe | `JEV_BACKEND=typesafe`, `TYPESAFE_API_KEY` |
-| Proxy | `JEV_BACKEND=proxy`, `JEV_PROXY_URL`, `JEV_PROXY_TOKEN` |
+Jev runs through Cloudflare Workers AI. Set `CLOUDFLARE_ACCOUNT_ID` and either `CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_AUTH_PROFILE` (a Wrangler profile). `JEV_GATEWAY_ID` is optional and defaults to `default`. `JEV_BACKEND`, when set, must be `cloudflare`.
 
 With a Wrangler profile, each run obtains its token through `wrangler auth token --profile NAME --json`. The token stays in memory. The profile token must belong to the pinned account; a mismatch produces HTTP 401 on every Jev call.
 Sources need `LUMENLOOP_API_KEY`, `ALGOLIA_APPLICATION_ID_DOCS`, `ALGOLIA_API_KEY_DOCS`, `ALGOLIA_APPLICATION_ID_SITE`, and `ALGOLIA_API_KEY_SITE`. Stellar Scout needs no credential.

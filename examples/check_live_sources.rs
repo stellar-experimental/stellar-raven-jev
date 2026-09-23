@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
             std::time::Duration::from_secs(90), connectors::fetch(&ctx, source, question),
         ).await {
             Ok(Ok(result)) => result,
-            result => FetchResult { omitted_documents: vec![], documents: vec![], failures: vec![Failure {
+            result => FetchResult { documents: vec![], failures: vec![Failure {
                 stage: "source_check".into(), source_id: Some(id.into()),
                 message: match result {
                     Ok(Err(error)) => error.to_string(),

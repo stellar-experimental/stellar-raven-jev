@@ -1,15 +1,12 @@
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
-use std::{
-    io::{self, Write},
-    path::PathBuf,
-};
+use std::path::PathBuf;
 use stellar_raven_jev::{
     connectors,
     http::HttpRecorder,
     jev::JevClient,
-    pipeline::{run_question, validate_config, RunOutcome},
+    pipeline::{validate_config, RunOutcome},
     types::RunConfig,
 };
 
@@ -111,25 +108,8 @@ enum Command {
         #[arg(long, value_enum, default_value = "banded")]
         rank_policy: stellar_raven_jev::search::RankPolicy,
     },
-    /// List typed operation schemas and retrieval capabilities.
-    Operations,
-    /// Execute an agent-authored retrieval plan against its original question.
-    Plan {
-        file: PathBuf,
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Retrieve documents for one question and save an evidence directory.
-    Ask { question: String },
-    /// Read one question per line. Each question creates a separate evidence directory.
-    Chat,
     /// Check local settings and authentication presence without network requests.
     Doctor,
-}
-
-fn report(outcome: &RunOutcome) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(outcome)?);
-    Ok(())
 }
 
 fn source_credentials(present: impl Fn(&str) -> bool) -> serde_json::Value {
@@ -200,16 +180,7 @@ fn profile_doctor_check(
     if config.fixture {
         return Ok(None);
     }
-    let backend = env("JEV_BACKEND").unwrap_or_else(|| {
-        if env("JEV_PROXY_URL").is_some() {
-            "proxy"
-        } else if env("TYPESAFE_API_KEY").is_some() {
-            "typesafe"
-        } else {
-            "cloudflare"
-        }
-        .into()
-    });
+    let backend = env("JEV_BACKEND").unwrap_or_else(|| "cloudflare".into());
     if backend != "cloudflare" || env("CLOUDFLARE_API_TOKEN").is_some() {
         return Ok(None);
     }
@@ -366,62 +337,6 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print!("{}", stellar_raven_jev::search::render_text(&report, limit));
-            }
-        }
-        Command::Operations => println!(
-            "{}",
-            serde_json::to_string_pretty(&stellar_raven_jev::operations::catalog())?
-        ),
-        Command::Plan { file, dry_run } => {
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            std::fs::File::open(file)?
-                .take(256 * 1024 + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(bytes.len() <= 256 * 1024, "Plan file exceeds 256 KiB");
-            let plan: stellar_raven_jev::plan::RetrievalPlan = serde_json::from_slice(&bytes)?;
-            stellar_raven_jev::plan::validate(&plan)?;
-            if dry_run {
-                println!(
-                    "{}",
-                    json!({"valid":true,"network_called":false,"plan":plan})
-                );
-            } else {
-                let outcome = stellar_raven_jev::plan::run_plan(&plan, &config).await?;
-                report(&outcome)?;
-                if outcome.status != "complete" {
-                    std::process::exit(if outcome.status == "partial" { 2 } else { 1 });
-                }
-            }
-        }
-        Command::Ask { question } => {
-            let outcome = run_question(&question, &config).await?;
-            report(&outcome)?;
-            if outcome.status != "complete" {
-                std::process::exit(1);
-            }
-        }
-        Command::Chat => {
-            eprintln!("Enter one question per line. Enter /quit to stop. Each question uses the configured per-run budget.");
-            let mut line = String::new();
-            loop {
-                eprint!("question> ");
-                io::stderr().flush()?;
-                line.clear();
-                if io::stdin().read_line(&mut line)? == 0 {
-                    break;
-                }
-                let question = line.trim();
-                if matches!(question, "/quit" | "/exit") {
-                    break;
-                }
-                if question.is_empty() {
-                    continue;
-                }
-                match run_question(question, &config).await {
-                    Ok(outcome) => report(&outcome)?,
-                    Err(error) => eprintln!("Run failed: {error}"),
-                }
             }
         }
         Command::Doctor => {

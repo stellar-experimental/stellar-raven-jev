@@ -19,18 +19,16 @@ const MAX_REQUEST_BYTES: usize = 60_000;
 const MAX_STATE_BYTES: usize = 24_000;
 const DOCUMENT_CHUNK_BYTES: usize = 12_000;
 const NANOS_PER_USD: f64 = 1_000_000_000.0;
-const MODEL: &str = "jev-1.13.0";
 const SHARED_CEILING_USD: f64 = 100.0;
 const AUTH_OUTPUT_LIMIT: usize = 16_384;
 
 // Never derive Debug: this type holds authentication values.
 enum Backend {
     Fixture,
-    Proxy {
+    /// Offline HTTP tests only: a local server that accepts the Cloudflare request body.
+    #[cfg(test)]
+    Loopback {
         url: String,
-        token: String,
-    },
-    TypeSafe {
         token: String,
     },
     Cloudflare {
@@ -43,34 +41,19 @@ impl Backend {
     fn name(&self) -> &'static str {
         match self {
             Self::Fixture => "fixture",
-            Self::Proxy { .. } => "jev_proxy",
-            Self::TypeSafe { .. } => "typesafe",
+            #[cfg(test)]
+            Self::Loopback { .. } => "loopback",
             Self::Cloudflare { .. } => "cloudflare",
         }
     }
-    fn upstream_attempts(&self) -> u64 {
-        // The existing proxy does not expose gateway retry controls.
-        if matches!(self, Self::Proxy { .. }) {
-            5
-        } else {
-            1
-        }
-    }
+    /// $0.042 per million input tokens plus the 5% Cloudflare credit fee, in nanodollars.
     fn cost_nanos(&self, tokens: u64) -> Result<u64> {
-        let tenths = if matches!(self, Self::TypeSafe { .. }) {
-            420u128
-        } else {
-            441u128
-        };
-        let cost = (u128::from(tokens) * tenths).div_ceil(10);
+        let cost = (u128::from(tokens) * 441).div_ceil(10);
         u64::try_from(cost).context("Jev token cost exceeds the accounting range")
     }
+    /// Cloudflare runs each request once (`cf-aig-max-attempts: 1`), so one request is reserved.
     fn reservation(&self) -> Result<u64> {
-        self.cost_nanos(
-            MAX_INPUT_TOKENS
-                .checked_mul(self.upstream_attempts())
-                .context("Jev reservation overflow")?,
-        )
+        self.cost_nanos(MAX_INPUT_TOKENS)
     }
 }
 
@@ -129,12 +112,6 @@ pub struct JevClient {
 }
 
 impl JevClient {
-    /// Tests of circuit mechanics open it at the first unresolved attempt.
-    #[cfg(test)]
-    pub(crate) fn open_circuit_after_for_test(&self, attempts: u32) {
-        self.ledger.lock().unwrap().unresolved_stop_after = attempts;
-    }
-
     #[cfg(test)]
     pub(crate) fn loopback_for_test(config: &RunConfig, url: String) -> Result<Self> {
         let mut offline = config.clone();
@@ -144,7 +121,7 @@ impl JevClient {
         let mut transport = config.clone();
         transport.fixture = false;
         client.http = HttpRecorder::loopback_for_test(&config.output_dir, &transport)?;
-        client.backend = Backend::Proxy {
+        client.backend = Backend::Loopback {
             url,
             token: "offline-placeholder".into(),
         };
@@ -188,10 +165,9 @@ impl JevClient {
             "shared_budget_owner": "lead; this client enforces its run allocation only",
             "input_usd_per_million": 0.042, "output_usd_per_million": 0.0,
             "cloudflare_credit_purchase_multiplier": 1.05,
-            "reservation_input_tokens_per_upstream_attempt": MAX_INPUT_TOKENS,
-            "upstream_attempts_reserved": client.backend.upstream_attempts(),
+            "reservation_input_tokens_per_request": MAX_INPUT_TOKENS,
             "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and Cloudflare credit purchase overhead",
-            "proxy_retry_policy": "no client retries; proxy hides upstream status and retry headers",
+            "retry_policy": "no client retries; Cloudflare runs each request once (cf-aig-max-attempts: 1)",
             "unresolved_usage_policy": "retain the full reservation of any attempt without a valid usage receipt; no automatic retry; stop new reservations after 3 consecutive unresolved attempts",
             "token_guard": "UTF-8 byte limits are local guards, not a verified provider tokenizer",
             "retrieved_pricing_date": "2026-09-21"
@@ -465,7 +441,8 @@ impl JevClient {
         Ok(Some(reservation))
     }
 
-    /// Terminal client state, shared by all scoring futures and plan gates.
+    /// Terminal client state, shared by all scoring futures.
+    #[cfg(test)]
     pub(crate) fn spending_stop_reason(&self) -> Option<&'static str> {
         let Ok(ledger) = self.ledger.lock() else {
             return Some("Jev accounting lock failed");
@@ -523,13 +500,7 @@ impl JevClient {
             .lock()
             .map_err(|_| anyhow!("Jev accounting lock failed"))?;
         let result = (|| -> Result<()> {
-            // Unknown proxy retries retain their full reservations, even after success.
-            let unknown = MAX_INPUT_TOKENS * (self.backend.upstream_attempts() - 1);
-            let cost = self.backend.cost_nanos(
-                input
-                    .checked_add(unknown)
-                    .context("Jev token accounting overflow")?,
-            )?;
+            let cost = self.backend.cost_nanos(input)?;
             ledger.usage.input_tokens = ledger
                 .usage
                 .input_tokens
@@ -649,14 +620,8 @@ impl JevClient {
                     pending.receipt_accounted = true;
                     trace["reported_provider_cost_usd"] =
                         json!(parsed.input_tokens as f64 * 0.042 / 1_000_000.0);
-                    trace["reported_cost_with_credit_fee_usd"] = json!(
-                        parsed.input_tokens as f64 * 0.042 / 1_000_000.0
-                            * if matches!(self.backend, Backend::TypeSafe { .. }) {
-                                1.0
-                            } else {
-                                1.05
-                            }
-                    );
+                    trace["reported_cost_with_credit_fee_usd"] =
+                        json!(parsed.input_tokens as f64 * 0.042 / 1_000_000.0 * 1.05);
                     trace["model"] = json!(parsed.model);
                     trace["answers"] = json!(parsed.answers);
                     trace["usage"] = json!(self.usage());
@@ -682,14 +647,8 @@ impl JevClient {
                                 pending.receipt_accounted = true;
                                 trace["reported_provider_cost_usd"] =
                                     json!(input as f64 * 0.042 / 1_000_000.0);
-                                trace["reported_cost_with_credit_fee_usd"] = json!(
-                                    input as f64 * 0.042 / 1_000_000.0
-                                        * if matches!(self.backend, Backend::TypeSafe { .. }) {
-                                            1.0
-                                        } else {
-                                            1.05
-                                        }
-                                );
+                                trace["reported_cost_with_credit_fee_usd"] =
+                                    json!(input as f64 * 0.042 / 1_000_000.0 * 1.05);
                                 trace["usage_receipt_accounted"] = json!(true);
                                 trace["usage"] = json!(self.usage());
                                 if settled.is_err() {
@@ -717,20 +676,13 @@ impl JevClient {
     fn request_parts(&self, state: Value, questions: Map<String, Value>) -> Result<RequestParts> {
         let mut headers = vec![("content-type".into(), "application/json".into())];
         match &self.backend {
-            Backend::Proxy { url, token } => {
+            #[cfg(test)]
+            Backend::Loopback { url, token } => {
                 headers.push(("authorization".into(), format!("Bearer {token}")));
                 Ok((
                     url.clone(),
                     headers,
-                    json!({"tag":"stellar-raven-jev","state":state,"questions":questions}),
-                ))
-            }
-            Backend::TypeSafe { token } => {
-                headers.push(("authorization".into(), format!("Bearer {token}")));
-                Ok((
-                    "https://api.typesafe.ai/v1/systemone".into(),
-                    headers,
-                    json!({"model":MODEL,"state":state,"questions":questions}),
+                    json!({"model":"typesafe/jev","input":{"state":state,"questions":questions}}),
                 ))
             }
             Backend::Cloudflare {
@@ -791,60 +743,35 @@ fn source_question(source: &Source, pass: usize) -> Value {
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }
-fn required_env(name: &str) -> Result<String> {
-    env_value(name).ok_or_else(|| anyhow!("Missing Jev configuration: {name}"))
-}
 fn backend_from_env() -> Result<Backend> {
-    let mode = env_value("JEV_BACKEND").unwrap_or_else(|| {
-        if env_value("JEV_PROXY_URL").is_some() {
-            "proxy"
-        } else if env_value("TYPESAFE_API_KEY").is_some() {
-            "typesafe"
-        } else {
-            "cloudflare"
-        }
-        .into()
-    });
-    match mode.as_str() {
-        "proxy" => {
-            let url = required_env("JEV_PROXY_URL")?;
-            let parsed =
-                reqwest::Url::parse(&url).map_err(|_| anyhow!("JEV_PROXY_URL is invalid"))?;
-            ensure!(
-                parsed.scheme() == "https"
-                    && parsed.host_str().is_some()
-                    && parsed.username().is_empty()
-                    && parsed.password().is_none()
-                    && parsed.query().is_none()
-                    && parsed.fragment().is_none(),
-                "JEV_PROXY_URL requires HTTPS without credentials, query, or fragment"
-            );
-            Ok(Backend::Proxy {
-                url,
-                token: required_env("JEV_PROXY_TOKEN")?,
-            })
-        }
-        "typesafe" => Ok(Backend::TypeSafe {
-            token: required_env("TYPESAFE_API_KEY")?,
-        }),
-        "cloudflare" => {
-            let account = required_env("CLOUDFLARE_ACCOUNT_ID")?;
-            ensure!(
-                account.len() == 32 && account.bytes().all(|b| b.is_ascii_hexdigit()),
-                "CLOUDFLARE_ACCOUNT_ID must contain 32 hexadecimal characters"
-            );
-            Ok(Backend::Cloudflare {
-                account,
-                token: cloudflare_token(
-                    env_value("CLOUDFLARE_API_TOKEN"),
-                    env_value("JEV_CLOUDFLARE_AUTH_PROFILE"),
-                    wrangler_oauth_token,
-                )?,
-                gateway: env_value("JEV_GATEWAY_ID").unwrap_or_else(|| "default".into()),
-            })
-        }
-        _ => bail!("JEV_BACKEND must be proxy, typesafe, or cloudflare"),
+    backend_from(env_value, wrangler_oauth_token)
+}
+
+fn backend_from(
+    env: impl Fn(&str) -> Option<String>,
+    resolve: impl FnOnce(&str) -> Result<String>,
+) -> Result<Backend> {
+    if let Some(mode) = env("JEV_BACKEND") {
+        ensure!(
+            mode == "cloudflare",
+            "JEV_BACKEND must be cloudflare; the proxy and typesafe backends were removed"
+        );
     }
+    let account = env("CLOUDFLARE_ACCOUNT_ID")
+        .ok_or_else(|| anyhow!("Missing Jev configuration: CLOUDFLARE_ACCOUNT_ID"))?;
+    ensure!(
+        account.len() == 32 && account.bytes().all(|b| b.is_ascii_hexdigit()),
+        "CLOUDFLARE_ACCOUNT_ID must contain 32 hexadecimal characters"
+    );
+    Ok(Backend::Cloudflare {
+        account,
+        token: cloudflare_token(
+            env("CLOUDFLARE_API_TOKEN"),
+            env("JEV_CLOUDFLARE_AUTH_PROFILE"),
+            resolve,
+        )?,
+        gateway: env("JEV_GATEWAY_ID").unwrap_or_else(|| "default".into()),
+    })
 }
 
 fn cloudflare_token(
@@ -1157,6 +1084,68 @@ impl<'de> Deserialize<'de> for StrictValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_cloudflare_is_selected_and_it_runs_each_request_once() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let no_profile = |_: &str| -> Result<String> { panic!("static token needs no profile") };
+        const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
+        // Unset backend with a leftover proxy URL still selects Cloudflare.
+        for pairs in [
+            &[
+                ("JEV_PROXY_URL", "https://old-proxy.example/evaluate"),
+                ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT),
+                ("CLOUDFLARE_API_TOKEN", "t"),
+            ][..],
+            &[
+                ("JEV_BACKEND", "cloudflare"),
+                ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT),
+                ("CLOUDFLARE_API_TOKEN", "t"),
+            ][..],
+        ] {
+            let backend = backend_from(env(pairs), no_profile).unwrap();
+            assert_eq!(backend.name(), "cloudflare");
+        }
+        for removed in ["proxy", "typesafe"] {
+            let pairs: &'static [(&str, &str)] = if removed == "proxy" {
+                &[("JEV_BACKEND", "proxy"), ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT)]
+            } else {
+                &[
+                    ("JEV_BACKEND", "typesafe"),
+                    ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT),
+                ]
+            };
+            let error = backend_from(env(pairs), no_profile)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("must be cloudflare"), "{removed}: {error}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = client(dir.path(), 0.0);
+        client.backend = offline_cloudflare();
+        let (url, headers, body) = client
+            .request_parts(json!({}), Map::from_iter([("q".into(), json!({}))]))
+            .unwrap();
+        assert!(url.starts_with("https://api.cloudflare.com/client/v4/accounts/"));
+        assert!(headers.contains(&("cf-aig-max-attempts".into(), "1".into())));
+        assert_eq!(body["model"], "typesafe/jev");
+    }
+
+    fn offline_cloudflare() -> Backend {
+        Backend::Cloudflare {
+            account: "0".repeat(32),
+            token: "offline-placeholder".into(),
+            gateway: "default".into(),
+        }
+    }
     use std::path::Path;
     use std::sync::Arc;
 
@@ -1319,9 +1308,7 @@ mod tests {
         let second = source_question(&source(), 1);
         let dir = tempfile::tempdir().unwrap();
         let mut client = client(dir.path(), 0.0);
-        client.backend = Backend::TypeSafe {
-            token: "offline-placeholder".into(),
-        };
+        client.backend = offline_cloudflare();
         let body0 = client
             .request_parts(
                 json!({"user_question":"q"}),
@@ -1337,9 +1324,10 @@ mod tests {
             .unwrap()
             .2;
         assert_ne!(
-            body0["questions"]["q"]["instructions"],
-            body1["questions"]["q"]["instructions"]
+            body0["input"]["questions"]["q"]["instructions"],
+            body1["input"]["questions"]["q"]["instructions"]
         );
+        assert!(body0["input"]["questions"]["q"]["instructions"].is_object());
         assert_ne!(first["instructions"], second["instructions"]);
         assert_ne!(first["criteria"], second["criteria"]);
         assert_eq!(first, source_question(&source(), 2));
@@ -1369,9 +1357,7 @@ mod tests {
     fn reservations_stop_concurrent_overspending() {
         let dir = tempfile::tempdir().unwrap();
         let mut client = client(dir.path(), 0.004);
-        client.backend = Backend::TypeSafe {
-            token: "offline-placeholder".into(),
-        };
+        client.backend = offline_cloudflare();
         let client = Arc::new(client);
         let results: Vec<_> = (0..16)
             .map(|_| {
@@ -1394,9 +1380,7 @@ mod tests {
     async fn a_full_budget_of_in_flight_reservations_makes_the_next_attempt_wait_not_fail() {
         let dir = tempfile::tempdir().unwrap();
         let mut client = client(dir.path(), 0.004);
-        client.backend = Backend::TypeSafe {
-            token: "offline-placeholder".into(),
-        };
+        client.backend = offline_cloudflare();
         let client = Arc::new(client);
         // One reservation fills the budget. With nothing in flight, the next one fails at once.
         let first = client.reserve_waiting().await.unwrap();
@@ -1428,9 +1412,7 @@ mod tests {
     async fn a_stop_wakes_waiting_reservations_with_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut client = client(dir.path(), 0.004);
-        client.backend = Backend::TypeSafe {
-            token: "offline-placeholder".into(),
-        };
+        client.backend = offline_cloudflare();
         let client = Arc::new(client);
         let _held = client.reserve_waiting().await.unwrap();
         let waiter = {
@@ -1451,9 +1433,7 @@ mod tests {
     fn unresolved_attempts_keep_reservations_and_open_the_circuit_after_three_in_a_row() {
         let dir = tempfile::tempdir().unwrap();
         let mut client = client(dir.path(), 1.0);
-        client.backend = Backend::TypeSafe {
-            token: "offline-placeholder".into(),
-        };
+        client.backend = offline_cloudflare();
         // Two unresolved attempts retain their reservations but do not stop the client.
         let first = client.reserve().unwrap();
         assert!(!client.retain_unresolved());
@@ -1483,9 +1463,7 @@ mod tests {
 
     fn client_with_budget_nanos(dir: &Path, nanos: u64) -> JevClient {
         let mut client = client(dir, 0.0);
-        client.backend = Backend::TypeSafe {
-            token: "offline-placeholder".into(),
-        };
+        client.backend = offline_cloudflare();
         client.ledger.lock().unwrap().budget_nanos = nanos;
         client
     }
@@ -1494,9 +1472,7 @@ mod tests {
     fn failed_attempts_keep_reservations_and_successes_count_usage() {
         let dir = tempfile::tempdir().unwrap();
         let mut client = client(dir.path(), 0.01);
-        client.backend = Backend::TypeSafe {
-            token: "offline-placeholder".into(),
-        };
+        client.backend = offline_cloudflare();
         let failed = client.reserve().unwrap();
         let success = client.reserve().unwrap();
         client.settle(success, 1000, 100).unwrap();
@@ -1504,7 +1480,7 @@ mod tests {
         assert_eq!(usage.requests, 2);
         assert_eq!(usage.input_tokens, 1000);
         assert_eq!(usage.output_tokens, 100);
-        assert!((usage.cost_usd - (failed + 42000) as f64 / NANOS_PER_USD).abs() < 1e-12);
+        assert!((usage.cost_usd - (failed + 44100) as f64 / NANOS_PER_USD).abs() < 1e-12);
     }
 
     #[tokio::test]
@@ -1512,9 +1488,7 @@ mod tests {
         for status in [401, 403] {
             let dir = tempfile::tempdir().unwrap();
             let mut client = client(dir.path(), 1.0);
-            client.backend = Backend::TypeSafe {
-                token: "offline-placeholder".into(),
-            };
+            client.backend = offline_cloudflare();
             let failed = client.reserve().unwrap();
             let inflight = client.reserve().unwrap();
             assert!(client.stop_on_authentication_failure(status).unwrap());
@@ -1543,7 +1517,7 @@ mod tests {
             assert_eq!(client.usage().input_tokens, 1000);
             assert_eq!(client.usage().output_tokens, 100);
             assert!(
-                (client.usage().cost_usd - (failed + 42000) as f64 / NANOS_PER_USD).abs() < 1e-12
+                (client.usage().cost_usd - (failed + 44100) as f64 / NANOS_PER_USD).abs() < 1e-12
             );
             assert!(std::fs::read_dir(dir.path().join("raw"))
                 .unwrap()
@@ -1619,9 +1593,8 @@ mod tests {
                     },
                 )
                 .unwrap();
-                // The configurable proxy URL reaches only this local server.
-                // Its hidden upstream attempts retain the existing conservative cost.
-                candidate.backend = Backend::Proxy {
+                // The loopback URL reaches only this local server.
+                candidate.backend = Backend::Loopback {
                     url: format!("http://{address}/evaluate"),
                     token: TOKEN.into(),
                 };
@@ -1681,7 +1654,7 @@ mod tests {
                 assert_eq!(answers, BTreeMap::from([("a".into(), 0.9), ("b".into(), 0.8)]));
                 server.await.unwrap();
 
-                let settled = client.backend.cost_nanos(4 * MAX_INPUT_TOKENS + 100).unwrap();
+                let settled = client.backend.cost_nanos(100).unwrap();
                 let usage = client.usage();
                 assert_eq!(usage.requests, 2);
                 assert_eq!((usage.input_tokens, usage.output_tokens), (100, 20));
@@ -1728,9 +1701,7 @@ mod tests {
     fn other_http_statuses_do_not_open_authentication_circuit() {
         let dir = tempfile::tempdir().unwrap();
         let mut client = client(dir.path(), 1.0);
-        client.backend = Backend::TypeSafe {
-            token: "offline-placeholder".into(),
-        };
+        client.backend = offline_cloudflare();
         for status in [200, 400, 404, 408, 429, 500, 503] {
             assert!(!client.stop_on_authentication_failure(status).unwrap());
         }
@@ -1795,10 +1766,7 @@ mod tests {
         let ledger = client.ledger.lock().unwrap();
         assert_eq!(ledger.in_flight, 0);
         assert_eq!(ledger.consecutive_unresolved, 0);
-        let settled = client
-            .backend
-            .cost_nanos(100 + MAX_INPUT_TOKENS * (client.backend.upstream_attempts() - 1))
-            .unwrap();
+        let settled = client.backend.cost_nanos(100).unwrap();
         assert_eq!(
             ledger.accounted_nanos,
             reservation + settled,
@@ -1867,10 +1835,7 @@ mod tests {
                 assert_eq!(client.usage().input_tokens, 100);
                 assert_eq!(
                     client.ledger.lock().unwrap().accounted_nanos,
-                    client
-                        .backend
-                        .cost_nanos(4 * MAX_INPUT_TOKENS + 100)
-                        .unwrap()
+                    client.backend.cost_nanos(100).unwrap()
                 );
             }
             let traces: Vec<Value> = std::fs::read_dir(&client.audit_dir)
@@ -1928,9 +1893,7 @@ mod tests {
 
         let other = tempfile::tempdir().unwrap();
         let mut broken = self::client(other.path(), 1.0);
-        broken.backend = Backend::TypeSafe {
-            token: "offline-placeholder".into(),
-        };
+        broken.backend = offline_cloudflare();
         broken.audit_dir = other.path().join("missing").join("jev");
         assert!(evaluate_one(&broken).await.is_err());
         assert!(broken
@@ -1968,23 +1931,6 @@ mod tests {
         assert!(!client.ledger.lock().unwrap().unresolved_usage);
         assert_eq!(client.usage().input_tokens, 100);
         assert!(client.reserve().is_err());
-    }
-
-    #[test]
-    fn proxy_retains_unknown_upstream_attempt_cost() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut client = client(dir.path(), 0.05);
-        client.backend = Backend::Proxy {
-            url: "https://example.invalid".into(),
-            token: "offline-placeholder".into(),
-        };
-        let reserved = client.reserve().unwrap();
-        client.settle(reserved, 1000, 20).unwrap();
-        let expected = client
-            .backend
-            .cost_nanos(4 * MAX_INPUT_TOKENS + 1000)
-            .unwrap();
-        assert_eq!(client.usage().cost_usd, expected as f64 / NANOS_PER_USD);
     }
 
     #[test]

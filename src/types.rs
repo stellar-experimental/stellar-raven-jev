@@ -31,9 +31,6 @@ pub struct Failure {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FetchResult {
     pub documents: Vec<Document>,
-    /// Parsed documents explicitly omitted by an adapter, not unreturned provider rows.
-    #[serde(default)]
-    pub omitted_documents: Vec<Document>,
     pub failures: Vec<Failure>,
 }
 

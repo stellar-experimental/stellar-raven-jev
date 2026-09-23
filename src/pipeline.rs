@@ -237,10 +237,6 @@ pub(crate) fn refresh_manifest_artifacts(root: &Path) -> Result<()> {
     write_json(root.join("manifest.json"), &manifest)
 }
 
-pub async fn run_question(question: &str, config: &RunConfig) -> Result<RunOutcome> {
-    run_question_scoped(question, config, connectors::SourceScope::All).await
-}
-
 pub async fn run_question_scoped(
     question: &str,
     config: &RunConfig,
@@ -701,7 +697,6 @@ mod tests {
                 return Ok(FetchResult::default());
             }
             let mut result = FetchResult {
-                omitted_documents: vec![],
                 documents: vec![Document {
                     id: "same-id".into(),
                     source_id: source.id.clone(),

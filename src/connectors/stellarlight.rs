@@ -1068,7 +1068,6 @@ mod tests {
         )
         .unwrap();
         let mut result = FetchResult {
-            omitted_documents: vec![],
             documents: vec![doc.clone()],
             failures: vec![],
         };

@@ -150,7 +150,8 @@ impl HttpRecorder {
         })
     }
 
-    /// Limits cover every clone, including connector calls and Jev requests.
+    /// Limits cover every clone, including connector calls and Jev requests. Tests only.
+    #[cfg(test)]
     pub fn new_bounded(
         run_dir: &Path,
         config: &RunConfig,
@@ -174,6 +175,7 @@ impl HttpRecorder {
         Ok(recorder)
     }
 
+    #[cfg(test)]
     pub fn metrics(&self) -> Value {
         match &self.limits {
             Some(limits) => {

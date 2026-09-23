@@ -15,11 +15,8 @@
 /scripts/
 /.agents/
 
-# Session reports and reviews. Only the plan guide below is tracked.
-/docs/*
-!/docs/service-v2/
-/docs/service-v2/*
-!/docs/service-v2/USAGE.md
+# Session reports and reviews stay local.
+/docs/
 
 *.log
 .DS_Store
