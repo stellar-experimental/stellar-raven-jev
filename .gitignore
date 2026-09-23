@@ -15,9 +15,8 @@
 /scripts/
 /.agents/
 
-# Session reports and reviews. Only the user guides below are tracked.
+# Session reports and reviews. Only the plan guide below is tracked.
 /docs/*
-!/docs/MCP-LOCAL.md
 !/docs/service-v2/
 /docs/service-v2/*
 !/docs/service-v2/USAGE.md

@@ -13,51 +13,35 @@ fn read<T: serde::de::DeserializeOwned>(root: &Path, name: &str) -> Result<T> {
 
 /// How results are ordered. `Banded` rounds scores to whole percent so near-ties fall to content
 /// completeness, then ID; `Raw` orders by the exact score and uses those keys only on exact ties.
-/// `BandedRelevant` is experimental: it puts the `relevant` signal before completeness. It showed
-/// no answer-quality gain on the development sample, so it is not the default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RankPolicy {
     #[default]
     Banded,
     Raw,
-    BandedRelevant,
 }
 
 impl RankPolicy {
     fn key(self, value: f64) -> f64 {
         match self {
-            Self::Banded | Self::BandedRelevant => (value * 100.0).round(),
+            Self::Banded => (value * 100.0).round(),
             Self::Raw => value,
         }
     }
 }
 
-/// Ordering for one policy over (usable_evidence, relevant, scope rank, id). Higher scores first.
-/// Missing values sort last. Only `BandedRelevant` reads `relevant`.
-/// Pure, so tests can check inversions without a run directory.
+/// Ordering for one policy over (usable_evidence, scope rank, id). Higher scores first.
+/// Missing scores sort last. Pure, so tests can check inversions without a run directory.
 pub fn compare_ranked(
     policy: RankPolicy,
-    a: (Option<f64>, Option<f64>, u8, &str),
-    b: (Option<f64>, Option<f64>, u8, &str),
+    a: (Option<f64>, u8, &str),
+    b: (Option<f64>, u8, &str),
 ) -> std::cmp::Ordering {
     let key = |v: Option<f64>| v.map(|v| policy.key(v)).unwrap_or(-1.0);
-    let relevant = |v: Option<f64>| {
-        if policy == RankPolicy::BandedRelevant {
-            key(v)
-        } else {
-            0.0
-        }
-    };
     key(b.0)
         .total_cmp(&key(a.0))
-        .then(relevant(b.1).total_cmp(&relevant(a.1)))
-        .then(b.2.cmp(&a.2))
-        .then(a.3.cmp(b.3))
-}
-
-pub fn build_report(outcome: &RunOutcome, full_text: bool) -> Result<Value> {
-    build_report_variant(outcome, full_text, None, false, RankPolicy::default())
+        .then(b.1.cmp(&a.1))
+        .then(a.2.cmp(b.2))
 }
 
 /// A variant name becomes part of two output paths. Only plain characters are allowed.
@@ -74,50 +58,6 @@ fn validate_variant(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Per-signal maxima recovered from the Jev audit traces of a run whose scores predate `signals`.
-/// Labeled as a projection wherever it is used. Only documents with a complete coverage record count.
-fn trace_signal_projection(root: &Path) -> BTreeMap<String, BTreeMap<String, f64>> {
-    let mut projection = BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(root.join("jev")) else {
-        return projection;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("document-") {
-            continue;
-        }
-        let Ok(coverage) = std::fs::read(entry.path())
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| Ok(serde_json::from_slice::<Value>(&bytes)?))
-        else {
-            continue;
-        };
-        if coverage["complete"] != true {
-            continue;
-        }
-        let Some(document_id) = coverage["document_id"].as_str() else {
-            continue;
-        };
-        let mut maxima: BTreeMap<String, f64> = BTreeMap::new();
-        for chunk in coverage["completed_chunks"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            for (name, value) in chunk["signals"].as_object().into_iter().flatten() {
-                if let Some(value) = value.as_f64() {
-                    maxima
-                        .entry(name.clone())
-                        .and_modify(|m| *m = m.max(value))
-                        .or_insert(value);
-                }
-            }
-        }
-        projection.insert(document_id.to_owned(), maxima);
-    }
-    projection
-}
-
 /// Rebuild the report from saved documents and scores. With a variant name, output goes to
 /// `search-<variant>.json` and `search-documents-<variant>/`, so the original presentation stays.
 /// This lets a newer ranking be replayed on an older run without new retrieval or scoring.
@@ -125,7 +65,6 @@ pub fn build_report_variant(
     outcome: &RunOutcome,
     full_text: bool,
     variant: Option<&str>,
-    signals_from_traces: bool,
     rank_policy: RankPolicy,
 ) -> Result<Value> {
     let root = outcome.directory.canonicalize()?;
@@ -143,12 +82,6 @@ pub fn build_report_variant(
         }
     }
     let suffix = variant.map(|v| format!("-{v}")).unwrap_or_default();
-    let projection = if signals_from_traces {
-        trace_signal_projection(&root)
-    } else {
-        BTreeMap::new()
-    };
-    let mut projected_count = 0usize;
     let question: Value = read(&root, "question.json")?;
     let scope: Value = read(&root, "source-scope.json")?;
     let scores: Vec<DocumentScore> = read(&root, "scores.json")?;
@@ -161,22 +94,14 @@ pub fn build_report_variant(
     for status in ["selected", "uncertain"] {
         let mut documents: Vec<Document> = read(&root, &format!("{status}.json"))?;
         // Order by usable_evidence, then content completeness, then ID. The rank policy decides
-        // whether near-ties count as ties and whether the `relevant` signal breaks them first.
+        // whether near-ties count as ties.
         documents.sort_by(|a, b| {
-            let tuple = |d: &Document| {
-                let score = scores.get(d.id.as_str());
-                (
-                    score.map(|s| s.probability),
-                    score
-                        .and_then(|s| s.signals.get("relevant"))
-                        .or_else(|| projection.get(&d.id).and_then(|m| m.get("relevant")))
-                        .copied(),
-                    scope_rank(d),
-                )
-            };
-            let (pa, ra, sa) = tuple(a);
-            let (pb, rb, sb) = tuple(b);
-            compare_ranked(rank_policy, (pa, ra, sa, &a.id), (pb, rb, sb, &b.id))
+            let probability = |d: &Document| scores.get(d.id.as_str()).map(|s| s.probability);
+            compare_ranked(
+                rank_policy,
+                (probability(a), scope_rank(a), &a.id),
+                (probability(b), scope_rank(b), &b.id),
+            )
         });
         for document in documents {
             let number = results.len() + 1;
@@ -186,38 +111,11 @@ pub fn build_report_variant(
             std::fs::write(&document_path, serde_json::to_vec_pretty(&document)?)?;
             let excerpt: String = document.text.chars().take(400).collect();
             let score = scores.get(document.id.as_str());
-            let projected = score.is_some_and(|s| s.signals.is_empty())
-                && projection.contains_key(&document.id);
-            if projected {
-                projected_count += 1;
-            }
-            let signals_source = if projected {
-                "trace_projection"
-            } else if score.is_some_and(|s| !s.signals.is_empty()) {
-                "score"
-            } else {
-                "none"
-            };
-            // Serialize the map the ranking used. A projected row shows the projected maxima and
-            // the same aggregation label, marked as a trace projection.
-            let (effective_signals, effective_aggregation): (Option<Value>, Option<String>) =
-                if projected {
-                    (
-                        projection.get(&document.id).map(|m| json!(m)),
-                        Some("independent_max_per_signal_across_chunks (trace projection)".into()),
-                    )
-                } else {
-                    (
-                        score.map(|s| json!(s.signals)),
-                        score.map(|s| s.signals_aggregation.clone()),
-                    )
-                };
             let mut row = json!({
                 "id":document.id,"source_id":document.source_id,"title":document.title,
                 "url":document.url,"status":status,
                 "probability":score.map(|s| s.probability),"reason":score.map(|s| &s.reason),
-                "signals":effective_signals,"signals_aggregation":effective_aggregation,
-                "signals_source":signals_source,
+                "signals":score.map(|s| &s.signals),"signals_aggregation":score.map(|s| &s.signals_aggregation),
                 "excerpt_truncated":excerpt.len() < document.text.len(),"excerpt":excerpt,
                 "text_bytes":document.text.len(),"text_path":text_path,"document_path":document_path,
                 "content_scope":content_scope(&document),
@@ -233,7 +131,6 @@ pub fn build_report_variant(
         "status":outcome.status,"directory":root,"index_path":root.join("INDEX.md"),
         "report_path":root.join(format!("search{suffix}.json")),"source_scope":scope,
         "replay_variant":variant,"rank_policy":rank_policy,
-        "signals_from_traces":signals_from_traces,"trace_projected_documents":projected_count,
         "counts":{"selected":outcome.selected,"uncertain":outcome.uncertain,"rejected":outcome.rejected,"omitted":omitted.len(),"reports":failures.len()},
         "usage":outcome.usage,"results":results,"reports":failures,
         "limitations":["Scores are uncalibrated relevance estimates.","Results can contain summaries or chunks. Full available text is not always the complete original document.","A complete run does not prove complete question coverage.","Remote instructions are source evidence. They are not installed or executed."],
@@ -439,8 +336,8 @@ mod tests {
     fn raw_policy_never_inverts_exact_scores_and_banded_breaks_near_ties_by_completeness() {
         use std::cmp::Ordering::*;
         // A 0.984 index excerpt against a 0.976 complete page.
-        let excerpt = (Some(0.984), Some(0.9), 1, "x");
-        let page = (Some(0.976), Some(0.9), 4, "y");
+        let excerpt = (Some(0.984), 1, "x");
+        let page = (Some(0.976), 4, "y");
         assert_eq!(
             compare_ranked(RankPolicy::Raw, excerpt, page),
             Less,
@@ -451,93 +348,57 @@ mod tests {
             Greater,
             "banded lets completeness decide inside 0.98"
         );
-        // Exact ties fall to completeness, then ID. Only banded-relevant reads `relevant` first.
-        let a = (Some(0.98), Some(0.7), 1, "a");
-        let b = (Some(0.98), Some(0.9), 1, "b");
-        assert_eq!(compare_ranked(RankPolicy::BandedRelevant, a, b), Greater);
-        let complete = (Some(0.98), Some(0.1), 4, "c");
-        assert_eq!(
-            compare_ranked(RankPolicy::BandedRelevant, b, complete),
-            Less,
-            "banded-relevant: relevant before completeness"
-        );
-        for policy in [
-            RankPolicy::Raw,
-            RankPolicy::Banded,
-            RankPolicy::BandedRelevant,
-        ] {
-            if policy != RankPolicy::BandedRelevant {
-                assert_eq!(
-                    compare_ranked(policy, a, b),
-                    Less,
-                    "{policy:?}: relevant ignored"
-                );
-                assert_eq!(
-                    compare_ranked(policy, b, complete),
-                    Greater,
-                    "{policy:?}: completeness before a higher relevant"
-                );
-            }
+        for policy in [RankPolicy::Raw, RankPolicy::Banded] {
+            // Exact ties fall to completeness, then ID.
             assert_eq!(
-                compare_ranked(policy, (Some(0.5), None, 0, "a"), (Some(0.5), None, 0, "b")),
+                compare_ranked(policy, (Some(0.98), 1, "a"), (Some(0.98), 4, "b")),
+                Greater
+            );
+            assert_eq!(
+                compare_ranked(policy, (Some(0.5), 0, "a"), (Some(0.5), 0, "b")),
                 Less
             );
             assert_eq!(
-                compare_ranked(policy, (None, None, 0, "a"), (Some(0.1), None, 0, "b")),
+                compare_ranked(policy, (None, 0, "a"), (Some(0.1), 0, "b")),
                 Greater,
                 "missing score sorts last"
             );
         }
     }
     #[test]
-    fn replay_projects_trace_signals_into_ranking_and_emitted_rows() {
+    fn a_replay_variant_writes_its_own_report_and_leaves_the_original() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let doc = |id: &str, scope: &str| Document {
+        let write = |name: &str, value: &Value| {
+            std::fs::write(root.join(name), serde_json::to_vec(value).unwrap()).unwrap()
+        };
+        let doc = |id: &str| Document {
             id: id.into(),
             source_id: "s".into(),
             title: id.into(),
             url: format!("https://x/{id}"),
             text: format!("text {id}"),
-            provenance: json!({"content_scope":scope}),
+            provenance: json!({"content_scope":"research_chunk"}),
             raw_artifacts: vec![],
         };
-        // Legacy scores: same probability, no signals. Traces say `b` is more relevant.
-        let legacy = |id: &str| DocumentScore {
+        let score = |id: &str, p: f64| DocumentScore {
             document_id: id.into(),
-            probability: 0.98,
-            reason: "legacy".into(),
-            signals: BTreeMap::new(),
-            signals_aggregation: String::new(),
-        };
-        let write = |name: &str, value: &Value| {
-            std::fs::write(root.join(name), serde_json::to_vec(value).unwrap()).unwrap()
+            probability: p,
+            reason: "fixture".into(),
+            signals: BTreeMap::from([("usable_evidence".into(), p)]),
+            signals_aggregation: "independent_max_per_signal_across_chunks".into(),
         };
         write(
             "question.json",
             &json!({"question":"q","config":{"fixture":true}}),
         );
-        write(
-            "source-scope.json",
-            &json!({"scope":"all","description":"d"}),
-        );
-        write("scores.json", &json!([legacy("a"), legacy("b")]));
+        write("source-scope.json", &json!({"scope":"all"}));
+        write("scores.json", &json!([score("a", 0.5), score("b", 0.9)]));
         write("failures.json", &json!([]));
         write("omitted.json", &json!([]));
-        write(
-            "selected.json",
-            &json!([doc("a", "research_chunk"), doc("b", "research_chunk")]),
-        );
+        write("selected.json", &json!([doc("a"), doc("b")]));
         write("uncertain.json", &json!([]));
-        std::fs::create_dir_all(root.join("jev")).unwrap();
-        for (id, relevant) in [("a", 0.3), ("b", 0.9)] {
-            write(
-                &format!("jev/document-{id}.json"),
-                &json!({"document_id":id,"complete":true,
-                "completed_chunks":[{"signals":{"usable_evidence":0.98,"relevant":relevant,"contradicts":0.0,"injection":0.0}},
-                                    {"signals":{"usable_evidence":0.5,"relevant":relevant - 0.1,"contradicts":0.2,"injection":0.0}}]}),
-            );
-        }
+        std::fs::write(root.join("search.json"), b"original").unwrap();
         let outcome = RunOutcome {
             directory: root.to_path_buf(),
             status: "complete".into(),
@@ -547,46 +408,21 @@ mod tests {
             failures: 0,
             usage: Default::default(),
         };
-        let report =
-            build_report_variant(&outcome, false, Some("t"), true, RankPolicy::BandedRelevant)
-                .unwrap();
-        let rows = report["results"].as_array().unwrap();
-        assert_eq!(
-            rows[0]["id"], "b",
-            "trace-projected relevant must order b first"
-        );
-        assert_eq!(rows[0]["signals_source"], "trace_projection");
-        assert_eq!(
-            rows[0]["signals"]["relevant"], 0.9,
-            "emitted map is the projected maxima"
-        );
-        assert_eq!(
-            rows[0]["signals"]["contradicts"], 0.2,
-            "maximum across chunks, not the first chunk"
-        );
-        assert_eq!(
-            rows[0]["signals_aggregation"],
-            "independent_max_per_signal_across_chunks (trace projection)"
-        );
-        assert_eq!(report["trace_projected_documents"], 2);
+        let report = build_report_variant(&outcome, false, Some("t"), RankPolicy::Raw).unwrap();
+        assert_eq!(report["results"][0]["id"], "b");
+        assert_eq!(report["results"][0]["signals"]["usable_evidence"], 0.9);
         assert!(root.join("search-t.json").exists());
-        assert!(
-            !root.join("search.json").exists(),
-            "a variant never writes the original report name"
+        assert!(root.join("search-documents-t").is_dir());
+        assert_eq!(
+            std::fs::read(root.join("search.json")).unwrap(),
+            b"original"
         );
-        // Without the flag the legacy rows carry no signals and say so.
-        let plain = build_report_variant(
-            &outcome,
-            false,
-            Some("u"),
-            false,
-            RankPolicy::BandedRelevant,
-        )
-        .unwrap();
-        assert_eq!(plain["results"][0]["signals_source"], "none");
-        assert_eq!(plain["results"][0]["signals"], json!({}));
-        assert_eq!(plain["trace_projected_documents"], 0);
+        assert!(
+            build_report_variant(&outcome, false, Some("t"), RankPolicy::Raw).is_err(),
+            "an existing variant is never overwritten"
+        );
     }
+
     #[test]
     fn variant_names_are_plain_and_bounded() {
         for ok in ["replay", "item2-v6", "a.b_c"] {
@@ -671,8 +507,8 @@ mod tests {
             assert_eq!(
                 compare_ranked(
                     policy,
-                    (Some(0.98), Some(0.9), scope_rank(&article), &article.id),
-                    (Some(0.98), Some(0.9), scope_rank(&catalog), &catalog.id),
+                    (Some(0.98), scope_rank(&article), &article.id),
+                    (Some(0.98), scope_rank(&catalog), &catalog.id),
                 ),
                 std::cmp::Ordering::Less,
                 "The complete article must sort before catalog metadata under {policy:?}"

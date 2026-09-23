@@ -60,7 +60,6 @@ A valid empty list differs from a missing collection, malformed payload, or plai
 This operation is available through typed plans and their operation catalog.
 Automatic source routing has no new vocabulary source in this change.
 The normal plan still scores its admitted snapshot against the original question with Jev.
-The source-only probe example measures transport and parsing without Jev scoring.
 
 ## Follow-up flow
 
@@ -111,7 +110,7 @@ More relevant source text can still increase reading costs without improving the
 Transport overhead and discarded excess bytes are outside that byte count.
 `deadline_secs` stops network waits and document scoring.
 Authentication startup and final artifact saves can finish after that deadline.
-`max_spend_usd` limits the plan's Jev allocation within the CLI or MCP allocation.
+`max_spend_usd` limits the plan's Jev allocation within the CLI allocation.
 Unknown paid-request usage retains its full reservation. The request is not retried.
 This applies to HTTP errors, transport failures, and missing usage.
 After 3 such requests in a row, the Jev client blocks new reservations. A settled request resets the count.
@@ -121,7 +120,6 @@ They can record valid receipts and settle their existing reservations.
 A typed plan skips later source calls after the client stops.
 It preserves fetched documents, omissions, failures, and unscored documents with the stop reason.
 A malformed answer with valid accounted usage does not itself imply unknown spending.
-The MCP server blocks later spending when it cannot reconcile usage. It charges a retained direct-backend reservation as a known upper bound and continues.
 
 `max_documents` limits distinct document score admissions across the plan.
 Each call has its own document allowance and page allowance.
@@ -136,23 +134,3 @@ When one call requests several collections, document admission alternates those 
 This prevents the first JSON group from consuming the entire call allowance.
 Existing adapters retain their query transformations and fixed internal limits.
 The service does not infer that an empty result proves missing information.
-
-## MCP
-
-Start the local service with an absolute credential file:
-
-```sh
-JEV_ENV_FILE="$PWD/.env" cargo run -- --budget-usd 5 mcp
-```
-
-Use `list_operations` to discover operations.
-Use `execute_plan` with `{"plan": YOUR_PLAN}` to execute a plan.
-Use `resources/read` to retrieve the returned selected and uncertain evidence.
-Existing `retrieve_sources` remains available.
-All retrieval tools share the server's spending allocation.
-An exact repeated plan reuses its saved result within the current session.
-A changed query, filter, or allowance creates a distinct run.
-
-The service supports one local client per process.
-Restarting creates a new spending ledger.
-Remote hosting, multi-user access, and automatic recovery remain outside this version.

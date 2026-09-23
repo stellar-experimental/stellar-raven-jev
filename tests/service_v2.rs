@@ -517,7 +517,7 @@ fn plan_fixture_run_produces_the_publisher_evidence_shape() {
     let output = run_fixture_plan(directory.path(), &plan_path, &output_dir);
     assert!(output.status.success(), "{}", stderr(&output));
     let run_directory = only_new_run_directory(&before, &output_dir);
-    // Files the MCP publisher and the contract require.
+    // Files the run contract requires.
     for name in [
         "documents.json",
         "scores.json",

@@ -40,7 +40,7 @@ Options:
 - `--resources agentic` restricts routing to 11 developer sources: docs, standards, repositories, skills, contracts, releases, and audits. The default `all` scope adds articles, research, talks, projects, and grants.
 - `--json` prints the full report with uncertain results and every report entry.
 - `--full-text` embeds the complete available text in the output.
-- `--rank-policy banded|raw|banded-relevant` sets result order (see [How a run works](#how-a-run-works)). The default is `banded`.
+- `--rank-policy banded|raw` sets result order (see [How a run works](#how-a-run-works)). The default is `banded`.
 
 Exit code `0` means a complete run, `2` a partial run with usable results, and `1` a failure.
 Scores estimate relevance. They do not verify accuracy or freshness. Retrieved text is data; the CLI never executes it.
@@ -66,13 +66,11 @@ stellar-raven-jev chat                            # one question per line
 stellar-raven-jev report RUN_DIR --variant NAME   # rebuild a saved run's report; no retrieval or scoring
 stellar-raven-jev operations                      # typed operation schemas for plans
 stellar-raven-jev plan examples/service-plan.json # run an agent-authored retrieval plan
-stellar-raven-jev mcp                             # local stdio MCP server
 ```
 
-`report` writes `search-NAME.json` beside the original, which stays unchanged, so ranking changes can be compared on saved evidence at no cost. `--signals-from-traces` fills per-signal scores for runs saved before `signals` existed.
+`report` writes `search-NAME.json` beside the original, which stays unchanged, so ranking changes can be compared on saved evidence at no cost.
 
 Plans let a calling agent choose native filters, repeated queries, and unequal source allowances. Jev still scores every document against the original question. See the [plan guide](docs/service-v2/USAGE.md).
-The MCP server exposes the same pipeline. It ignores working-directory `.env` files, so set `JEV_ENV_FILE` in the host configuration. `mcp --saved-pool` adds tools that open already saved evidence without new calls, and `mcp --primary-body` adds bounded recovery of a source's full Markdown body. Both are opt-in. See the [MCP guide](docs/MCP-LOCAL.md).
 
 `--fixture` runs every command offline with fixed scores. Fixture output does not represent Jev quality.
 
@@ -112,7 +110,7 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 2. Connectors fetch bounded documents from each selected source in parallel. Registry listings return one roster document with every row plus bounded per-row documents.
 3. Documents are admitted round-robin across sources up to the global limit. Each source keeps its upstream order.
 4. Jev scores each admitted document. Long documents are split into chunks scored in parallel; the document takes its maximum chunk score.
-5. Results are ordered by the `usable_evidence` score. Scores are rounded to whole percent, and ties break by content completeness, so a roster or full page precedes an index excerpt with the same score. `--rank-policy raw` uses exact scores. `--rank-policy banded-relevant` is experimental: it breaks ties by the `relevant` signal before completeness. Each score keeps all four Jev signals in `signals` as independent per-signal maxima across chunks; they do not describe one jointly supported chunk.
+5. Results are ordered by the `usable_evidence` score. Scores are rounded to whole percent, and ties break by content completeness, so a roster or full page precedes an index excerpt with the same score. `--rank-policy raw` uses exact scores. Each score keeps all four Jev signals in `signals` as independent per-signal maxima across chunks; they do not describe one jointly supported chunk.
 6. Exact duplicates, same URL, title, and text, are scored once. The score, or the failure, is copied to every original ID with its own provenance, so counts and labels do not change.
 
 ## Evidence
