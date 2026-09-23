@@ -104,7 +104,7 @@ impl Default for RunConfig {
             timeout_secs: 30,
             concurrency: 16,
             max_pages: 2,
-            max_documents: 100,
+            max_documents: 400,
             per_source_documents: default_per_source_documents(),
             fetch_deadline_secs: default_fetch_deadline_secs(),
             max_body_bytes: 8 * 1024 * 1024,

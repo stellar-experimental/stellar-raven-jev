@@ -42,7 +42,9 @@ struct Cli {
     concurrency: usize,
     #[arg(long, global = true, default_value_t = 2)]
     max_pages: usize,
-    #[arg(long, global = true, default_value_t = 100)]
+    /// Scoring admission limit across all sources. The default is above the largest fetch seen
+    /// in the 40-case development pass (342), so every fetched document is normally scored.
+    #[arg(long, global = true, default_value_t = 400)]
     max_documents: usize,
     #[arg(long, global = true, default_value_t = 12)]
     per_source_documents: usize,

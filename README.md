@@ -84,7 +84,7 @@ All flags work before or after the command.
 | `--concurrency` | `16` | Concurrent connector jobs, scoring jobs, and HTTP requests |
 | `--fetch-deadline-secs` | `10` | Wall-clock limit for the retrieval stage; unfinished connectors are recorded and dropped |
 | `--max-pages` | `2` | Connector page attempts |
-| `--max-documents` | `100` | Global scoring admission limit |
+| `--max-documents` | `400` | Global scoring admission limit. Runs fetch about 270 documents (median); unscored documents go to `omitted.json` |
 | `--per-source-documents` | `12` | Document limit for each source |
 | `--max-body-bytes` | `8388608` | Maximum retained bytes per HTTP response |
 | `--route-passes` | `2` | Source decision passes with distinct lenses |
