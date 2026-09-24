@@ -35,10 +35,19 @@ enum Backend {
         url: String,
         token: String,
     },
+    /// Cloudflare Workers AI through an AI Gateway.
     Cloudflare {
         account: String,
         token: String,
         gateway: String,
+    },
+    /// TypeSafe's own API.
+    TypeSafe {
+        key: String,
+    },
+    /// OpenRouter's TypeSafe-compatible endpoint.
+    OpenRouter {
+        key: String,
     },
 }
 impl Backend {
@@ -48,11 +57,19 @@ impl Backend {
             #[cfg(test)]
             Self::Loopback { .. } => "loopback",
             Self::Cloudflare { .. } => "cloudflare",
+            Self::TypeSafe { .. } => "typesafe",
+            Self::OpenRouter { .. } => "openrouter",
         }
     }
-    /// $0.042 per million input tokens plus the 5% Cloudflare credit fee, in nanodollars.
+    /// $0.042 per million input tokens, in nanodollars, plus each provider's credit purchase fee:
+    /// 5% for Cloudflare, 5.5% for OpenRouter, none when TypeSafe bills directly.
     fn cost_nanos(&self, tokens: u64) -> Result<u64> {
-        let cost = (u128::from(tokens) * 441).div_ceil(10);
+        let per_ten_tokens: u128 = match self {
+            Self::TypeSafe { .. } => 420,
+            Self::OpenRouter { .. } => 444,
+            _ => 441,
+        };
+        let cost = (u128::from(tokens) * per_ten_tokens).div_ceil(10);
         u64::try_from(cost).context("Jev token cost exceeds the accounting range")
     }
     /// Cloudflare runs each request once (`cf-aig-max-attempts: 1`), so one request is reserved.
@@ -78,10 +95,12 @@ struct Ledger {
     unresolved_stop_after: u32,
 }
 
-/// Retries of one call after HTTP 429, and the bounds on the provider's Retry-After.
+/// Waits of one call when no provider is usable, and the bounds on the provider's Retry-After.
 const RATE_LIMIT_RETRIES: u32 = 3;
 const RATE_LIMIT_DEFAULT_WAIT_SECS: u64 = 30;
 const RATE_LIMIT_MAX_WAIT_SECS: u64 = 90;
+/// Sends of one attempt across all providers, refusals and waits included.
+const MAX_SENDS_PER_ATTEMPT: u32 = 8;
 
 /// Unresolved attempts in a row before the client stops. A single upstream block page (HTTP 402
 /// wrapping a Cloudflare challenge) is transient and must not end a run. Each unresolved attempt
@@ -95,9 +114,8 @@ type Hedge = std::sync::OnceLock<u64>;
 
 /// One Jev call: the request and what every attempt of it shares.
 struct Call<'a> {
-    url: &'a str,
-    headers: &'a [(String, String)],
-    body: &'a Value,
+    state: &'a Value,
+    questions: &'a Map<String, Value>,
     expected: &'a BTreeSet<String>,
     context: &'a Value,
     trace_id: &'a str,
@@ -105,9 +123,20 @@ struct Call<'a> {
     /// Notified when the first attempt holds its HTTP permit. The hedge delay starts then, so
     /// queue wait never triggers a hedge.
     sent: tokio::sync::Notify,
-    /// Set when the first attempt is rate limited. No hedge starts after that: a copy sent into
-    /// the provider's cooldown would only add load.
+    /// Set when the first attempt must wait because no provider is usable. No hedge starts after
+    /// that: a copy would only add load to a provider in its cooldown.
     rate_limited: std::sync::atomic::AtomicBool,
+    /// The provider the first attempt last used, so a hedge goes elsewhere when it can.
+    first_provider: std::sync::atomic::AtomicUsize,
+}
+
+/// A provider's standing for the rest of the run.
+#[derive(Clone, Copy, Default)]
+struct ProviderState {
+    /// Rejected the credentials (401 or 403): never used again in this run.
+    disabled: bool,
+    /// Rate limited or refused payment: skipped until then.
+    cooling_until: Option<std::time::Instant>,
 }
 
 struct Attempted {
@@ -124,6 +153,7 @@ struct PendingAttempt<'a> {
     receipt_accounted: bool,
     finished: bool,
     reservation: u64,
+    provider: usize,
     hedge: &'a Hedge,
     audit_name: String,
 }
@@ -132,8 +162,12 @@ impl Drop for PendingAttempt<'_> {
     fn drop(&mut self) {
         if !self.finished {
             if let (false, Some(&input)) = (self.receipt_accounted, self.hedge.get()) {
-                self.client
-                    .settle_cancelled(self.reservation, input, &self.audit_name);
+                self.client.settle_cancelled(
+                    self.reservation,
+                    input,
+                    self.provider,
+                    &self.audit_name,
+                );
                 return;
             }
             let mut ledger = self.client.ledger.lock().unwrap_or_else(|e| e.into_inner());
@@ -150,7 +184,12 @@ impl Drop for PendingAttempt<'_> {
 
 pub struct JevClient {
     http: HttpRecorder,
+    /// The first provider in the chain. Tests replace it with a loopback server.
     backend: Backend,
+    /// Providers tried after `backend`, in order.
+    fallbacks: Vec<Backend>,
+    /// One entry per provider in chain order.
+    providers: Mutex<Vec<ProviderState>>,
     ledger: Mutex<Ledger>,
     /// Wakes reservations that wait for in-flight attempts to settle or stop.
     settled: tokio::sync::Notify,
@@ -191,22 +230,26 @@ impl JevClient {
             config.budget_usd <= SHARED_CEILING_USD,
             "Jev run budget exceeds the shared $100 ceiling"
         );
-        let backend = if config.fixture {
-            Backend::Fixture
+        let mut chain = if config.fixture {
+            vec![Backend::Fixture]
         } else {
             ensure!(
                 config.budget_usd > 0.0,
                 "Live Jev requires --budget-usd above zero"
             );
-            backend_from_env()?
+            providers_from_env()?
         };
+        let backend = chain.remove(0);
+        let fallbacks = chain;
         let audit_dir = http.run_dir().join("jev");
         if config.full_record {
             std::fs::create_dir_all(&audit_dir).context("Cannot create the Jev audit directory")?;
         }
         let client = Self {
             http: http.clone(),
+            providers: Mutex::new(vec![ProviderState::default(); 1 + fallbacks.len()]),
             backend,
+            fallbacks,
             audit_dir,
             record: config.full_record,
             ledger: Mutex::new(Ledger {
@@ -224,15 +267,17 @@ impl JevClient {
             batch: config.jev_batch,
         };
         client.write_audit("accounting-policy", &json!({
-            "backend": client.backend.name(), "run_budget_usd": config.budget_usd,
+            "providers": client.chain().iter().map(|b| b.name()).collect::<Vec<_>>(),
+            "run_budget_usd": config.budget_usd,
             "shared_ceiling_usd": SHARED_CEILING_USD,
             "shared_budget_owner": "lead; this client enforces its run allocation only",
             "input_usd_per_million": 0.042, "output_usd_per_million": 0.0,
-            "cloudflare_credit_purchase_multiplier": 1.05,
+            "credit_purchase_multipliers": {"cloudflare": 1.05, "openrouter": 1.055, "typesafe": 1.0},
             "reservation_input_tokens_per_request": MAX_INPUT_TOKENS,
-            "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and Cloudflare credit purchase overhead",
-            "retry_policy": "Cloudflare runs each request once (cf-aig-max-attempts: 1); the client retries only after HTTP 429, per rate_limit_policy",
-            "rate_limit_policy": "HTTP 429 releases the reservation, because the provider did not run the request; the first attempt waits for Retry-After (1 to 90 s) and retries up to 3 times; a hedge does not retry",
+            "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and each provider's credit purchase overhead; reservations use the highest provider price",
+            "retry_policy": "each provider runs a request once (Cloudflare: cf-aig-max-attempts: 1); the client sends again only after a response that means the request was not run (429, 529, 402, 401, 403), per rate_limit_policy and provider_chain_policy, at most 8 sends per attempt",
+            "rate_limit_policy": "HTTP 429 or 529 releases the reservation, because the provider did not run the request, and cools that provider for Retry-After (1 to 90 s); the call moves to the next available provider at once and waits only when none is available, up to 3 waits; a hedge does not wait",
+            "provider_chain_policy": "providers are tried in chain order; 401 or 403 disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
             "hedge_policy": "a call unanswered jev_hedge_ms after its request is sent gets one identical hedge request when the budget has room without waiting; the first valid answer wins, so a failed attempt lets the other decide; the cancelled request is charged the winner's input tokens",
             "unresolved_usage_policy": "retain the full reservation of any attempt without a valid usage receipt; no automatic retry; stop new reservations after 3 consecutive unresolved attempts",
             "token_guard": "UTF-8 byte limits are local guards, not a verified provider tokenizer",
@@ -255,7 +300,7 @@ impl JevClient {
                 "Source IDs must be nonempty and unique"
             );
         }
-        if matches!(self.backend, Backend::Fixture) {
+        if self.is_fixture() {
             let scores: Vec<_> = sources
                 .iter()
                 .map(|source| SourceScore {
@@ -349,7 +394,7 @@ impl JevClient {
                 results[d] = Some(Err(anyhow!("The document ID is empty")));
                 continue;
             }
-            if matches!(self.backend, Backend::Fixture) {
+            if self.is_fixture() {
                 let score = DocumentScore {
                     document_id: document.id.clone(),
                     probability: 0.8,
@@ -560,6 +605,84 @@ impl JevClient {
         })
     }
 
+    /// Every provider in chain order.
+    fn chain(&self) -> Vec<&Backend> {
+        std::iter::once(&self.backend)
+            .chain(&self.fallbacks)
+            .collect()
+    }
+
+    fn is_fixture(&self) -> bool {
+        matches!(self.backend, Backend::Fixture)
+    }
+
+    /// One attempt reserves the worst case at the highest provider price.
+    fn reservation_nanos(&self) -> Result<u64> {
+        self.chain()
+            .iter()
+            .map(|b| b.reservation())
+            .try_fold(0u64, |max, r| r.map(|r| max.max(r)))
+    }
+
+    /// The first usable provider in chain order, preferring one other than `avoid`.
+    fn pick_provider(&self, avoid: Option<usize>) -> Option<usize> {
+        let now = std::time::Instant::now();
+        let states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
+        let usable: Vec<usize> = (0..states.len())
+            .filter(|&i| !states[i].disabled && states[i].cooling_until.is_none_or(|t| t <= now))
+            .collect();
+        usable
+            .iter()
+            .copied()
+            .find(|&i| Some(i) != avoid)
+            .or_else(|| usable.first().copied())
+    }
+
+    /// How long until some provider leaves its cooldown, or `None` when every one is disabled.
+    fn soonest_provider(&self) -> Option<Duration> {
+        let now = std::time::Instant::now();
+        let states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .iter()
+            .filter(|s| !s.disabled)
+            .map(|s| {
+                s.cooling_until
+                    .map_or(Duration::ZERO, |t| t.saturating_duration_since(now))
+            })
+            .min()
+    }
+
+    /// Cool a provider. A shorter Retry-After never cuts an existing cooldown short.
+    fn cool_provider(&self, provider: usize, wait: Duration) {
+        let mut states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
+        let until = std::time::Instant::now() + wait;
+        let state = &mut states[provider];
+        state.cooling_until = Some(state.cooling_until.map_or(until, |t| t.max(until)));
+    }
+
+    fn provider_usable(&self, provider: usize) -> bool {
+        let states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
+        !states[provider].disabled
+            && states[provider]
+                .cooling_until
+                .is_none_or(|t| t <= std::time::Instant::now())
+    }
+
+    /// Disable a provider whose credentials were rejected.
+    fn disable_provider(&self, provider: usize) {
+        let mut states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
+        states[provider].disabled = true;
+    }
+
+    /// Whether another provider remains enabled, cooling or not.
+    fn other_providers(&self, provider: usize) -> bool {
+        let states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .iter()
+            .enumerate()
+            .any(|(i, s)| i != provider && !s.disabled)
+    }
+
     pub fn usage(&self) -> Usage {
         // Recover the last conservative ledger even if a caller panicked.
         self.ledger
@@ -583,7 +706,7 @@ impl JevClient {
             !question.trim().is_empty(),
             "The currentness question is empty"
         );
-        if matches!(self.backend, Backend::Fixture) {
+        if self.is_fixture() {
             return Ok(0.5);
         }
         let text = document
@@ -613,7 +736,7 @@ impl JevClient {
     pub async fn classify_intent(&self, question: &str) -> Result<BTreeMap<String, f64>> {
         ensure!(!question.trim().is_empty(), "The intent question is empty");
         let questions = intent_questions();
-        if matches!(self.backend, Backend::Fixture) {
+        if self.is_fixture() {
             let mut answers: BTreeMap<String, f64> = INTENTS
                 .iter()
                 .map(|(option, _)| (format!("intent={option}"), 0.0))
@@ -671,7 +794,7 @@ impl JevClient {
 
     /// `Ok(None)` means: wait, because in-flight reservations may still settle below budget.
     fn reserve_now(&self, may_wait: bool) -> Result<Option<u64>> {
-        let reservation = self.backend.reservation()?;
+        let reservation = self.reservation_nanos()?;
         let mut ledger = self
             .ledger
             .lock()
@@ -759,13 +882,23 @@ impl JevClient {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn settle(&self, reservation: u64, input: u64, output: u64) -> Result<()> {
+        self.settle_on(0, reservation, input, output)
+    }
+
+    fn settle_on(&self, provider: usize, reservation: u64, input: u64, output: u64) -> Result<()> {
         let mut ledger = self
             .ledger
             .lock()
             .map_err(|_| anyhow!("Jev accounting lock failed"))?;
         let result = (|| -> Result<()> {
-            let cost = self.backend.cost_nanos(input)?;
+            let cost = self.chain()[provider].cost_nanos(input)?;
+            *ledger
+                .usage
+                .provider_requests
+                .entry(self.chain()[provider].name().to_owned())
+                .or_default() += 1;
             ledger.usage.input_tokens = ledger
                 .usage
                 .input_tokens
@@ -803,8 +936,9 @@ impl JevClient {
         result
     }
 
-    /// Release the reservation of a rate-limited request. The provider did not run it.
-    fn release_rate_limited(&self, reservation: u64, hedge: bool) {
+    /// Release the reservation of a request the provider did not run, or that was never sent.
+    /// `rate_limited` counts it in `usage.rate_limited_requests` (HTTP 429 or 529).
+    fn release_unrun(&self, reservation: u64, hedge: bool, rate_limited: bool) {
         let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
         ledger.accounted_nanos = ledger.accounted_nanos.saturating_sub(reservation);
         ledger.usage.cost_usd = ledger.accounted_nanos as f64 / NANOS_PER_USD;
@@ -812,19 +946,9 @@ impl JevClient {
         if hedge {
             ledger.usage.hedged_requests = ledger.usage.hedged_requests.saturating_sub(1);
         }
-        ledger.usage.rate_limited_requests += 1;
-        ledger.in_flight = ledger.in_flight.saturating_sub(1);
-        drop(ledger);
-        self.settled.notify_waiters();
-    }
-
-    /// Release the reservation of a hedge that was stopped before it was sent.
-    fn release_unsent(&self, reservation: u64) {
-        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
-        ledger.accounted_nanos = ledger.accounted_nanos.saturating_sub(reservation);
-        ledger.usage.cost_usd = ledger.accounted_nanos as f64 / NANOS_PER_USD;
-        ledger.usage.requests = ledger.usage.requests.saturating_sub(1);
-        ledger.usage.hedged_requests = ledger.usage.hedged_requests.saturating_sub(1);
+        if rate_limited {
+            ledger.usage.rate_limited_requests += 1;
+        }
         ledger.in_flight = ledger.in_flight.saturating_sub(1);
         drop(ledger);
         self.settled.notify_waiters();
@@ -832,7 +956,7 @@ impl JevClient {
 
     /// Charge a cancelled hedge loser. Identical requests report identical input tokens, so the
     /// winner's receipt is the loser's charge whether or not the provider finished it.
-    fn settle_cancelled(&self, reservation: u64, input: u64, audit_name: &str) {
+    fn settle_cancelled(&self, reservation: u64, input: u64, provider: usize, audit_name: &str) {
         let recorded = self
             .write_audit(
                 &format!("{audit_name}-cancelled"),
@@ -840,12 +964,15 @@ impl JevClient {
             )
             .is_ok();
         let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
-        let charged = self.backend.cost_nanos(input).ok().and_then(|cost| {
-            ledger
-                .accounted_nanos
-                .checked_sub(reservation)?
-                .checked_add(cost)
-        });
+        let charged = self.chain()[provider]
+            .cost_nanos(input)
+            .ok()
+            .and_then(|cost| {
+                ledger
+                    .accounted_nanos
+                    .checked_sub(reservation)?
+                    .checked_add(cost)
+            });
         match charged {
             Some(accounted) => {
                 ledger.accounted_nanos = accounted;
@@ -875,22 +1002,24 @@ impl JevClient {
         );
         let expected: BTreeSet<_> = questions.keys().cloned().collect();
         ensure!(!expected.is_empty(), "Jev requires at least one question");
-        let (url, headers, body) = self.request_parts(state, questions)?;
-        ensure!(
-            serde_json::to_vec(&body)?.len() <= MAX_REQUEST_BYTES,
-            "Jev request exceeds the local byte limit; no request was sent"
-        );
+        for provider in self.chain() {
+            let (_, _, body) = request_parts(provider, &state, &questions)?;
+            ensure!(
+                serde_json::to_vec(&body)?.len() <= MAX_REQUEST_BYTES,
+                "Jev request exceeds the local byte limit; no request was sent"
+            );
+        }
         let trace_id = uuid::Uuid::new_v4().to_string();
         let call = Call {
-            url: &url,
-            headers: &headers,
-            body: &body,
+            state: &state,
+            questions: &questions,
             expected: &expected,
             context: &context,
             trace_id: &trace_id,
             hedge: Hedge::new(),
             sent: tokio::sync::Notify::new(),
             rate_limited: std::sync::atomic::AtomicBool::new(false),
+            first_provider: std::sync::atomic::AtomicUsize::new(usize::MAX),
         };
         let first = self.attempt(&call, 0);
         tokio::pin!(first);
@@ -934,15 +1063,53 @@ impl JevClient {
     /// Three such errors in a row open the unresolved-usage circuit (`retain_unresolved`). A hedge
     /// attempt (`attempt > 0`) never waits for budget room.
     async fn attempt(&self, call: &Call<'_>, attempt: u32) -> Result<Attempted> {
-        let (url, headers, body, expected, context) = (
-            call.url,
-            call.headers.to_vec(),
-            call.body,
-            call.expected,
-            call.context,
-        );
+        let (expected, context) = (call.expected, call.context);
         let mut rate_limit_retries = 0u32;
+        let mut tries = 0u32;
         loop {
+            // Every refusal moves a provider to cooling or disabled, but responses can outlast
+            // short cooldowns, so the number of sends per attempt has its own bound.
+            ensure!(
+                tries < MAX_SENDS_PER_ATTEMPT,
+                "Jev providers kept refusing the call"
+            );
+            // The first usable provider; a hedge prefers one the first attempt is not using.
+            let avoid = (attempt > 0)
+                .then(|| {
+                    call.first_provider
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .filter(|&p| p != usize::MAX);
+            let provider = match self.pick_provider(avoid) {
+                Some(provider) => provider,
+                None => {
+                    let Some(wait) = self.soonest_provider() else {
+                        bail!("Every Jev provider rejected its credentials");
+                    };
+                    if attempt > 0 || rate_limit_retries >= RATE_LIMIT_RETRIES {
+                        bail!("Every Jev provider is rate limited or refusing payment");
+                    }
+                    if attempt == 0 {
+                        call.rate_limited
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    rate_limit_retries += 1;
+                    tokio::time::sleep(self.rate_limit_wait.unwrap_or(wait)).await;
+                    continue;
+                }
+            };
+            if attempt == 0 {
+                call.first_provider
+                    .store(provider, std::sync::atomic::Ordering::SeqCst);
+            }
+            let backend = self.chain()[provider];
+            let (url, headers, body) = request_parts(backend, call.state, call.questions)?;
+            // Checked again once the request holds its permit: the provider may have been cooled
+            // or disabled by another call while this one waited.
+            let stop = || {
+                (attempt > 0 && call.rate_limited.load(std::sync::atomic::Ordering::SeqCst))
+                    || !self.provider_usable(provider)
+            };
             let reservation = if attempt == 0 {
                 self.reserve_waiting().await?
             } else {
@@ -953,24 +1120,23 @@ impl JevClient {
                 ledger.usage.hedged_requests += 1;
                 reservation
             };
-            let audit_name = if rate_limit_retries == 0 {
+            let audit_name = if tries == 0 {
                 format!("{}-attempt-{attempt}", call.trace_id)
             } else {
-                format!(
-                    "{}-attempt-{attempt}-retry-{rate_limit_retries}",
-                    call.trace_id
-                )
+                format!("{}-attempt-{attempt}-try-{tries}", call.trace_id)
             };
+            tries += 1;
             let mut pending = PendingAttempt {
                 client: self,
                 receipt_accounted: false,
                 finished: false,
                 reservation,
+                provider,
                 hedge: &call.hedge,
                 audit_name: audit_name.clone(),
             };
             // Persist the reservation first. Cancellation leaves a conservative pending record.
-            let mut trace = json!({"schema_version":1,"backend":self.backend.name(),"context":context,
+            let mut trace = json!({"schema_version":1,"backend":backend.name(),"context":context,
                 "attempt":attempt,"request":body,"state":"reserved","reservation_usd":reservation as f64/NANOS_PER_USD,
                 "usage":self.usage(),"time_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()});
             self.write_audit(&audit_name, &trace)?;
@@ -978,26 +1144,29 @@ impl JevClient {
                 .http
                 .request_body_recorded_elsewhere(
                     reqwest::Method::POST,
-                    url,
-                    headers.clone(),
+                    &url,
+                    headers,
                     Some(body.clone()),
-                    if attempt == 0 {
-                        crate::http::SendGate::NotifySent(&call.sent)
-                    } else {
-                        crate::http::SendGate::SkipIf(&call.rate_limited)
+                    crate::http::SendGate {
+                        stop: Some(&stop),
+                        notify: (attempt == 0).then_some(&call.sent),
                     },
                 )
                 .await
             {
                 Ok(response) => response,
                 Err(error) if error.downcast_ref::<crate::http::NotSent>().is_some() => {
-                    // A hedge that the rate limit stopped before sending costs nothing.
-                    self.release_unsent(reservation);
+                    // Stopped before sending: the provider became unusable while this request
+                    // waited, or, for a hedge, the first attempt is waiting out a rate limit.
+                    self.release_unrun(reservation, attempt > 0, false);
                     trace["state"] = json!("not_sent");
-                    trace["accounting"] = json!("Reservation released; the hedge was not sent.");
+                    trace["accounting"] = json!("Reservation released; the request was not sent.");
                     self.write_audit(&audit_name, &trace)?;
                     pending.finished = true;
-                    bail!("The hedge was not sent: the first attempt is rate limited");
+                    if attempt > 0 {
+                        bail!("The hedge was not sent");
+                    }
+                    continue;
                 }
                 Err(_) => {
                     let opened = self.retain_unresolved();
@@ -1013,31 +1182,40 @@ impl JevClient {
             };
             trace["http_status"] = json!(response.status);
             trace["response_artifact"] = json!(response.artifact);
-            if response.status == 429 {
-                // The provider rejected the request before running it, so nothing was spent. The
-                // first attempt waits as told and tries again; a hedge gives up, so hedging never
-                // adds load under a rate limit.
-                self.release_rate_limited(reservation, attempt > 0);
-                if attempt == 0 {
-                    call.rate_limited
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
+            let wait = self.rate_limit_wait.unwrap_or_else(|| {
+                Duration::from_secs(
+                    response
+                        .headers
+                        .get("retry-after")
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .unwrap_or(RATE_LIMIT_DEFAULT_WAIT_SECS)
+                        .clamp(1, RATE_LIMIT_MAX_WAIT_SECS),
+                )
+            });
+            // 429 (rate limited) and 529 (overloaded) mean the provider did not run the request, so
+            // nothing was spent. The provider cools down and the call moves to the next usable
+            // provider at once; it waits only when none is usable. With another provider in the
+            // chain, 402 (payment refused) cools a provider the same way.
+            let others = self.other_providers(provider);
+            if matches!(response.status, 429 | 529) || (response.status == 402 && others) {
+                self.release_unrun(reservation, attempt > 0, response.status != 402);
+                self.cool_provider(provider, wait);
                 trace["state"] = json!("rate_limited");
                 trace["accounting"] =
-                    json!("Reservation released; a rate-limited request is not run.");
-                let path = self.write_audit(&audit_name, &trace)?;
+                    json!("Reservation released; the provider did not run the request.");
+                self.write_audit(&audit_name, &trace)?;
                 pending.finished = true;
-                if attempt > 0 || rate_limit_retries >= RATE_LIMIT_RETRIES {
-                    bail!("Jev rate limit (HTTP 429) persisted. Audit: {path}");
-                }
-                let wait = response
-                    .headers
-                    .get("retry-after")
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .unwrap_or(RATE_LIMIT_DEFAULT_WAIT_SECS)
-                    .clamp(1, RATE_LIMIT_MAX_WAIT_SECS);
-                rate_limit_retries += 1;
-                tokio::time::sleep(self.rate_limit_wait.unwrap_or(Duration::from_secs(wait))).await;
+                continue;
+            }
+            // Rejected credentials disable only this provider while another remains.
+            if matches!(response.status, 401 | 403) && others {
+                self.disable_provider(provider);
+                self.release_unrun(reservation, attempt > 0, false);
+                trace["state"] = json!("provider_disabled");
+                trace["accounting"] =
+                    json!("Reservation released; the provider rejected the credentials.");
+                self.write_audit(&audit_name, &trace)?;
+                pending.finished = true;
                 continue;
             }
             if !(200..300).contains(&response.status) {
@@ -1058,13 +1236,19 @@ impl JevClient {
             let parsed = parse_response(&response.body, expected);
             match parsed {
                 Ok(parsed) => {
-                    let settlement =
-                        self.settle(reservation, parsed.input_tokens, parsed.output_tokens);
+                    let settlement = self.settle_on(
+                        provider,
+                        reservation,
+                        parsed.input_tokens,
+                        parsed.output_tokens,
+                    );
                     pending.receipt_accounted = true;
                     trace["reported_provider_cost_usd"] =
                         json!(parsed.input_tokens as f64 * 0.042 / 1_000_000.0);
-                    trace["reported_cost_with_credit_fee_usd"] =
-                        json!(parsed.input_tokens as f64 * 0.042 / 1_000_000.0 * 1.05);
+                    trace["accounted_cost_usd"] = json!(backend
+                        .cost_nanos(parsed.input_tokens)
+                        .map(|n| n as f64 / NANOS_PER_USD)
+                        .ok());
                     trace["model"] = json!(parsed.model);
                     trace["answers"] = json!(parsed.answers);
                     trace["usage"] = json!(self.usage());
@@ -1090,12 +1274,14 @@ impl JevClient {
                                 usage.get("input_tokens").and_then(Value::as_u64),
                                 usage.get("output_tokens").and_then(Value::as_u64),
                             ) {
-                                let settled = self.settle(reservation, input, output);
+                                let settled = self.settle_on(provider, reservation, input, output);
                                 pending.receipt_accounted = true;
                                 trace["reported_provider_cost_usd"] =
                                     json!(input as f64 * 0.042 / 1_000_000.0);
-                                trace["reported_cost_with_credit_fee_usd"] =
-                                    json!(input as f64 * 0.042 / 1_000_000.0 * 1.05);
+                                trace["accounted_cost_usd"] = json!(backend
+                                    .cost_nanos(input)
+                                    .map(|n| n as f64 / NANOS_PER_USD)
+                                    .ok());
                                 trace["usage_receipt_accounted"] = json!(true);
                                 trace["usage"] = json!(self.usage());
                                 if settled.is_err() {
@@ -1119,38 +1305,64 @@ impl JevClient {
             }
         }
     }
+}
 
-    fn request_parts(&self, state: Value, questions: Map<String, Value>) -> Result<RequestParts> {
-        let mut headers = vec![("content-type".into(), "application/json".into())];
-        match &self.backend {
-            #[cfg(test)]
-            Backend::Loopback { url, token } => {
-                headers.push(("authorization".into(), format!("Bearer {token}")));
-                Ok((
-                    url.clone(),
-                    headers,
-                    json!({"model":"typesafe/jev","input":{"state":state,"questions":questions}}),
-                ))
-            }
-            Backend::Cloudflare {
-                account,
-                token,
-                gateway,
-            } => {
-                headers.extend([
-                    ("authorization".into(), format!("Bearer {token}")),
-                    ("cf-aig-gateway-id".into(), gateway.clone()),
-                    ("cf-aig-max-attempts".into(), "1".into()),
-                    ("cf-aig-skip-cache".into(), "true".into()),
-                ]);
-                Ok((
-                    format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai/run"),
-                    headers,
-                    json!({"model":"typesafe/jev","input":{"state":state,"questions":questions}}),
-                ))
-            }
-            Backend::Fixture => bail!("Fixture mode cannot make a Jev request"),
+/// The URL, headers, and body of one request to `provider`.
+fn request_parts(
+    provider: &Backend,
+    state: &Value,
+    questions: &Map<String, Value>,
+) -> Result<RequestParts> {
+    let mut headers = vec![("content-type".into(), "application/json".into())];
+    // TypeSafe and OpenRouter share TypeSafe's own request shape.
+    let direct = |url: &str, key: &str, model: &str, mut headers: Vec<(String, String)>| {
+        headers.push(("authorization".into(), format!("Bearer {key}")));
+        (
+            url.to_owned(),
+            headers,
+            json!({"model":model,"state":state,"questions":questions}),
+        )
+    };
+    match provider {
+        #[cfg(test)]
+        Backend::Loopback { url, token } => {
+            headers.push(("authorization".into(), format!("Bearer {token}")));
+            Ok((
+                url.clone(),
+                headers,
+                json!({"model":"typesafe/jev","input":{"state":state,"questions":questions}}),
+            ))
         }
+        Backend::Cloudflare {
+            account,
+            token,
+            gateway,
+        } => {
+            headers.extend([
+                ("authorization".into(), format!("Bearer {token}")),
+                ("cf-aig-gateway-id".into(), gateway.clone()),
+                ("cf-aig-max-attempts".into(), "1".into()),
+                ("cf-aig-skip-cache".into(), "true".into()),
+            ]);
+            Ok((
+                format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai/run"),
+                headers,
+                json!({"model":"typesafe/jev","input":{"state":state,"questions":questions}}),
+            ))
+        }
+        Backend::TypeSafe { key } => Ok(direct(
+            "https://api.typesafe.ai/v1/systemone",
+            key,
+            "jev-latest",
+            headers,
+        )),
+        Backend::OpenRouter { key } => Ok(direct(
+            "https://openrouter.ai/api/v1/systemone",
+            key,
+            "~typesafe/jev-latest",
+            headers,
+        )),
+        Backend::Fixture => bail!("Fixture mode cannot make a Jev request"),
     }
 }
 
@@ -1282,12 +1494,82 @@ fn source_question(source: &Source, pass: usize) -> Value {
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }
-fn backend_from_env() -> Result<Backend> {
-    backend_from(env_value, wrangler_oauth_token)
+fn providers_from_env() -> Result<Vec<Backend>> {
+    providers_from(env_value, wrangler_oauth_token)
 }
 
-fn backend_from(
+/// Provider names in their default chain order.
+const PROVIDERS: [&str; 3] = ["cloudflare", "typesafe", "openrouter"];
+
+/// The provider chain. `JEV_PROVIDERS` (comma-separated) sets the order and must name only
+/// configured providers; without it, every configured provider is used in the default order.
+fn providers_from(
     env: impl Fn(&str) -> Option<String>,
+    resolve: impl FnOnce(&str) -> Result<String>,
+) -> Result<Vec<Backend>> {
+    let order = provider_order(&env)?;
+    let mut resolve = Some(resolve);
+    order
+        .iter()
+        .map(|name| match name.as_str() {
+            "cloudflare" => cloudflare_from(&env, resolve.take().expect("one Cloudflare entry")),
+            "typesafe" => Ok(Backend::TypeSafe {
+                key: env("TYPESAFE_AI_API_KEY").unwrap_or_default(),
+            }),
+            _ => Ok(Backend::OpenRouter {
+                key: env("OPENROUTER_API_KEY").unwrap_or_default(),
+            }),
+        })
+        .collect()
+}
+
+/// The provider chain's names in order, from configuration alone. Starts nothing and sends
+/// nothing, so `doctor` can show it.
+pub fn provider_order(env: &impl Fn(&str) -> Option<String>) -> Result<Vec<String>> {
+    let configured = |name: &str| match name {
+        "cloudflare" => {
+            env("CLOUDFLARE_ACCOUNT_ID").is_some()
+                && (env("CLOUDFLARE_API_TOKEN").is_some()
+                    || env("JEV_CLOUDFLARE_AUTH_PROFILE").is_some())
+        }
+        "typesafe" => env("TYPESAFE_AI_API_KEY").is_some(),
+        _ => env("OPENROUTER_API_KEY").is_some(),
+    };
+    let order: Vec<String> = match env("JEV_PROVIDERS") {
+        Some(list) => {
+            let names: Vec<String> = list
+                .split(',')
+                .map(|n| n.trim().to_ascii_lowercase())
+                .filter(|n| !n.is_empty())
+                .collect();
+            for (i, name) in names.iter().enumerate() {
+                ensure!(
+                    PROVIDERS.contains(&name.as_str()),
+                    "JEV_PROVIDERS names an unknown provider: {name} (use cloudflare, typesafe, openrouter)"
+                );
+                ensure!(!names[..i].contains(name), "JEV_PROVIDERS repeats {name}");
+                ensure!(
+                    configured(name),
+                    "JEV_PROVIDERS names {name}, but its credentials are missing"
+                );
+            }
+            names
+        }
+        None => PROVIDERS
+            .iter()
+            .filter(|n| configured(n))
+            .map(|n| (*n).to_owned())
+            .collect(),
+    };
+    ensure!(
+        !order.is_empty(),
+        "No Jev provider is configured: set CLOUDFLARE_ACCOUNT_ID (with CLOUDFLARE_API_TOKEN or JEV_CLOUDFLARE_AUTH_PROFILE), TYPESAFE_AI_API_KEY, or OPENROUTER_API_KEY"
+    );
+    Ok(order)
+}
+
+fn cloudflare_from(
+    env: &impl Fn(&str) -> Option<String>,
     resolve: impl FnOnce(&str) -> Result<String>,
 ) -> Result<Backend> {
     let account = env("CLOUDFLARE_ACCOUNT_ID")
@@ -1668,7 +1950,7 @@ mod tests {
         };
         let no_profile = |_: &str| -> Result<String> { panic!("static token needs no profile") };
         const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
-        let backend = backend_from(
+        let chain = providers_from(
             env(&[
                 ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT),
                 ("CLOUDFLARE_API_TOKEN", "t"),
@@ -1676,14 +1958,15 @@ mod tests {
             no_profile,
         )
         .unwrap();
-        assert_eq!(backend.name(), "cloudflare");
-        assert!(backend_from(env(&[("CLOUDFLARE_API_TOKEN", "t")]), no_profile).is_err());
-        let dir = tempfile::tempdir().unwrap();
-        let mut client = client(dir.path(), 0.0);
-        client.backend = offline_cloudflare();
-        let (url, headers, body) = client
-            .request_parts(json!({}), Map::from_iter([("q".into(), json!({}))]))
-            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].name(), "cloudflare");
+        assert!(providers_from(env(&[("CLOUDFLARE_API_TOKEN", "t")]), no_profile).is_err());
+        let (url, headers, body) = request_parts(
+            &offline_cloudflare(),
+            &json!({}),
+            &Map::from_iter([("q".into(), json!({}))]),
+        )
+        .unwrap();
         assert!(url.starts_with("https://api.cloudflare.com/client/v4/accounts/"));
         assert!(headers.contains(&("cf-aig-max-attempts".into(), "1".into())));
         assert_eq!(body["model"], "typesafe/jev");
@@ -1859,20 +2142,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut client = client(dir.path(), 0.0);
         client.backend = offline_cloudflare();
-        let body0 = client
-            .request_parts(
-                json!({"user_question":"q"}),
-                Map::from_iter([("q".into(), first.clone())]),
-            )
-            .unwrap()
-            .2;
-        let body1 = client
-            .request_parts(
-                json!({"user_question":"q"}),
-                Map::from_iter([("q".into(), second.clone())]),
-            )
-            .unwrap()
-            .2;
+        let body0 = request_parts(
+            &client.backend,
+            &json!({"user_question":"q"}),
+            &Map::from_iter([("q".into(), first.clone())]),
+        )
+        .unwrap()
+        .2;
+        let body1 = request_parts(
+            &client.backend,
+            &json!({"user_question":"q"}),
+            &Map::from_iter([("q".into(), second.clone())]),
+        )
+        .unwrap()
+        .2;
         assert_ne!(
             body0["input"]["questions"]["q"]["instructions"],
             body1["input"]["questions"]["q"]["instructions"]
@@ -2735,6 +3018,228 @@ mod tests {
         assert_eq!(client.usage().requests, 1);
     }
 
+    #[test]
+    fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let no_profile = |_: &str| -> Result<String> { panic!("static token needs no profile") };
+        let names = |chain: Vec<Backend>| chain.iter().map(|b| b.name()).collect::<Vec<_>>();
+        const ALL: &[(&str, &str)] = &[
+            ("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"),
+            ("CLOUDFLARE_API_TOKEN", "t"),
+            ("TYPESAFE_AI_API_KEY", "k"),
+            ("OPENROUTER_API_KEY", "o"),
+        ];
+        assert_eq!(
+            names(providers_from(env(ALL), no_profile).unwrap()),
+            ["cloudflare", "typesafe", "openrouter"]
+        );
+        assert_eq!(
+            names(providers_from(env(&[("OPENROUTER_API_KEY", "o")]), no_profile).unwrap()),
+            ["openrouter"]
+        );
+        const ORDERED: &[(&str, &str)] = &[
+            ("TYPESAFE_AI_API_KEY", "k"),
+            ("OPENROUTER_API_KEY", "o"),
+            ("JEV_PROVIDERS", "openrouter, TypeSafe"),
+        ];
+        assert_eq!(
+            names(providers_from(env(ORDERED), no_profile).unwrap()),
+            ["openrouter", "typesafe"]
+        );
+        for bad in [
+            &[("JEV_PROVIDERS", "typesafe")][..],
+            &[
+                ("TYPESAFE_AI_API_KEY", "k"),
+                ("JEV_PROVIDERS", "typesafe,typesafe"),
+            ][..],
+            &[("TYPESAFE_AI_API_KEY", "k"), ("JEV_PROVIDERS", "vertex")][..],
+            &[][..],
+        ] {
+            let bad: &'static [(&'static str, &'static str)] =
+                Box::leak(bad.to_vec().into_boxed_slice());
+            assert!(providers_from(env(bad), no_profile).is_err());
+        }
+        let (url, headers, body) = request_parts(
+            &Backend::OpenRouter { key: "o".into() },
+            &json!({"x":1}),
+            &Map::from_iter([("q".into(), json!({}))]),
+        )
+        .unwrap();
+        assert_eq!(url, "https://openrouter.ai/api/v1/systemone");
+        assert!(headers.contains(&("authorization".into(), "Bearer o".into())));
+        assert_eq!(
+            (body["model"].as_str(), &body["state"]),
+            (Some("~typesafe/jev-latest"), &json!({"x":1}))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_provider_hands_the_call_to_the_next_one_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (busy, busy_server) =
+            scripted_server(vec![(0, "429 Too Many Requests", "{}".into())]).await;
+        let (spare, spare_server) = scripted_server(vec![
+            (0, "200 OK", response().to_string()),
+            (0, "200 OK", response().to_string()),
+        ])
+        .await;
+        let mut client = hedging_client(dir.path(), busy, 1.0);
+        client.hedge_after = None;
+        // A real cooldown: the call must not wait for it.
+        client.fallbacks = vec![Backend::Loopback {
+            url: spare,
+            token: "offline-placeholder".into(),
+        }];
+        client.providers = Mutex::new(vec![ProviderState::default(); 2]);
+        let questions = || {
+            Map::from_iter([
+                ("a".into(), json!({"type":"noul"})),
+                ("b".into(), json!({"type":"noul"})),
+            ])
+        };
+        let started = std::time::Instant::now();
+        for n in 0..2 {
+            client
+                .evaluate(json!({ "n": n }), questions(), json!({}))
+                .await
+                .unwrap();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "failover must not wait"
+        );
+        busy_server.await.unwrap();
+        spare_server.await.unwrap();
+        let usage = client.usage();
+        // The second call skips the cooling provider entirely.
+        assert_eq!((usage.requests, usage.rate_limited_requests), (2, 1));
+        assert!(client.spending_stop_reason().is_none());
+    }
+
+    fn two_provider_client(dir: &Path, first: String, second: String) -> JevClient {
+        let mut client = hedging_client(dir, first, 1.0);
+        client.hedge_after = None;
+        client.fallbacks = vec![Backend::Loopback {
+            url: second,
+            token: "offline-placeholder".into(),
+        }];
+        client.providers = Mutex::new(vec![ProviderState::default(); 2]);
+        client
+    }
+
+    async fn ask(client: &JevClient) -> Result<(BTreeMap<String, f64>, String)> {
+        client
+            .evaluate(
+                json!({"n":1}),
+                Map::from_iter([
+                    ("a".into(), json!({"type":"noul"})),
+                    ("b".into(), json!({"type":"noul"})),
+                ]),
+                json!({}),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_payment_refusal_cools_one_provider_and_is_not_a_rate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, a) = scripted_server(vec![(0, "402 Payment Required", "{}".into())]).await;
+        let (second, b) = scripted_server(vec![(0, "200 OK", response().to_string())]).await;
+        let client = two_provider_client(dir.path(), first, second);
+        ask(&client).await.unwrap();
+        a.await.unwrap();
+        b.await.unwrap();
+        let usage = client.usage();
+        assert_eq!((usage.requests, usage.rate_limited_requests), (1, 0));
+        assert!(client.providers.lock().unwrap()[0].cooling_until.is_some());
+        assert!(client.spending_stop_reason().is_none());
+    }
+
+    #[tokio::test]
+    async fn when_every_provider_is_cooling_the_call_waits_then_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, a) = scripted_server(vec![
+            (0, "429 Too Many Requests", "{}".into()),
+            (0, "200 OK", response().to_string()),
+        ])
+        .await;
+        let (second, b) = scripted_server(vec![(0, "429 Too Many Requests", "{}".into())]).await;
+        let mut client = two_provider_client(dir.path(), first, second);
+        client.rate_limit_wait = Some(Duration::from_millis(50));
+        ask(&client).await.unwrap();
+        a.await.unwrap();
+        b.await.unwrap();
+        let usage = client.usage();
+        assert_eq!((usage.requests, usage.rate_limited_requests), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn a_hedge_goes_to_a_different_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first provider stalls; the hedge must reach the second one, which answers.
+        let (first, a) = scripted_server(vec![(400, "200 OK", response().to_string())]).await;
+        let (second, b) = scripted_server(vec![(0, "200 OK", response().to_string())]).await;
+        let mut client = two_provider_client(dir.path(), first, second);
+        client.hedge_after = Some(Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        ask(&client).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(350),
+            "the hedge answered first"
+        );
+        b.await.unwrap();
+        a.await.unwrap();
+        assert_eq!(client.usage().hedged_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_credentials_disable_one_provider_and_the_next_one_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bad, bad_server) = scripted_server(vec![(0, "401 Unauthorized", "{}".into())]).await;
+        let (good, good_server) =
+            scripted_server(vec![(0, "200 OK", response().to_string())]).await;
+        let mut client = hedging_client(dir.path(), bad, 1.0);
+        client.hedge_after = None;
+        client.fallbacks = vec![Backend::Loopback {
+            url: good,
+            token: "offline-placeholder".into(),
+        }];
+        client.providers = Mutex::new(vec![ProviderState::default(); 2]);
+        client
+            .evaluate(
+                json!({"n":1}),
+                Map::from_iter([
+                    ("a".into(), json!({"type":"noul"})),
+                    ("b".into(), json!({"type":"noul"})),
+                ]),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        bad_server.await.unwrap();
+        good_server.await.unwrap();
+        assert!(client.spending_stop_reason().is_none());
+        assert!(client.providers.lock().unwrap()[0].disabled);
+        assert_eq!(
+            client.usage().rate_limited_requests,
+            0,
+            "a 401 is not a rate limit"
+        );
+        let ledger = client.ledger.lock().unwrap();
+        assert_eq!(
+            ledger.accounted_nanos,
+            client.backend.cost_nanos(100).unwrap(),
+            "the rejected request costs nothing"
+        );
+    }
+
     #[tokio::test]
     async fn a_hedge_without_budget_room_leaves_the_first_attempt_to_finish() {
         let dir = tempfile::tempdir().unwrap();
@@ -2913,6 +3418,7 @@ mod tests {
             receipt_accounted: false,
             finished: false,
             reservation,
+            provider: 0,
             hedge: &hedge,
             audit_name: "unfinished".into(),
         };

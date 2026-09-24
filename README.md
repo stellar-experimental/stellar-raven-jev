@@ -10,7 +10,7 @@ It returns ranked evidence with URLs, excerpts, and paths to the full text. It d
 cargo install --path . --locked
 ```
 
-Copy `.env.example` to `.env` and fill in the source and Cloudflare credentials.
+Copy `.env.example` to `.env` and fill in the source credentials and at least one Jev provider.
 The CLI loads `.env` from the working directory or its parents, or from `--env-file` / `JEV_ENV_FILE`.
 
 ## Use from an agent
@@ -97,8 +97,9 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 - When attempts still in flight fill the budget, the next attempt waits for one to settle. It fails at once only when nothing is in flight.
 - An attempt that ends without a usage receipt (an HTTP error, a transport error, or an invalid body) keeps its full reservation as spent and is not retried. After 3 such attempts in a row, the client stops new attempts for the run. A settled attempt resets the count.
 - A Jev call without an answer 2 seconds after its request is sent gets one identical hedge request, if the budget has room without waiting. Queue wait does not count. The first valid answer wins, and the other request is cancelled. If one attempt fails, the other one decides. Identical requests report identical input tokens, so the cancelled request is charged the winner's input tokens. `usage.hedged_requests` counts hedges. Jev latency has a heavy tail (p95 about 1.3 s, p99 about 10 s) that a request sent a moment later does not repeat. On 24 interleaved runs, hedging cut the median run from 14.7 s to 12.0 s and the slowest from 32.2 s to 15.4 s, for about 7% more cost. The selected sets agreed across arms as closely as within one arm.
-- HTTP 401 or 403 stops the client at once.
-- HTTP 429 (rate limit) releases the reservation, because the provider did not run the request. The call waits for `Retry-After` (1 to 90 seconds) and retries up to 3 times. A hedge request does not retry. `usage.rate_limited_requests` counts these responses.
+- HTTP 429 (rate limit) or 529 (overloaded) releases the reservation, because the provider did not run the request, and cools that provider for its `Retry-After` (1 to 90 seconds). The call moves to the next usable provider at once. It waits only when no provider is usable, at most 3 times. A hedge request never waits, and it prefers a different provider than the first attempt. `usage.rate_limited_requests` counts these responses.
+- With another provider in the chain, HTTP 401 or 403 disables that provider for the run, and HTTP 402 (payment refused) cools it; the call moves on and the reservation is released. With no other provider, 401 or 403 stops the client at once and 402 counts as an unresolved attempt.
+- Transport errors and other HTTP errors are never retried on another provider, because the provider may have run the request.
 - A document whose scoring fails is listed as `uncertain` in `classification.json`, with a `failures.json` entry.
 
 ## How a run works
@@ -137,7 +138,15 @@ Run directories use owner-only permissions on Unix. Raw responses can contain pr
 
 ## Configuration
 
-Jev runs through Cloudflare Workers AI. Set `CLOUDFLARE_ACCOUNT_ID` and either `CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_AUTH_PROFILE` (a Wrangler profile). `JEV_GATEWAY_ID` is optional and defaults to `default`.
+Jev can run through three providers. Every configured one joins a chain, in this order unless `JEV_PROVIDERS` (comma-separated) sets another order or a subset:
+
+| Provider | Configuration | Endpoint and model | Accounted price per million input tokens |
+|---|---|---|---|
+| `cloudflare` | `CLOUDFLARE_ACCOUNT_ID` plus `CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_AUTH_PROFILE`; optional `JEV_GATEWAY_ID` (default `default`) | Workers AI `typesafe/jev` | $0.0441 ($0.042 plus the 5% credit fee) |
+| `typesafe` | `TYPESAFE_AI_API_KEY` | `https://api.typesafe.ai/v1/systemone`, `jev-latest` | $0.042 |
+| `openrouter` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1/systemone`, `~typesafe/jev-latest` | $0.0444 ($0.042 plus the 5.5% credit fee) |
+
+All three serve the same model with the same request shape, and they answer the same questions alike. Output tokens are free on all three. Each attempt reserves the worst case at the highest price and settles at the price of the provider it was sent to; a cancelled hedge copy is charged at its own provider's price. `usage.provider_requests` counts settled requests per provider, and `doctor` shows the chain.
 
 With a Wrangler profile, each run obtains its token through `wrangler auth token --profile NAME --json`. The token stays in memory. The profile token must belong to the pinned account; a mismatch produces HTTP 401 on every Jev call.
 Sources need `LUMENLOOP_API_KEY`, `ALGOLIA_APPLICATION_ID_DOCS`, `ALGOLIA_API_KEY_DOCS`, `ALGOLIA_APPLICATION_ID_SITE`, and `ALGOLIA_API_KEY_SITE`. Stellar Scout needs no credential.

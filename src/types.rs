@@ -71,8 +71,10 @@ pub struct Usage {
     pub cost_usd: f64,
     /// Hedge requests sent for slow calls. They are included in `requests`.
     pub hedged_requests: u64,
-    /// Requests the provider rejected with HTTP 429. They are not in `requests` and cost nothing.
+    /// Requests a provider rejected with HTTP 429 or 529. They are not in `requests` and cost nothing.
     pub rate_limited_requests: u64,
+    /// Settled requests per provider (`cloudflare`, `typesafe`, `openrouter`).
+    pub provider_requests: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

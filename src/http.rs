@@ -32,14 +32,12 @@ struct RequestLimits {
     counters: Mutex<(u64, u64)>,
 }
 
-/// What a request does once it holds its concurrency permit.
-#[derive(Clone, Copy)]
-pub enum SendGate<'a> {
-    Open,
-    /// Notify the caller that the request is about to be sent.
-    NotifySent(&'a tokio::sync::Notify),
-    /// Do not send if the flag is set; the request then fails with `NotSent`.
-    SkipIf(&'a std::sync::atomic::AtomicBool),
+/// What a request does once it holds its concurrency permit: first `stop` may cancel it (the
+/// request then fails with `NotSent`), then `notify` learns that it is about to be sent.
+#[derive(Clone, Copy, Default)]
+pub struct SendGate<'a> {
+    pub stop: Option<&'a (dyn Fn() -> bool + Sync)>,
+    pub notify: Option<&'a tokio::sync::Notify>,
 }
 
 /// The request was stopped before anything was sent.
@@ -286,7 +284,7 @@ impl HttpRecorder {
         headers: Vec<(String, String)>,
         body: Option<Value>,
     ) -> Result<HttpResponse> {
-        self.request_recorded(method, url, headers, body, true, SendGate::Open)
+        self.request_recorded(method, url, headers, body, true, SendGate::default())
             .await
     }
 
@@ -380,14 +378,11 @@ impl HttpRecorder {
                 write_metadata(&metadata_path, &record.metadata)?;
             }
             let _permit = self.semaphore.acquire().await?;
-            match gate {
-                SendGate::Open => {}
-                SendGate::NotifySent(sent) => sent.notify_one(),
-                SendGate::SkipIf(stop) => {
-                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                        return Err(NotSent.into());
-                    }
-                }
+            if gate.stop.is_some_and(|stop| stop()) {
+                return Err(NotSent.into());
+            }
+            if let Some(sent) = gate.notify {
+                sent.notify_one();
             }
             // Wall-clock start after the permit, so timelines separate queue wait from transfer.
             record.metadata["queued_ms"] = json!(started.elapsed().as_millis() as u64);

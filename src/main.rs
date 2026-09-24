@@ -192,6 +192,11 @@ fn profile_doctor_check(
     if config.fixture {
         return Ok(None);
     }
+    // The chain must be valid, and only a chain with Cloudflare needs the Wrangler check.
+    let order = stellar_raven_jev::jev::provider_order(&env)?;
+    if !order.iter().any(|name| name == "cloudflare") {
+        return Ok(None);
+    }
     if env("CLOUDFLARE_API_TOKEN").is_some() {
         return Ok(None);
     }
@@ -378,6 +383,10 @@ async fn main() -> Result<()> {
                     "mode":if config.fixture {"offline-fixture"} else {"live-jev"},
                     "network_checked":false,"authentication_validated_remotely":false,
                     "oauth_refresh_performed":false,
+                    "jev_providers":stellar_raven_jev::jev::provider_order(&|key: &str| {
+                        std::env::var(key).ok().filter(|value| !value.trim().is_empty())
+                    })
+                    .map_or_else(|error| json!({"error": error.to_string()}), |order| json!(order)),
                     "jev_authentication_check":result.as_ref().ok(),
                     "local_configuration_ready":configuration_ready,
                     "jev_configuration_ready":result.is_ok(),
