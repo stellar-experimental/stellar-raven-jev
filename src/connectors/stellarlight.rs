@@ -141,12 +141,18 @@ async fn read(
     result: &mut FetchResult,
     url: &str,
 ) -> Option<(Value, String)> {
-    let mut response = ctx.http.request(Method::GET, url, vec![], None).await;
+    let mut response = ctx
+        .http
+        .request(Method::GET, url, auth_headers(), None)
+        .await;
     // Scout answers transient overload with a server error. One late retry recovers most of them;
     // a second failure is reported.
     if matches!(&response, Ok(r) if matches!(r.status, 500 | 502 | 503 | 504)) {
         tokio::time::sleep(retry_delay()).await;
-        response = ctx.http.request(Method::GET, url, vec![], None).await;
+        response = ctx
+            .http
+            .request(Method::GET, url, auth_headers(), None)
+            .await;
     }
     match response {
         Ok(response) => {
@@ -188,6 +194,17 @@ async fn read(
             None
         }
     }
+}
+
+/// A partner key (`STELLAR_LIGHT_API_KEY`) raises Scout's request limits; without one, requests
+/// are anonymous and get the public limits.
+fn auth_headers() -> Vec<(String, String)> {
+    std::env::var("STELLAR_LIGHT_API_KEY")
+        .ok()
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty())
+        .map(|key| vec![("Authorization".to_owned(), format!("Bearer {key}"))])
+        .unwrap_or_default()
 }
 
 /// 250 to 750 ms, spread so that concurrent readers do not retry together.

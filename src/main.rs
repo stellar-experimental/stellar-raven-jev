@@ -314,6 +314,8 @@ fn source_credentials(present: impl Fn(&str) -> bool) -> serde_json::Value {
             }),
         );
     }
+    // Scout works without a key; a partner key raises its request limits.
+    sources["stellarlight"]["partner_key_present"] = json!(present("STELLAR_LIGHT_API_KEY"));
     serde_json::Value::Object(sources)
 }
 
@@ -730,6 +732,7 @@ mod tests {
         );
         assert_eq!(credentials["stellarlight"]["credentials_required"], false);
         assert_eq!(credentials["stellarlight"]["ready"], true);
+        assert_eq!(credentials["stellarlight"]["partner_key_present"], false);
         for source in credentials.as_object().unwrap().values() {
             assert!(source["present"]
                 .as_object()
