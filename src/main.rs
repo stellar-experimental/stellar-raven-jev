@@ -38,6 +38,9 @@ struct Cli {
     jev_concurrency: usize,
     #[arg(long, global = true, hide = true, default_value_t = 2000)]
     jev_hedge_ms: u64,
+    /// Reference date (YYYY-MM-DD) for currentness judgments. Defaults to today in UTC.
+    #[arg(long, global = true, hide = true)]
+    today: Option<String>,
     #[arg(long, global = true, hide = true, default_value_t = 2)]
     max_pages: usize,
     /// Scoring admission limit across all sources. It is an operating budget, set high enough that
@@ -264,6 +267,10 @@ async fn main() -> Result<()> {
         concurrency: cli.concurrency,
         jev_concurrency: cli.jev_concurrency,
         jev_hedge_ms: cli.jev_hedge_ms,
+        today: cli
+            .today
+            .clone()
+            .unwrap_or_else(stellar_raven_jev::rank::today_utc),
         max_pages: cli.max_pages,
         max_documents: cli.max_documents,
         per_source_documents: cli.per_source_documents,

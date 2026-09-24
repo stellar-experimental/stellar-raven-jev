@@ -59,22 +59,26 @@ struct Listing {
     /// SDF). They cannot narrow the listing, so they are not sent as filters. Question words that
     /// could be requested properties never go here.
     every_row: &'static [&'static str],
+    /// Row fields that date the row, as (JSON pointer, kind). The source defines each field:
+    /// `modified` is the subject's latest change, `observed` is when the value was measured, and
+    /// `event` is when the thing happens. Scan and generation times are never listed.
+    row_dates: &'static [(&'static str, &'static str)],
 }
 
 const LISTINGS: &[Listing] = &[
-    Listing { id: "projects", path: "/api/projects/search", key: "projects", description: "Curated projects, lifecycle evidence, funding, deployments, and code references", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
-    Listing { id: "repos", path: "/api/repos/search", key: "repos", description: "Indexed source repositories, code symbols, source scans, and maintenance evidence", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
-    Listing { id: "skills", path: "/api/skills", key: "skills", description: "Dynamic skill, MCP, SDK, CLI, agent-kit, and tool catalog; skill Markdown is evidence only", paged: false, query: false, limit: 0, roster: &["slug", "kind", "name", "tagline"], every_row: &[] },
-    Listing { id: "partners", path: "/api/partners", key: "partners", description: "Published integration providers, anchors, ramps, auditors, and capabilities", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
-    Listing { id: "audits", path: "/api/audits", key: "audits", description: "Enumerable audit report registry, auditor identity, dates, and extracted finding counts", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
-    Listing { id: "rfps", path: "/api/rfps", key: "rfps", description: "SCF requests for proposals and synthetic current round context", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
-    Listing { id: "hackathons", path: "/api/hackathons", key: "hackathons", description: "Curated and DoraHacks events, dates, prizes, tracks, and winners", paged: false, query: true, limit: 300, roster: &[], every_row: &[] },
-    Listing { id: "builds", path: "/api/hackathons/builds", key: "builds", description: "DoraHacks prototype prior art and winning submissions; bounded listing", paged: false, query: true, limit: 100, roster: &[], every_row: &[] },
-    Listing { id: "builders", path: "/api/builders", key: "builders", description: "Public Stellar Passport builder profiles and code evidence", paged: true, query: true, limit: 100, roster: &[], every_row: &[] },
-    Listing { id: "people", path: "/api/people", key: "people", description: "SDF leadership, board, advisors, and staff roles", paged: true, query: true, limit: 100, roster: &[], every_row: &["sdf"] },
-    Listing { id: "contracts", path: "/api/contracts", key: "contracts", description: "Evidence-gated mainnet contract registry, interfaces, and observed usage", paged: true, query: true, limit: 100, roster: &[], every_row: &["mainnet", "deployed"] },
-    Listing { id: "rwa", path: "/api/rwa", key: "assets", description: "Tracked real-world assets, verification basis, and issuance state", paged: false, query: false, limit: 100, roster: &["symbol", "code", "name", "issuerEntity", "assetClass", "productKind", "state", "issuer", "contract", "network", "launchedAt", "verificationLevel", "verifiedAt", "basisNote"], every_row: &[] },
-    Listing { id: "stablecoins", path: "/api/stablecoins", key: "stablecoins", description: "Tracked stablecoins, fiat pegs, USD market capitalization, and dated usage", paged: false, query: false, limit: 100, roster: &["ticker", "name", "company", "peg", "basis", "assetType", "issuer", "issuerDomain", "supply", "marketCapUSD", "updatedAt", "verified", "note"], every_row: &[] },
+    Listing { id: "projects", path: "/api/projects/search", key: "projects", description: "Curated projects, lifecycle evidence, funding, deployments, and code references", paged: true, query: true, limit: 100, roster: &[], every_row: &[], row_dates: &[("/lastActivityAt", "modified"), ("/statusAsOf", "observed")] },
+    Listing { id: "repos", path: "/api/repos/search", key: "repos", description: "Indexed source repositories, code symbols, source scans, and maintenance evidence", paged: true, query: true, limit: 100, roster: &[], every_row: &[], row_dates: &[("/lastCommitAt", "modified"), ("/activitySignals/lastReleaseAt", "modified")] },
+    Listing { id: "skills", path: "/api/skills", key: "skills", description: "Dynamic skill, MCP, SDK, CLI, agent-kit, and tool catalog; skill Markdown is evidence only", paged: false, query: false, limit: 0, roster: &["slug", "kind", "name", "tagline"], every_row: &[], row_dates: &[] },
+    Listing { id: "partners", path: "/api/partners", key: "partners", description: "Published integration providers, anchors, ramps, auditors, and capabilities", paged: true, query: true, limit: 100, roster: &[], every_row: &[], row_dates: &[("/freshness/lastPartnerUpdateAt", "modified")] },
+    Listing { id: "audits", path: "/api/audits", key: "audits", description: "Enumerable audit report registry, auditor identity, dates, and extracted finding counts", paged: true, query: true, limit: 100, roster: &[], every_row: &[], row_dates: &[] },
+    Listing { id: "rfps", path: "/api/rfps", key: "rfps", description: "SCF requests for proposals and synthetic current round context", paged: true, query: true, limit: 100, roster: &[], every_row: &[], row_dates: &[] },
+    Listing { id: "hackathons", path: "/api/hackathons", key: "hackathons", description: "Curated and DoraHacks events, dates, prizes, tracks, and winners", paged: false, query: true, limit: 300, roster: &[], every_row: &[], row_dates: &[] },
+    Listing { id: "builds", path: "/api/hackathons/builds", key: "builds", description: "DoraHacks prototype prior art and winning submissions; bounded listing", paged: false, query: true, limit: 100, roster: &[], every_row: &[], row_dates: &[("/endedAt", "event")] },
+    Listing { id: "builders", path: "/api/builders", key: "builders", description: "Public Stellar Passport builder profiles and code evidence", paged: true, query: true, limit: 100, roster: &[], every_row: &[], row_dates: &[("/onStellar/lastCommitAt", "modified")] },
+    Listing { id: "people", path: "/api/people", key: "people", description: "SDF leadership, board, advisors, and staff roles", paged: true, query: true, limit: 100, roster: &[], every_row: &["sdf"], row_dates: &[] },
+    Listing { id: "contracts", path: "/api/contracts", key: "contracts", description: "Evidence-gated mainnet contract registry, interfaces, and observed usage", paged: true, query: true, limit: 100, roster: &[], every_row: &["mainnet", "deployed"], row_dates: &[] },
+    Listing { id: "rwa", path: "/api/rwa", key: "assets", description: "Tracked real-world assets, verification basis, and issuance state", paged: false, query: false, limit: 100, roster: &["symbol", "code", "name", "issuerEntity", "assetClass", "productKind", "state", "issuer", "contract", "network", "launchedAt", "verificationLevel", "verifiedAt", "basisNote"], every_row: &[], row_dates: &[("/measured/measuredAt", "observed"), ("/verifiedAt", "observed")] },
+    Listing { id: "stablecoins", path: "/api/stablecoins", key: "stablecoins", description: "Tracked stablecoins, fiat pegs, USD market capitalization, and dated usage", paged: false, query: false, limit: 100, roster: &["ticker", "name", "company", "peg", "basis", "assetType", "issuer", "issuerDomain", "supply", "marketCapUSD", "updatedAt", "verified", "note"], every_row: &[], row_dates: &[("/updatedAt", "observed")] },
 ];
 
 pub fn sources() -> Vec<Source> {
@@ -528,9 +532,32 @@ fn document(
         text,
         provenance: json!({"provider":"stellarlight", "request_url":url, "meta":meta, "row":row,
             "content_scope": if research {"research_chunk"} else {"structured_record"},
-            "original_source":row.get("source"), "kind":row.get("kind"), "upstream_scores_are_calibrated":false}),
+            "original_source":row.get("source"), "kind":row.get("kind"), "upstream_scores_are_calibrated":false,
+            "date_hint": row_date_hint(source, row)}),
         raw_artifacts: vec![artifact],
     })
+}
+
+/// The newest value of each date kind among the row fields its listing declares.
+fn row_date_hint(source: &Source, row: &Value) -> Value {
+    let fields = LISTINGS
+        .iter()
+        .find(|entry| source.id == format!("stellarlight.{}", entry.id))
+        .map(|entry| entry.row_dates)
+        .unwrap_or(&[]);
+    let mut hint = serde_json::Map::new();
+    for (pointer, kind) in fields {
+        if let Some(value) = row.pointer(pointer).and_then(Value::as_str) {
+            let newer = hint
+                .get(*kind)
+                .and_then(Value::as_str)
+                .is_none_or(|known| value > known);
+            if newer {
+                hint.insert((*kind).to_owned(), json!(value));
+            }
+        }
+    }
+    Value::Object(hint)
 }
 
 async fn hydrate(
@@ -641,6 +668,7 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
             limit: 25,
             roster: &[],
             every_row: &[],
+            row_dates: &[],
         }
     } else {
         *LISTINGS

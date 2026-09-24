@@ -42,7 +42,8 @@ impl Intent {
     }
 }
 
-/// A document date and what it means. Only `published` and `modified` drive recency.
+/// A document date and what it means. `published`, `modified`, and `observed` (a registry value
+/// as of that date) drive recency; `event`, `upload_metadata`, and `ingested` do not.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct DocDate {
     pub date: String,
@@ -52,7 +53,25 @@ pub struct DocDate {
 }
 
 fn civil_days(y: i64, m: i64, d: i64) -> Option<i64> {
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || !(1990..=2100).contains(&y) {
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1..=12).contains(&m)
+        || !(1990..=2100).contains(&y)
+        || !(1..=month_days[(m - 1) as usize]).contains(&d)
+    {
         return None;
     }
     // Days since 1970-01-01 (Howard Hinnant's algorithm).
@@ -63,6 +82,38 @@ fn civil_days(y: i64, m: i64, d: i64) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(era * 146097 + doe - 719468)
+}
+
+/// Days since 1970-01-01 for an exact YYYY-MM-DD date.
+pub fn iso_date_days(text: &str) -> Option<i64> {
+    let b = text.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    civil_days(
+        text[..4].parse().ok()?,
+        text[5..7].parse().ok()?,
+        text[8..].parse().ok()?,
+    )
+}
+
+/// Today's date in UTC as YYYY-MM-DD.
+pub fn today_utc() -> String {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 / 86_400)
+        .unwrap_or(0);
+    // Inverse of `civil_days` (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 fn month_number(name: &str) -> Option<i64> {
@@ -127,65 +178,146 @@ fn path<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
-/// The document's own date, from provenance first, then from explicit labels in its text.
-/// Index timestamps are never document dates. Upload and ingestion times are kept but do not drive
-/// recency.
-pub fn document_date(document: &Document) -> Option<DocDate> {
-    let p = &document.provenance;
-    let provenance = [
-        (&["discovery", "publishing_date"][..], "published"),
-        (&["row", "publishedAt"][..], "published"),
-        (&["detail", "created_at"][..], "published"),
-    ];
-    let upload_source = document.source_id.starts_with("lumenloop.av");
-    for (keys, kind) in provenance {
-        if let Some((date, days)) = path(p, keys).and_then(parse_date) {
-            return Some(DocDate { date, kind, days });
+/// Machine-readable page dates from HTML: a `dateModified`/`datePublished` item property on a
+/// `<time>` or `<meta>` tag, Open Graph `article:*_time` tags, or JSON-LD keys. Returns
+/// (modified, published). Visible text is not read here.
+pub fn html_page_dates(html: &str) -> (Option<String>, Option<String>) {
+    static TAG: OnceLock<Regex> = OnceLock::new();
+    static ATTR: OnceLock<Regex> = OnceLock::new();
+    static JSON_LD: OnceLock<Regex> = OnceLock::new();
+    let tag = TAG.get_or_init(|| Regex::new(r#"(?is)<(?:time|meta)\b[^>]*>"#).unwrap());
+    let attr_re = ATTR.get_or_init(|| {
+        Regex::new(r#"(?i)\b(itemprop|property|name|datetime|content)\s*=\s*"([^"]*)""#).unwrap()
+    });
+    let json_ld = JSON_LD.get_or_init(|| {
+        Regex::new(r#""(dateModified|datePublished)"\s*:\s*"([^"]{10,40})""#).unwrap()
+    });
+    let (mut modified, mut published) = (None, None);
+    for m in tag.find_iter(html) {
+        let attrs: BTreeMap<String, String> = attr_re
+            .captures_iter(m.as_str())
+            .map(|c| (c[1].to_ascii_lowercase(), c[2].to_owned()))
+            .collect();
+        let attr = |name: &str| attrs.get(name).cloned();
+        let role = attr("itemprop")
+            .or_else(|| attr("property"))
+            .or_else(|| attr("name"))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let value = attr("datetime").or_else(|| attr("content"));
+        match (role.as_str(), value) {
+            ("datemodified" | "article:modified_time", Some(v)) if modified.is_none() => {
+                modified = Some(v)
+            }
+            ("datepublished" | "article:published_time", Some(v)) if published.is_none() => {
+                published = Some(v)
+            }
+            _ => {}
         }
     }
+    for c in json_ld.captures_iter(html) {
+        let slot = if &c[1] == "dateModified" {
+            &mut modified
+        } else {
+            &mut published
+        };
+        if slot.is_none() {
+            *slot = Some(c[2].to_owned());
+        }
+    }
+    (modified, published)
+}
+
+/// Whether a date kind says when the content was written or last known true.
+pub fn drives_recency(kind: &str) -> bool {
+    matches!(kind, "published" | "modified" | "observed")
+}
+
+/// The document's own date. Candidates come from source fields, connector date hints, page
+/// metadata, a same-URL document, and explicit labels in the text. The newest candidate that says
+/// when the content was written or last known true wins, but never one after `today` (days since
+/// 1970-01-01) plus a day: such a date is a typo or a schedule. Other kinds (event, upload,
+/// ingestion) are kept only when nothing else exists. Index timestamps are never document dates.
+pub fn document_date(document: &Document, today: i64) -> Option<DocDate> {
+    let p = &document.provenance;
+    let mut found: Vec<DocDate> = Vec::new();
+    let mut push = |text: Option<&str>, kind: &'static str| {
+        if let Some((date, days)) = text.and_then(parse_date) {
+            found.push(DocDate { date, kind, days });
+        }
+    };
+    push(path(p, &["discovery", "publishing_date"]), "published");
+    push(path(p, &["row", "publishedAt"]), "published");
+    push(path(p, &["detail", "created_at"]), "published");
     // An Algolia site record carries the page's own date field.
-    if let Some((date, days)) = p["records"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find_map(|record| record["date"].as_str().and_then(parse_date))
-    {
-        return Some(DocDate {
-            date,
-            kind: "published",
-            days,
-        });
+    for record in p["records"].as_array().into_iter().flatten() {
+        push(record["date"].as_str(), "published");
+    }
+    // Page metadata read from the original HTML, and a date hint a connector took from a field
+    // whose meaning the source defines.
+    push(path(p, &["page_dates", "modified"]), "modified");
+    push(path(p, &["page_dates", "published"]), "published");
+    for (field, kind) in [
+        ("modified", "modified"),
+        ("observed", "observed"),
+        ("event", "event"),
+    ] {
+        push(path(p, &["date_hint", field]), kind);
     }
     // `created_at` is an upload time for recordings and an ingestion time where the connector says
     // so. Elsewhere (research, proposals) it is when the item was written.
     let ingested = path(p, &["publication_date_status"]).is_some_and(|s| s.contains("ingestion"));
-    if let Some((date, days)) = path(p, &["discovery", "created_at"]).and_then(parse_date) {
-        let kind = if upload_source {
-            "upload_metadata"
-        } else if ingested {
-            "ingested"
-        } else {
-            "published"
-        };
-        return Some(DocDate { date, kind, days });
-    }
+    let created_kind = if document.source_id.starts_with("lumenloop.av") {
+        "upload_metadata"
+    } else if ingested {
+        "ingested"
+    } else {
+        "published"
+    };
+    push(path(p, &["discovery", "created_at"]), created_kind);
+    push(path(p, &["discovery", "start_at"]), "event");
     static LABELS: OnceLock<Regex> = OnceLock::new();
     let labels = LABELS.get_or_init(|| {
         Regex::new(r#"(?i)(last updated(?: on)?:?|publishing date:?|published(?: on)?:?|date:|datetime=")\s*"#).unwrap()
     });
-    for m in labels.find_iter(&document.text) {
+    if let Some(m) = labels.find_iter(&document.text).find(|m| {
+        parse_date(
+            &document.text[m.end()..]
+                .chars()
+                .take(40)
+                .collect::<String>(),
+        )
+        .is_some()
+    }) {
         let label = m.as_str().to_ascii_lowercase();
-        let rest: String = document.text[m.end()..].chars().take(40).collect();
-        if let Some((date, days)) = parse_date(&rest) {
-            let kind = if label.contains("updated") || label.contains("datetime") {
-                "modified"
-            } else {
-                "published"
-            };
-            return Some(DocDate { date, kind, days });
-        }
+        let kind = if label.contains("updated") {
+            "modified"
+        } else {
+            "published"
+        };
+        push(
+            Some(
+                &document.text[m.end()..]
+                    .chars()
+                    .take(40)
+                    .collect::<String>(),
+            ),
+            kind,
+        );
     }
-    None
+    // A same-URL document from another source may carry the date this copy lacks.
+    let copied_kind = match path(p, &["url_date", "kind"]) {
+        Some("published") => "published",
+        Some("observed") => "observed",
+        _ => "modified",
+    };
+    push(path(p, &["url_date", "date"]), copied_kind);
+    let newest = found
+        .iter()
+        .filter(|d| drives_recency(d.kind) && d.days <= today + 1)
+        .max_by_key(|d| d.days)
+        .cloned();
+    newest.or_else(|| found.into_iter().find(|d| !drives_recency(d.kind)))
 }
 
 /// Lowercase host without `www.`, and the URL path.
@@ -222,7 +354,7 @@ pub struct Ranked {
     pub fused: f64,
     pub authority_tier: u8,
     pub date: Option<DocDate>,
-    pub current: BTreeMap<String, f64>,
+    pub still_current: Option<f64>,
 }
 
 /// Intent weights for (relevance, currentness, recency, authority).
@@ -240,14 +372,15 @@ fn weights(intent: &Intent) -> [f64; 4] {
 const RRF_K: f64 = 10.0;
 
 /// Order selected documents. Relevance (length-normalized) always counts; currentness, recency,
-/// and authority count by intent. For a confident `current` intent, documents fall into buckets
-/// first: 1 live and not superseded, 3 superseded, 2 everything else. The currentness answers come
-/// from each document's best chunk.
+/// and authority count by intent. Currentness is Jev's judgment that the best chunk likely still
+/// holds today, given the document's date. For a confident `current` intent, documents judged
+/// likely still true come first.
 pub fn rank(
     intent: &Intent,
     documents: &[&Document],
     scores: &BTreeMap<&str, &DocumentScore>,
     scopes: &[String],
+    today: i64,
 ) -> Vec<Ranked> {
     let n = documents.len();
     let tiers: Vec<u8> = documents
@@ -255,7 +388,7 @@ pub fn rank(
         .zip(scopes)
         .map(|(d, s)| authority_tier(d, s))
         .collect();
-    let dates: Vec<Option<DocDate>> = documents.iter().map(|d| document_date(d)).collect();
+    let dates: Vec<Option<DocDate>> = documents.iter().map(|d| document_date(d, today)).collect();
     let relevance: Vec<f64> = documents
         .iter()
         .map(|d| {
@@ -266,20 +399,13 @@ pub fn rank(
         })
         .collect();
     let score = |i: usize| scores.get(documents[i].id.as_str()).copied();
-    let current = |i: usize| score(i).map(|s| &s.current).filter(|c| !c.is_empty());
-    let currentness: Vec<f64> = (0..n)
-        .map(|i| match current(i) {
-            Some(a) => {
-                let g = |k: &str| a.get(k).copied().unwrap_or(0.0);
-                g("dated") + g("live") - g("planned_only") - g("superseded")
-            }
-            None => f64::NEG_INFINITY,
-        })
-        .collect();
+    let still = |i: usize| score(i).and_then(|s| s.still_current);
+    // A missing judgment takes the middle position, like a missing date.
+    let currentness: Vec<f64> = (0..n).map(|i| still(i).unwrap_or(f64::NAN)).collect();
     let recency: Vec<f64> = dates
         .iter()
         .map(|d| match d {
-            Some(d) if matches!(d.kind, "published" | "modified") => d.days as f64,
+            Some(d) if drives_recency(d.kind) => d.days as f64,
             _ => f64::NAN,
         })
         .collect();
@@ -310,12 +436,7 @@ pub fn rank(
             if !bucketed {
                 return 2;
             }
-            let g = |k: &str| current(i).and_then(|a| a.get(k).copied());
-            let superseded = g("superseded").unwrap_or(0.0) >= 0.5;
-            let live = g("live").unwrap_or(0.0) >= 0.5;
-            if superseded {
-                3
-            } else if live {
+            if still(i).unwrap_or(0.0) >= 0.5 {
                 1
             } else {
                 2
@@ -337,7 +458,7 @@ pub fn rank(
             fused: fused[i],
             authority_tier: tiers[i],
             date: dates[i].clone(),
-            current: current(i).cloned().unwrap_or_default(),
+            still_current: still(i),
         })
         .collect()
 }
@@ -346,6 +467,7 @@ pub fn rank(
 mod tests {
     use super::*;
     use serde_json::json;
+    const TODAY: i64 = 20_719; // 2026-09-23
 
     fn doc(id: &str, url: &str, title: &str, text: &str, provenance: Value) -> Document {
         Document {
@@ -367,7 +489,7 @@ mod tests {
             signals_aggregation: String::new(),
             best_chunk: [0, 0],
             usable_top2_mean: top2,
-            current: BTreeMap::new(),
+            still_current: None,
         }
     }
 
@@ -380,7 +502,7 @@ mod tests {
             "",
             json!({"discovery":{"publishing_date":"2026-08-13 00:00:00+00"}}),
         );
-        assert_eq!(document_date(&p).unwrap().date, "2026-08-13");
+        assert_eq!(document_date(&p, TODAY).unwrap().date, "2026-08-13");
         let label = doc(
             "b",
             "",
@@ -388,7 +510,7 @@ mod tests {
             "Blog\nLast updated on Aug 12, 2026 by X",
             json!({}),
         );
-        let d = document_date(&label).unwrap();
+        let d = document_date(&label, TODAY).unwrap();
         assert_eq!((d.date.as_str(), d.kind), ("2026-08-12", "modified"));
         let index_only = doc(
             "c",
@@ -397,7 +519,7 @@ mod tests {
             "no dates",
             json!({"index_metadata":{"updatedAt":"2026-07-29T07:58:18Z"}}),
         );
-        assert!(document_date(&index_only).is_none());
+        assert!(document_date(&index_only, TODAY).is_none());
         let mut av = doc(
             "d",
             "",
@@ -406,7 +528,7 @@ mod tests {
             json!({"discovery":{"created_at":"2026-04-28T05:30:30Z"}}),
         );
         av.source_id = "lumenloop.av".into();
-        assert_eq!(document_date(&av).unwrap().kind, "upload_metadata");
+        assert_eq!(document_date(&av, TODAY).unwrap().kind, "upload_metadata");
         let record = doc(
             "r",
             "",
@@ -414,11 +536,11 @@ mod tests {
             "",
             json!({"records":[{"object_id":"1","date":"2024-06-18"}]}),
         );
-        assert_eq!(document_date(&record).unwrap().date, "2024-06-18");
+        assert_eq!(document_date(&record, TODAY).unwrap().date, "2024-06-18");
         let ordinal = doc("o", "", "t", "Published on June 18th, 2024", json!({}));
-        assert_eq!(document_date(&ordinal).unwrap().date, "2024-06-18");
+        assert_eq!(document_date(&ordinal, TODAY).unwrap().date, "2024-06-18");
         let scf = doc("e", "", "t", "Date: 31/08/2026", json!({}));
-        assert_eq!(document_date(&scf).unwrap().date, "2026-08-31");
+        assert_eq!(document_date(&scf, TODAY).unwrap().date, "2026-08-31");
         assert!(civil_days(2026, 9, 16).unwrap() > civil_days(2026, 8, 13).unwrap());
     }
 
@@ -458,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn a_confident_current_intent_puts_live_evidence_above_saturated_superseded_pages() {
+    fn a_confident_current_intent_puts_evidence_judged_still_true_first() {
         let old = doc(
             "old",
             "https://example.org/a",
@@ -481,22 +603,14 @@ mod tests {
             json!({"row":{"publishedAt":"2026-01-02"}}),
         );
         let docs = [&old, &neutral, &live];
-        let current = |live: f64, planned_only: f64, superseded: f64, dated: f64| {
-            BTreeMap::from([
-                ("live".to_owned(), live),
-                ("planned_only".to_owned(), planned_only),
-                ("superseded".to_owned(), superseded),
-                ("dated".to_owned(), dated),
-            ])
-        };
         let mut s = [
             score("old", 0.98),
             score("neutral", 0.98),
             score("live", 0.95),
         ];
-        s[0].current = current(0.9, 0.0, 0.8, 0.9);
-        s[1].current = current(0.2, 0.3, 0.1, 0.1);
-        s[2].current = current(0.95, 0.05, 0.0, 0.9);
+        s[0].still_current = Some(0.2);
+        s[1].still_current = Some(0.4);
+        s[2].still_current = Some(0.9);
         let scores: BTreeMap<&str, &DocumentScore> =
             s.iter().map(|x| (x.document_id.as_str(), x)).collect();
         let scopes = vec!["main_visible_text".to_owned(); 3];
@@ -505,19 +619,19 @@ mod tests {
             confidence: 0.9,
             versioned: 0.9,
         };
-        let ranked = rank(&intent, &docs, &scores, &scopes);
+        let ranked = rank(&intent, &docs, &scores, &scopes, TODAY);
         let ids: Vec<&str> = ranked.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["live", "neutral", "old"]);
         assert_eq!(
             ranked.iter().map(|r| r.bucket).collect::<Vec<_>>(),
-            [1, 2, 3]
+            [1, 2, 2]
         );
         // With low intent confidence there are no hard buckets.
         let unsure = Intent {
             confidence: 0.3,
             ..intent.clone()
         };
-        assert!(rank(&unsure, &docs, &scores, &scopes)
+        assert!(rank(&unsure, &docs, &scores, &scopes, TODAY)
             .iter()
             .all(|r| r.bucket == 2));
         // A timeless question ignores recency and currentness entirely.
@@ -526,7 +640,7 @@ mod tests {
             confidence: 0.9,
             versioned: 0.0,
         };
-        let ranked = rank(&timeless, &docs, &scores, &scopes);
+        let ranked = rank(&timeless, &docs, &scores, &scopes, TODAY);
         assert_eq!(
             ranked[2].id, "live",
             "lower relevance stays last without time signals"
@@ -542,13 +656,78 @@ mod tests {
             "",
             json!({"discovery":{"created_at":"2026-09-18T20:08:08Z"},"publication_date_status":"not_returned; created_at_is_ingestion_time"}),
         );
-        assert_eq!(document_date(&jobs).unwrap().kind, "ingested");
+        assert_eq!(document_date(&jobs, TODAY).unwrap().kind, "ingested");
         let ambiguous = doc("a", "", "t", "Date: 03/04/2026", json!({}));
-        assert_eq!(document_date(&ambiguous), None);
+        assert_eq!(document_date(&ambiguous, TODAY), None);
         let european = doc("e", "", "t", "Date: 23/04/2026", json!({}));
-        assert_eq!(document_date(&european).unwrap().date, "2026-04-23");
+        assert_eq!(document_date(&european, TODAY).unwrap().date, "2026-04-23");
         let upper = doc("u", "https://WWW.GitHub.com/stellar/x", "t", "", json!({}));
         assert_eq!(authority_tier(&upper, "main_visible_text"), 1);
+    }
+
+    #[test]
+    fn page_metadata_and_date_hints_supply_dates_and_the_newest_recency_date_wins() {
+        let docusaurus = r#"<footer><span>Last updated on <b><time datetime="2026-07-21T14:36:40.000Z" itemprop="dateModified">Jul 21, 2026</time></b></span></footer>"#;
+        assert_eq!(
+            html_page_dates(docusaurus),
+            (Some("2026-07-21T14:36:40.000Z".into()), None)
+        );
+        let og = r#"<meta content="2025-01-02T00:00:00Z" property="article:published_time"><script type="application/ld+json">{"dateModified":"2025-03-04"}</script>"#;
+        assert_eq!(
+            html_page_dates(og),
+            (
+                Some("2025-03-04".into()),
+                Some("2025-01-02T00:00:00Z".into())
+            )
+        );
+        let both = doc(
+            "b",
+            "",
+            "t",
+            "",
+            json!({"row":{"publishedAt":"2024-01-01"},"page_dates":{"modified":"2026-02-03"}}),
+        );
+        let d = document_date(&both, TODAY).unwrap();
+        assert_eq!((d.date.as_str(), d.kind), ("2026-02-03", "modified"));
+        let registry = doc(
+            "r",
+            "",
+            "t",
+            "",
+            json!({"date_hint":{"observed":"2026-09-21T13:00:00Z"}}),
+        );
+        assert_eq!(document_date(&registry, TODAY).unwrap().kind, "observed");
+        let event = doc(
+            "e",
+            "",
+            "t",
+            "",
+            json!({"discovery":{"start_at":"2026-10-01"}}),
+        );
+        let d = document_date(&event, TODAY).unwrap();
+        assert!(!drives_recency(d.kind));
+        assert_eq!(parse_date("2026-02-31"), None);
+        assert_eq!(civil_days(2026, 9, 23), Some(TODAY));
+        // A date after today is a typo or a schedule, not the document's date.
+        let future = doc(
+            "f",
+            "",
+            "t",
+            "",
+            json!({"row":{"publishedAt":"2025-05-05"},"page_dates":{"modified":"2027-01-01"}}),
+        );
+        assert_eq!(document_date(&future, TODAY).unwrap().date, "2025-05-05");
+        let copied = doc(
+            "c",
+            "",
+            "t",
+            "",
+            json!({"url_date":{"date":"2026-09-21","kind":"observed"}}),
+        );
+        assert_eq!(document_date(&copied, TODAY).unwrap().kind, "observed");
+        assert_eq!(iso_date_days("2024-02-29"), civil_days(2024, 2, 29));
+        assert_eq!(iso_date_days("2026-9-1"), None);
+        assert!(iso_date_days(&today_utc()).is_some());
     }
 
     #[test]

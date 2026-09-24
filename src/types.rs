@@ -52,15 +52,15 @@ pub struct DocumentScore {
     /// maximum of that signal over the document's chunks; different signals can come from different
     /// chunks, so the map is not one jointly supported evidence vector.
     pub signals_aggregation: String,
-    /// Byte range of the chunk with the highest usable_evidence. `current` comes from this chunk
-    /// only, so its answers never mix chunks.
+    /// Byte range of the chunk with the highest usable_evidence. `still_current` judges this chunk
+    /// only, so its answer never mixes chunks.
     pub best_chunk: [usize; 2],
     /// Mean of the two highest chunk usable_evidence values (one chunk: that value). Long pages
     /// get more chunks and so more chances at a high maximum; this key reduces that advantage.
     pub usable_top2_mean: f64,
-    /// Currentness answers (`live`, `planned_only`, `superseded`, `dated`) from the best chunk,
-    /// asked in the same call as the evidence questions when the question depends on time.
-    pub current: std::collections::BTreeMap<String, f64>,
+    /// Jev's judgment that the best chunk likely still holds today, given the document's date.
+    /// Asked after selection, only for questions that depend on time.
+    pub still_current: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -71,6 +71,8 @@ pub struct Usage {
     pub cost_usd: f64,
     /// Hedge requests sent for slow calls. They are included in `requests`.
     pub hedged_requests: u64,
+    /// Requests the provider rejected with HTTP 429. They are not in `requests` and cost nothing.
+    pub rate_limited_requests: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,6 +87,8 @@ pub struct RunConfig {
     /// Send one hedge request for a Jev call still unanswered after this many milliseconds.
     /// Zero turns hedging off.
     pub jev_hedge_ms: u64,
+    /// The reference date for currentness judgments, as YYYY-MM-DD in UTC.
+    pub today: String,
     pub max_pages: usize,
     pub max_documents: usize,
     pub per_source_documents: usize,
@@ -109,6 +113,7 @@ impl Default for RunConfig {
             concurrency: 16,
             jev_concurrency: 32,
             jev_hedge_ms: 2000,
+            today: crate::rank::today_utc(),
             max_pages: 2,
             max_documents: 400,
             per_source_documents: 12,

@@ -261,6 +261,27 @@ fn facet_document_ceiling(max_documents: usize, retained: usize, remaining_facet
     retained + max_documents.saturating_sub(retained) / remaining_facets.max(1)
 }
 
+/// Whether `url` is a canonical page of an indexed site: HTTPS on developers.stellar.org or
+/// stellar.org, with no credentials, port, or encoded path separators. Callers outside the
+/// connector use it before fetching an indexed page again.
+pub(crate) fn is_canonical_page(url: &str) -> bool {
+    let Ok(url) = Url::parse(url) else {
+        return false;
+    };
+    let path = url.path().to_lowercase();
+    url.scheme() == "https"
+        && matches!(
+            url.host_str(),
+            Some("developers.stellar.org" | "stellar.org")
+        )
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && !path.contains('\\')
+        && !path.contains("%2f")
+        && !path.contains("%5c")
+}
+
 fn canonical(index: Index, hit: &Value) -> Option<Url> {
     let raw = hit
         .get("url_without_anchor")
@@ -1464,6 +1485,21 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Posted January 1") && !text.contains("2020-01-01"));
+    }
+    #[test]
+    fn only_canonical_site_pages_are_fetched_again() {
+        assert!(is_canonical_page("https://developers.stellar.org/docs/a"));
+        assert!(is_canonical_page("https://stellar.org/blog/x"));
+        for url in [
+            "http://stellar.org/blog/x",
+            "https://internal.example/a",
+            "https://user:pw@stellar.org/a",
+            "https://stellar.org:8443/a",
+            "https://stellar.org/a%2F..%2Fb",
+            "https://evil.stellar.org.example/a",
+        ] {
+            assert!(!is_canonical_page(url), "{url}");
+        }
     }
     #[test]
     fn extraction_removes_hidden_content_and_keeps_article_heading() {

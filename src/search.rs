@@ -121,6 +121,12 @@ pub fn build_report_variant(
         serde_json::from_value(intent_record["intent"].clone())
             .context("intent.json has an invalid question intent")?
     };
+    // The run's own reference date, so a later replay ranks the same way.
+    let today = question["config"]["today"]
+        .as_str()
+        .and_then(crate::rank::iso_date_days)
+        .or_else(|| crate::rank::iso_date_days(&crate::rank::today_utc()))
+        .unwrap_or_default();
     let mut ranking: BTreeMap<String, crate::rank::Ranked> = BTreeMap::new();
     let document_dir = root.join(format!("search-documents{suffix}"));
     std::fs::create_dir_all(&document_dir)?;
@@ -129,7 +135,7 @@ pub fn build_report_variant(
         if status == "selected" {
             let refs: Vec<&Document> = documents.iter().collect();
             let scopes: Vec<String> = refs.iter().map(|d| content_scope(d).to_owned()).collect();
-            let ranked = crate::rank::rank(&intent, &refs, &scores, &scopes);
+            let ranked = crate::rank::rank(&intent, &refs, &scores, &scopes, today);
             let position: BTreeMap<&str, usize> = ranked
                 .iter()
                 .enumerate()
@@ -160,7 +166,7 @@ pub fn build_report_variant(
             } else {
                 row["rank"] = json!({
                     "authority_tier": crate::rank::authority_tier(&document, content_scope(&document)),
-                    "date": crate::rank::document_date(&document),
+                    "date": crate::rank::document_date(&document, today),
                 });
             }
             if full_text {
@@ -202,11 +208,9 @@ fn currentness(intent: &crate::rank::Intent, rows: &[Value]) -> Value {
         .take(NEWEST_DATED_WINDOW)
         .copied()
         .filter(|r| {
-            r["rank"]["bucket"].as_u64().unwrap_or(2) <= 2
-                && matches!(
-                    r["rank"]["date"]["kind"].as_str(),
-                    Some("published" | "modified")
-                )
+            r["rank"]["date"]["kind"]
+                .as_str()
+                .is_some_and(crate::rank::drives_recency)
         })
         .collect();
     dated.sort_by(|a, b| {
@@ -225,7 +229,7 @@ fn currentness(intent: &crate::rank::Intent, rows: &[Value]) -> Value {
         "intent": intent,
         "assessed_documents": selected
             .iter()
-            .filter(|r| r["rank"]["current"].as_object().is_some_and(|c| !c.is_empty()))
+            .filter(|r| r["rank"]["still_current"].is_number())
             .count(),
         "newest_dated_evidence": newest,
     })
@@ -348,8 +352,7 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
     for (url, i) in &first {
         order.swap(*i, best[url]);
     }
-    // When no official page makes the display, the best-ranked official page that is not
-    // superseded takes the last slot.
+    // When no official page makes the display, the best-ranked official page takes the last slot.
     if limit != 0 {
         let mut shown_urls = BTreeSet::new();
         let shown: Vec<usize> = (0..order.len())
@@ -359,9 +362,7 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
             })
             .take(limit)
             .collect();
-        let official = |r: &Value| {
-            r["rank"]["authority_tier"] == 1 && r["rank"]["bucket"].as_u64().unwrap_or(2) <= 2
-        };
+        let official = |r: &Value| r["rank"]["authority_tier"] == 1;
         if shown.len() == limit && !shown.iter().any(|&i| official(order[i])) {
             if let Some(pick) = (shown[limit - 1] + 1..order.len())
                 .find(|&i| official(order[i]) && !shown_urls.contains(&url_of(order[i])))
@@ -386,7 +387,9 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
             "probability":row["probability"],"excerpt":row["excerpt"],
             "text_bytes":row["text_bytes"],"text_path":row["text_path"],
             "content_scope":row["content_scope"],
-            "date":matches!(row["rank"]["date"]["kind"].as_str(), Some("published" | "modified")).then(|| &row["rank"]["date"]["date"]),
+            "date":row["rank"]["date"]["kind"].as_str().is_some_and(crate::rank::drives_recency).then(|| &row["rank"]["date"]["date"]),
+            "date_kind":row["rank"]["date"]["kind"].as_str().filter(|k| crate::rank::drives_recency(k)),
+            "still_current":row["rank"]["still_current"],
             "authority_tier":row["rank"]["authority_tier"],
             "same_url_others":url_counts.get(url).map(|n| n.saturating_sub(1)).unwrap_or(0),
         });
@@ -445,7 +448,7 @@ mod tests {
             signals_aggregation: "independent_max_per_signal_across_chunks".into(),
             best_chunk: [0, 0],
             usable_top2_mean: p,
-            current: BTreeMap::new(),
+            still_current: None,
         };
         write(
             "question.json",
@@ -632,7 +635,7 @@ mod tests {
             signals_aggregation: String::new(),
             best_chunk: [0, 0],
             usable_top2_mean: 0.3,
-            current: BTreeMap::new(),
+            still_current: None,
         };
         let (sa, sc) = (score("z"), score("a"));
         let scores = BTreeMap::from([("z", &sa), ("a", &sc)]);

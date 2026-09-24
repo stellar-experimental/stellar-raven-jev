@@ -54,13 +54,16 @@ pub trait Backend: Send + Sync {
         source: &Source,
         question: &str,
     ) -> Result<FetchResult>;
-    async fn score_document(
+    async fn score_document(&self, question: &str, document: &Document) -> Result<DocumentScore>;
+    async fn classify_intent(&self, question: &str) -> Result<BTreeMap<String, f64>>;
+    async fn assess_currentness(
         &self,
         question: &str,
         document: &Document,
-        currentness: bool,
-    ) -> Result<DocumentScore>;
-    async fn classify_intent(&self, question: &str) -> Result<BTreeMap<String, f64>>;
+        chunk: [usize; 2],
+        date: Option<(&str, &str)>,
+        today: &str,
+    ) -> Result<f64>;
     fn usage(&self) -> Usage;
 }
 
@@ -85,18 +88,23 @@ impl Backend for LiveBackend {
     ) -> Result<FetchResult> {
         connectors::fetch(ctx, source, question).await
     }
-    async fn score_document(
-        &self,
-        question: &str,
-        document: &Document,
-        currentness: bool,
-    ) -> Result<DocumentScore> {
-        self.jev
-            .score_document(question, document, currentness)
-            .await
+    async fn score_document(&self, question: &str, document: &Document) -> Result<DocumentScore> {
+        self.jev.score_document(question, document).await
     }
     async fn classify_intent(&self, question: &str) -> Result<BTreeMap<String, f64>> {
         self.jev.classify_intent(question).await
+    }
+    async fn assess_currentness(
+        &self,
+        question: &str,
+        document: &Document,
+        chunk: [usize; 2],
+        date: Option<(&str, &str)>,
+        today: &str,
+    ) -> Result<f64> {
+        self.jev
+            .assess_currentness(question, document, chunk, date, today)
+            .await
     }
     fn usage(&self) -> Usage {
         self.jev.usage()
@@ -104,6 +112,9 @@ impl Backend for LiveBackend {
 }
 
 pub fn validate_config(config: &RunConfig) -> Result<()> {
+    if crate::rank::iso_date_days(&config.today).is_none() {
+        bail!("--today must be a calendar date in YYYY-MM-DD form");
+    }
     if !config.budget_usd.is_finite() || config.budget_usd < 0.0 {
         bail!("--budget-usd must be finite and nonnegative");
     }
@@ -623,12 +634,9 @@ async fn execute(
         }
     }
     // Keep Jev budget and retry accounting inside JevClient. Do not cancel its paid requests externally.
-    let currentness = intent.asks_currentness();
     let scoring = stream::iter(to_score)
         .map(|document| async move {
-            let result = backend
-                .score_document(question, &document, currentness)
-                .await;
+            let result = backend.score_document(question, &document).await;
             (document, result)
         })
         .buffer_unordered(config.jev_concurrency);
@@ -688,6 +696,18 @@ async fn execute(
     evidence
         .timings
         .insert("score", run_started.elapsed().as_millis() as u64);
+    if intent.asks_currentness() {
+        let today = crate::rank::iso_date_days(&config.today).unwrap_or_default();
+        propagate_url_dates(&mut evidence, today);
+        if !config.fixture {
+            backfill_page_dates(&http, &mut evidence, today).await;
+            propagate_url_dates(&mut evidence, today);
+        }
+        assess_currentness(question, config, backend, &mut evidence, today).await;
+        evidence
+            .timings
+            .insert("currentness", run_started.elapsed().as_millis() as u64);
+    }
     evidence
         .scores
         .sort_by(|a, b| a.document_id.cmp(&b.document_id));
@@ -716,6 +736,184 @@ async fn execute(
 fn text_digest(text: &str) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+/// Selected documents judged for currentness, highest relevance first. Lower-ranked documents keep
+/// no judgment and take the middle position in that ranking list.
+const CURRENTNESS_DOCUMENTS: usize = 80;
+/// Selected pages whose HTML is read for page dates, and the time allowed for all of them.
+const PAGE_DATE_FETCHES: usize = 24;
+const PAGE_DATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A selected document without a date takes the newest date of any fetched document with the same
+/// URL. Different sources index the same page; one of them may carry its date.
+fn propagate_url_dates(evidence: &mut Evidence, today: i64) {
+    let recency_date = |d: &Document| {
+        crate::rank::document_date(d, today).filter(|x| crate::rank::drives_recency(x.kind))
+    };
+    let mut by_url: BTreeMap<String, crate::rank::DocDate> = BTreeMap::new();
+    for document in evidence
+        .selected
+        .iter()
+        .chain(&evidence.uncertain)
+        .chain(&evidence.rejected)
+    {
+        if document.url.is_empty() {
+            continue;
+        }
+        if let Some(date) = recency_date(document) {
+            let newer = by_url
+                .get(&document.url)
+                .is_none_or(|known| date.days > known.days);
+            if newer {
+                by_url.insert(document.url.clone(), date);
+            }
+        }
+    }
+    for document in &mut evidence.selected {
+        if recency_date(document).is_some() {
+            continue;
+        }
+        if let Some(date) = by_url.get(&document.url) {
+            document.provenance["url_date"] = json!({"date": date.date, "kind": date.kind});
+        }
+    }
+}
+
+/// Developer-docs and site pages are scored from their Markdown or index text, which carries no
+/// date; the HTML page states it in machine-readable metadata. Read that metadata for selected
+/// canonical pages that are still undated, within a small request and time budget.
+async fn backfill_page_dates(http: &HttpRecorder, evidence: &mut Evidence, today: i64) {
+    let targets: Vec<usize> = evidence
+        .selected
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| {
+            d.source_id.starts_with("algolia:")
+                && connectors::algolia::is_canonical_page(&d.url)
+                && !crate::rank::document_date(d, today)
+                    .is_some_and(|x| crate::rank::drives_recency(x.kind))
+        })
+        .map(|(i, _)| i)
+        .take(PAGE_DATE_FETCHES)
+        .collect();
+    let fetches = targets.iter().map(|&i| {
+        let url = evidence.selected[i].url.clone();
+        async move {
+            let response = tokio::time::timeout(
+                PAGE_DATE_DEADLINE,
+                http.request(reqwest::Method::GET, &url, vec![], None),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            (response.status == 200)
+                .then(|| crate::rank::html_page_dates(&String::from_utf8_lossy(&response.body)))
+                .map(|dates| (i, dates))
+        }
+    });
+    // Each fetch has its own time limit, so one slow page never discards the others.
+    for (i, (modified, published)) in futures::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+    {
+        if modified.is_some() || published.is_some() {
+            evidence.selected[i].provenance["page_dates"] =
+                json!({"modified": modified, "published": published});
+        }
+    }
+}
+
+/// Ask Jev, for each selected document, whether its best chunk likely still holds today given the
+/// document's date. Relevance and selection are already final; this only informs the order.
+/// Identical inputs (same title, chunk, and date) are asked once and the answer is copied.
+async fn assess_currentness(
+    question: &str,
+    config: &RunConfig,
+    backend: &dyn Backend,
+    evidence: &mut Evidence,
+    today: i64,
+) {
+    let scores: BTreeMap<String, (f64, [usize; 2])> = evidence
+        .scores
+        .iter()
+        .map(|s| (s.document_id.clone(), (s.usable_top2_mean, s.best_chunk)))
+        .collect();
+    let mut targets: Vec<&Document> = evidence
+        .selected
+        .iter()
+        .filter(|d| scores.contains_key(&d.id))
+        .collect();
+    targets.sort_by(|a, b| {
+        scores[&b.id]
+            .0
+            .total_cmp(&scores[&a.id].0)
+            .then(a.id.cmp(&b.id))
+    });
+    // Group identical inputs, keeping the order of their first member.
+    type Group<'a> = (&'a Document, Option<crate::rank::DocDate>, Vec<String>);
+    let mut groups: Vec<Group> = Vec::new();
+    let mut by_input: BTreeMap<(String, String, Option<String>), usize> = BTreeMap::new();
+    for document in targets {
+        let [start, end] = scores[&document.id].1;
+        let chunk = document.text.get(start..end).unwrap_or(&document.text);
+        let date = crate::rank::document_date(document, today);
+        let key = (
+            document.title.clone(),
+            text_digest(chunk),
+            date.as_ref().map(|d| format!("{} {}", d.date, d.kind)),
+        );
+        match by_input.get(&key) {
+            Some(&g) => groups[g].2.push(document.id.clone()),
+            None if groups.len() < CURRENTNESS_DOCUMENTS => {
+                by_input.insert(key, groups.len());
+                groups.push((document, date, vec![document.id.clone()]));
+            }
+            None => {}
+        }
+    }
+    let today_text = config.today.as_str();
+    let results: Vec<(Vec<String>, Result<f64>)> = stream::iter(groups)
+        .map(|(document, date, ids)| {
+            let chunk = scores[&document.id].1;
+            async move {
+                let date = date.as_ref().map(|d| (d.date.as_str(), d.kind));
+                let result = backend
+                    .assess_currentness(question, document, chunk, date, today_text)
+                    .await;
+                (ids, result)
+            }
+        })
+        .buffer_unordered(config.jev_concurrency)
+        .collect()
+        .await;
+    let mut judged: BTreeMap<String, f64> = BTreeMap::new();
+    for (ids, result) in results {
+        match result {
+            Ok(value) if value.is_finite() && (0.0..=1.0).contains(&value) => {
+                for id in ids {
+                    judged.insert(id, value);
+                }
+            }
+            Ok(_) => evidence.failures.push(failure(
+                "currentness",
+                None,
+                format!(
+                    "{}: Jev returned an invalid currentness probability",
+                    ids[0]
+                ),
+            )),
+            Err(error) => {
+                evidence
+                    .failures
+                    .push(failure("currentness", None, format!("{}: {error}", ids[0])))
+            }
+        }
+    }
+    for score in &mut evidence.scores {
+        score.still_current = judged.get(&score.document_id).copied();
+    }
 }
 
 fn classify(evidence: &mut Evidence, config: &RunConfig, document: Document, score: DocumentScore) {
@@ -775,6 +973,7 @@ mod tests {
         fetched: Mutex<Vec<String>>,
         observed_caps: Mutex<Vec<usize>>,
         scored: AtomicUsize,
+        assessed: AtomicUsize,
         fail_fetch: bool,
         fail_score: bool,
         fail_route: bool,
@@ -877,12 +1076,7 @@ mod tests {
             }
             Ok(result)
         }
-        async fn score_document(
-            &self,
-            _: &str,
-            document: &Document,
-            currentness: bool,
-        ) -> Result<DocumentScore> {
+        async fn score_document(&self, _: &str, document: &Document) -> Result<DocumentScore> {
             self.scored.fetch_add(1, Ordering::SeqCst);
             if self.fail_score {
                 bail!("actual scoring failure");
@@ -895,12 +1089,19 @@ mod tests {
                 signals_aggregation: Default::default(),
                 best_chunk: [0, document.text.len()],
                 usable_top2_mean: 0.8,
-                current: if currentness {
-                    BTreeMap::from([("live".into(), 0.9), ("dated".into(), 0.5)])
-                } else {
-                    BTreeMap::new()
-                },
+                still_current: None,
             })
+        }
+        async fn assess_currentness(
+            &self,
+            _: &str,
+            _: &Document,
+            _: [usize; 2],
+            _: Option<(&str, &str)>,
+            _: &str,
+        ) -> Result<f64> {
+            self.assessed.fetch_add(1, Ordering::SeqCst);
+            Ok(0.9)
         }
         async fn classify_intent(&self, _: &str) -> Result<BTreeMap<String, f64>> {
             Ok(BTreeMap::from([
@@ -918,6 +1119,7 @@ mod tests {
             fetched: Mutex::new(vec![]),
             observed_caps: Mutex::new(vec![]),
             scored: AtomicUsize::new(0),
+            assessed: AtomicUsize::new(0),
             fail_fetch: false,
             fail_score: false,
             fail_route: false,
@@ -1174,6 +1376,9 @@ mod tests {
         assert_eq!(copied.probability, 0.8);
         assert!(copied.reason.contains("a::same-id"));
         assert_eq!(copied.document_id, "b::same-id");
+        // The current intent asks currentness once for the identical pair and copies the answer.
+        assert_eq!(backend.assessed.load(Ordering::SeqCst), 1);
+        assert!(scores.iter().all(|s| s.still_current == Some(0.9)));
     }
     #[tokio::test]
     async fn same_url_with_different_title_or_text_is_scored_separately() {

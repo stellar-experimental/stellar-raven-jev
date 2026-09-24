@@ -32,6 +32,28 @@ struct RequestLimits {
     counters: Mutex<(u64, u64)>,
 }
 
+/// What a request does once it holds its concurrency permit.
+#[derive(Clone, Copy)]
+pub enum SendGate<'a> {
+    Open,
+    /// Notify the caller that the request is about to be sent.
+    NotifySent(&'a tokio::sync::Notify),
+    /// Do not send if the flag is set; the request then fails with `NotSent`.
+    SkipIf(&'a std::sync::atomic::AtomicBool),
+}
+
+/// The request was stopped before anything was sent.
+#[derive(Debug)]
+pub struct NotSent;
+
+impl std::fmt::Display for NotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The request was stopped before it was sent")
+    }
+}
+
+impl std::error::Error for NotSent {}
+
 #[derive(Clone, Debug)]
 pub struct HttpResponse {
     pub status: u16,
@@ -264,23 +286,23 @@ impl HttpRecorder {
         headers: Vec<(String, String)>,
         body: Option<Value>,
     ) -> Result<HttpResponse> {
-        self.request_recorded(method, url, headers, body, true, None)
+        self.request_recorded(method, url, headers, body, true, SendGate::Open)
             .await
     }
 
     /// For a caller that saves the exact request body in its own audit record (the Jev trace).
     /// The metadata keeps the body's SHA-256 and size, so the one full copy stays verifiable.
-    /// `sent`, when given, is notified once the request holds its concurrency permit, so a caller
-    /// can time the request itself and not its queue wait.
+    /// `gate` acts once the request holds its concurrency permit: it can notify the caller, so the
+    /// caller times the request and not its queue wait, or stop the request before it is sent.
     pub async fn request_body_recorded_elsewhere(
         &self,
         method: Method,
         url: &str,
         headers: Vec<(String, String)>,
         body: Option<Value>,
-        sent: Option<&tokio::sync::Notify>,
+        gate: SendGate<'_>,
     ) -> Result<HttpResponse> {
-        self.request_recorded(method, url, headers, body, false, sent)
+        self.request_recorded(method, url, headers, body, false, gate)
             .await
     }
 
@@ -291,7 +313,7 @@ impl HttpRecorder {
         headers: Vec<(String, String)>,
         body: Option<Value>,
         record_body: bool,
-        sent: Option<&tokio::sync::Notify>,
+        gate: SendGate<'_>,
     ) -> Result<HttpResponse> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let prefix = format!("raw/{sequence:06}");
@@ -358,8 +380,14 @@ impl HttpRecorder {
                 write_metadata(&metadata_path, &record.metadata)?;
             }
             let _permit = self.semaphore.acquire().await?;
-            if let Some(sent) = sent {
-                sent.notify_one();
+            match gate {
+                SendGate::Open => {}
+                SendGate::NotifySent(sent) => sent.notify_one(),
+                SendGate::SkipIf(stop) => {
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(NotSent.into());
+                    }
+                }
             }
             // Wall-clock start after the permit, so timelines separate queue wait from transfer.
             record.metadata["queued_ms"] = json!(started.elapsed().as_millis() as u64);
