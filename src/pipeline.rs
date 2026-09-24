@@ -21,6 +21,8 @@ pub struct RunOutcome {
     pub uncertain: usize,
     pub failures: usize,
     pub usage: Usage,
+    /// For a `busy` run: how long until the host expects room for this question.
+    pub retry_after_ms: Option<u64>,
 }
 
 #[derive(Default, Serialize)]
@@ -36,6 +38,11 @@ struct Evidence {
     failures: Vec<Failure>,
     /// The question time intent. See `rank`.
     intent: serde_json::Value,
+    /// Source load counters from the HTTP recorder. See `HttpRecorder::load_summary`.
+    load: serde_json::Value,
+    /// Set when the question found no room in a source's request window in time.
+    #[serde(skip)]
+    retry_after_ms: Option<u64>,
     #[serde(skip)]
     timings: BTreeMap<&'static str, u64>,
 }
@@ -229,6 +236,7 @@ fn persist(
         uncertain: evidence.uncertain.len(),
         failures: evidence.failures.len(),
         usage: usage.clone(),
+        retry_after_ms: evidence.retry_after_ms,
     };
     // A light record keeps no mid-run checkpoints; the final write feeds the report.
     if status == "running" && !config.full_record {
@@ -252,6 +260,7 @@ fn persist(
     write_json(root.join("failures.json"), &evidence.failures)?;
     write_json(root.join("usage.json"), usage)?;
     write_json(root.join("intent.json"), &evidence.intent)?;
+    write_json(root.join("load.json"), &evidence.load)?;
     let artifacts = collect_artifacts(root)?;
     write_json(
         root.join("manifest.json"),
@@ -340,6 +349,11 @@ pub async fn run_question_scoped(
     scope: connectors::SourceScope,
 ) -> Result<RunOutcome> {
     let (config, http) = prepare(question, config)?;
+    let governor = match &config.host_dir {
+        Some(dir) => crate::governor::Governor::at(dir)?,
+        None => crate::governor::Governor::local(),
+    };
+    let http = http.with_source_gates(std::sync::Arc::new(governor));
     let registry = connectors::sources();
     let sources: Vec<_> = registry
         .iter()
@@ -488,6 +502,35 @@ async fn execute(
     evidence
         .timings
         .insert("route", run_started.elapsed().as_millis() as u64);
+    // Book the first request of every selected source in any window its source advertises, so
+    // the question waits for room instead of losing sources to a refusal mid-fetch. Without room
+    // in about one window, the question is refused as busy: only routing was spent.
+    let demands = connectors::first_requests(
+        sources
+            .iter()
+            .filter(|source| selected.contains(&source.id)),
+    );
+    match http.book_windows(&demands).await {
+        Ok(None) => {}
+        Ok(Some(wait)) => {
+            evidence.failures.push(failure(
+                "admission",
+                None,
+                format!(
+                    "No room in a source's request window within the booking limit; retry in {} ms",
+                    wait.as_millis()
+                ),
+            ));
+            evidence.retry_after_ms = Some(wait.as_millis() as u64);
+            evidence.load = http.load_summary();
+            return persist(config, &evidence, &backend.usage(), "busy");
+        }
+        Err(error) => {
+            evidence
+                .failures
+                .push(failure("host_state", None, error.to_string()));
+        }
+    }
     let jobs = stream::iter(
         sources
             .iter()
@@ -507,7 +550,9 @@ async fn execute(
             )
         }
     })
-    .buffer_unordered(config.concurrency);
+    .buffer_unordered(selected.len().max(1));
+    // Every selected connector starts at once; the recorder bounds requests per host, so a slow
+    // host cannot delay the connectors of other hosts.
     // Heap-pinned so the stream, and every in-flight connector with its HTTP permit, can be dropped early.
     let mut jobs = Box::pin(jobs);
     let mut fetched = Vec::new();
@@ -737,6 +782,7 @@ async fn execute(
     ] {
         docs.sort_by(|a, b| a.id.cmp(&b.id));
     }
+    evidence.load = http.load_summary();
     let status = if evidence.failures.is_empty() {
         "complete"
     } else {

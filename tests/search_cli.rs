@@ -7,8 +7,52 @@ fn cli() -> Command {
     command
         .env_remove("JEV_ENV_FILE")
         .env_remove("JEV_BUDGET_USD")
-        .env_remove("JEV_OUTPUT_DIR");
+        .env_remove("JEV_OUTPUT_DIR")
+        .env_remove("JEV_MAX_SEARCHES")
+        .env_remove("JEV_PROVIDER_RPM");
     command
+}
+
+#[test]
+fn a_busy_host_refuses_before_any_run_and_frees_the_slot_on_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = temp.path().join(".host");
+    std::fs::create_dir_all(&host).unwrap();
+    let slot = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(host.join("slot-0.lock"))
+        .unwrap();
+    slot.lock().unwrap();
+    let run = || {
+        cli()
+            .args(["--fixture", "--output-dir"])
+            .arg(temp.path())
+            .args(["--max-searches", "1", "--admission-wait-secs", "0"])
+            .args([
+                "search",
+                "How does the fictional Quillon ledger batch its receipts?",
+                "--limit",
+                "1",
+            ])
+            .output()
+            .unwrap()
+    };
+    let refused = run();
+    assert_eq!(refused.status.code(), Some(3));
+    let busy: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(busy["status"], "busy");
+    assert!(busy["retry_after_ms"].as_u64().unwrap() > 0);
+    // Nothing ran: the output directory holds only the host state folder.
+    let entries: Vec<_> = std::fs::read_dir(temp.path()).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    drop(slot);
+    let admitted = run();
+    assert!(matches!(admitted.status.code(), Some(0 | 2)));
+    let compact: Value = serde_json::from_slice(&admitted.stdout).unwrap();
+    assert_eq!(compact["load"]["admission_wait_ms"], 0);
+    assert_eq!(compact["load"]["degraded"], false);
 }
 
 #[test]

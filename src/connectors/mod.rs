@@ -50,6 +50,22 @@ pub fn sources() -> Vec<Source> {
     result
 }
 
+/// The first request of each source, counted per request scope, so a question can book them in
+/// any window the source advertises before it sends them.
+pub fn first_requests<'a>(sources: impl IntoIterator<Item = &'a Source>) -> Vec<(String, u64)> {
+    let mut demands = std::collections::BTreeMap::<String, u64>::new();
+    for source in sources {
+        let scope = match source.family.as_str() {
+            "stellarlight" => stellarlight::first_request_scope(source),
+            _ => None,
+        };
+        if let Some(scope) = scope {
+            *demands.entry(scope).or_default() += 1;
+        }
+    }
+    demands.into_iter().collect()
+}
+
 pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Result<FetchResult> {
     match source.family.as_str() {
         "lumenloop" => lumenloop::fetch(ctx, source, question).await,

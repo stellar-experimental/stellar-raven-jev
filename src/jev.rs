@@ -95,8 +95,9 @@ struct Ledger {
     unresolved_stop_after: u32,
 }
 
-/// Waits of one call when no provider is usable, and the bounds on the provider's Retry-After.
-const RATE_LIMIT_RETRIES: u32 = 3;
+/// Longest total wait of one call when no provider is usable or has send budget, and the default
+/// cooldown when a provider's refusal carries no Retry-After.
+const PROVIDER_WAIT_LIMIT: Duration = Duration::from_secs(120);
 const RATE_LIMIT_DEFAULT_WAIT_SECS: u64 = 30;
 const RATE_LIMIT_MAX_WAIT_SECS: u64 = 90;
 /// Sends of one attempt across all providers, refusals and waits included.
@@ -130,13 +131,12 @@ struct Call<'a> {
     first_provider: std::sync::atomic::AtomicUsize,
 }
 
-/// A provider's standing for the rest of the run.
+/// A provider's standing for the rest of the run. Cooldowns and send budgets live in the host
+/// governor, which every search on the host shares.
 #[derive(Clone, Copy, Default)]
 struct ProviderState {
     /// Rejected the credentials (401 or 403): never used again in this run.
     disabled: bool,
-    /// Rate limited or refused payment: skipped until then.
-    cooling_until: Option<std::time::Instant>,
 }
 
 struct Attempted {
@@ -190,6 +190,10 @@ pub struct JevClient {
     fallbacks: Vec<Backend>,
     /// One entry per provider in chain order.
     providers: Mutex<Vec<ProviderState>>,
+    /// Host-wide send budgets and cooldowns per provider.
+    governor: crate::governor::Governor,
+    /// Per-provider send rates from `JEV_PROVIDER_RPM`.
+    rpm_overrides: BTreeMap<String, f64>,
     ledger: Mutex<Ledger>,
     /// Wakes reservations that wait for in-flight attempts to settle or stop.
     settled: tokio::sync::Notify,
@@ -248,6 +252,11 @@ impl JevClient {
         let client = Self {
             http: http.clone(),
             providers: Mutex::new(vec![ProviderState::default(); 1 + fallbacks.len()]),
+            governor: match &config.host_dir {
+                Some(dir) => crate::governor::Governor::at(dir)?,
+                None => crate::governor::Governor::local(),
+            },
+            rpm_overrides: rpm_overrides(env_value("JEV_PROVIDER_RPM"))?,
             backend,
             fallbacks,
             audit_dir,
@@ -276,8 +285,8 @@ impl JevClient {
             "reservation_input_tokens_per_request": MAX_INPUT_TOKENS,
             "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and each provider's credit purchase overhead; reservations use the highest provider price",
             "retry_policy": "each provider runs a request once (Cloudflare: cf-aig-max-attempts: 1); the client sends again only after a response that means the request was not run (429, 529, 402, 401, 403), per rate_limit_policy and provider_chain_policy, at most 8 sends per attempt",
-            "rate_limit_policy": "HTTP 429 or 529 releases the reservation, because the provider did not run the request, and cools that provider for Retry-After (1 to 90 s); the call moves to the next available provider at once and waits only when none is available, up to 3 waits; a hedge does not wait",
-            "provider_chain_policy": "providers are tried in chain order; 401 or 403 disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
+            "rate_limit_policy": "HTTP 429 or 529 releases the reservation, because the provider did not run the request, and cools that provider for every search on the host for Retry-After (1 to 90 s); the call moves to the next available provider at once; a hedge does not wait",
+            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
             "hedge_policy": "a call unanswered jev_hedge_ms after its request is sent gets one identical hedge request when the budget has room without waiting; the first valid answer wins, so a failed attempt lets the other decide; the cancelled request is charged the winner's input tokens",
             "unresolved_usage_policy": "retain the full reservation of any attempt without a valid usage receipt; no automatic retry; stop new reservations after 3 consecutive unresolved attempts",
             "token_guard": "UTF-8 byte limits are local guards, not a verified provider tokenizer",
@@ -624,48 +633,41 @@ impl JevClient {
             .try_fold(0u64, |max, r| r.map(|r| max.max(r)))
     }
 
-    /// The first usable provider in chain order, preferring one other than `avoid`.
-    fn pick_provider(&self, avoid: Option<usize>) -> Option<usize> {
-        let now = std::time::Instant::now();
-        let states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
-        let usable: Vec<usize> = (0..states.len())
-            .filter(|&i| !states[i].disabled && states[i].cooling_until.is_none_or(|t| t <= now))
+    /// The provider's identity and send rate for the host governor.
+    fn budget(&self, provider: usize) -> crate::governor::ProviderBudget {
+        provider_budget(self.chain()[provider], &self.rpm_overrides)
+    }
+
+    /// The first provider in chain order that is enabled, not cooling, and has host send budget,
+    /// preferring one other than `avoid`. Nothing is spent until the send.
+    fn pick_provider(&self, avoid: Option<usize>) -> Result<crate::governor::Send> {
+        let usable: Vec<bool> = self
+            .providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|s| !s.disabled)
             .collect();
-        usable
-            .iter()
-            .copied()
-            .find(|&i| Some(i) != avoid)
-            .or_else(|| usable.first().copied())
+        let budgets: Vec<_> = (0..usable.len()).map(|i| self.budget(i)).collect();
+        self.governor.choose(&budgets, &usable, avoid)
     }
 
-    /// How long until some provider leaves its cooldown, or `None` when every one is disabled.
-    fn soonest_provider(&self) -> Option<Duration> {
-        let now = std::time::Instant::now();
-        let states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
-        states
-            .iter()
-            .filter(|s| !s.disabled)
-            .map(|s| {
-                s.cooling_until
-                    .map_or(Duration::ZERO, |t| t.saturating_duration_since(now))
-            })
-            .min()
+    /// Cool a provider for every search on the host. A shorter Retry-After never cuts an existing
+    /// cooldown short.
+    fn cool_provider(&self, provider: usize, wait: Duration) -> Result<()> {
+        self.governor.cool(&self.budget(provider), wait)
     }
 
-    /// Cool a provider. A shorter Retry-After never cuts an existing cooldown short.
-    fn cool_provider(&self, provider: usize, wait: Duration) {
-        let mut states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
-        let until = std::time::Instant::now() + wait;
-        let state = &mut states[provider];
-        state.cooling_until = Some(state.cooling_until.map_or(until, |t| t.max(until)));
-    }
-
-    fn provider_usable(&self, provider: usize) -> bool {
-        let states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
-        !states[provider].disabled
-            && states[provider]
-                .cooling_until
-                .is_none_or(|t| t <= std::time::Instant::now())
+    /// At the moment of sending: whether the provider is still enabled and not cooling, spending
+    /// one send of its host budget when it is. A request that holds an HTTP permit therefore sends
+    /// only within the budget and never into a cooldown another search just started.
+    fn send_now(&self, provider: usize) -> bool {
+        let disabled = self.providers.lock().unwrap_or_else(|e| e.into_inner())[provider].disabled;
+        !disabled
+            && self
+                .governor
+                .consume(&self.budget(provider))
+                .unwrap_or(false)
     }
 
     /// Disable a provider whose credentials were rejected.
@@ -1064,13 +1066,14 @@ impl JevClient {
     /// attempt (`attempt > 0`) never waits for budget room.
     async fn attempt(&self, call: &Call<'_>, attempt: u32) -> Result<Attempted> {
         let (expected, context) = (call.expected, call.context);
-        let mut rate_limit_retries = 0u32;
+        let mut wait_deadline: Option<std::time::Instant> = None;
         let mut tries = 0u32;
+        let mut refusals = 0u32;
         loop {
             // Every refusal moves a provider to cooling or disabled, but responses can outlast
-            // short cooldowns, so the number of sends per attempt has its own bound.
+            // short cooldowns, so the number of refused sends per attempt has its own bound.
             ensure!(
-                tries < MAX_SENDS_PER_ATTEMPT,
+                refusals < MAX_SENDS_PER_ATTEMPT,
                 "Jev providers kept refusing the call"
             );
             // The first usable provider; a hedge prefers one the first attempt is not using.
@@ -1080,21 +1083,34 @@ impl JevClient {
                         .load(std::sync::atomic::Ordering::SeqCst)
                 })
                 .filter(|&p| p != usize::MAX);
-            let provider = match self.pick_provider(avoid) {
-                Some(provider) => provider,
-                None => {
-                    let Some(wait) = self.soonest_provider() else {
-                        bail!("Every Jev provider rejected its credentials");
-                    };
-                    if attempt > 0 || rate_limit_retries >= RATE_LIMIT_RETRIES {
-                        bail!("Every Jev provider is rate limited or refusing payment");
+            let provider = match self.pick_provider(avoid)? {
+                crate::governor::Send::Go(provider) => provider,
+                crate::governor::Send::None => {
+                    bail!("Every Jev provider rejected its credentials")
+                }
+                crate::governor::Send::Wait(wait) => {
+                    // Every usable provider is cooling or out of host send budget. A hedge would
+                    // only add load, so it gives up; the first attempt waits, within a bound.
+                    let deadline = *wait_deadline
+                        .get_or_insert_with(|| std::time::Instant::now() + PROVIDER_WAIT_LIMIT);
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if attempt > 0 || remaining.is_zero() {
+                        bail!("Every Jev provider is rate limited or out of send budget");
                     }
                     if attempt == 0 {
                         call.rate_limited
                             .store(true, std::sync::atomic::Ordering::SeqCst);
                     }
-                    rate_limit_retries += 1;
-                    tokio::time::sleep(self.rate_limit_wait.unwrap_or(wait)).await;
+                    let wait = self
+                        .rate_limit_wait
+                        .map_or(wait, |w| w.min(wait))
+                        .min(remaining);
+                    self.ledger
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .usage
+                        .provider_wait_ms += wait.as_millis() as u64;
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
             };
@@ -1104,11 +1120,11 @@ impl JevClient {
             }
             let backend = self.chain()[provider];
             let (url, headers, body) = request_parts(backend, call.state, call.questions)?;
-            // Checked again once the request holds its permit: the provider may have been cooled
-            // or disabled by another call while this one waited.
+            // Decided once the request holds its permit: the provider may have been cooled,
+            // disabled, or spent by another call while this one waited.
             let stop = || {
                 (attempt > 0 && call.rate_limited.load(std::sync::atomic::Ordering::SeqCst))
-                    || !self.provider_usable(provider)
+                    || !self.send_now(provider)
             };
             let reservation = if attempt == 0 {
                 self.reserve_waiting().await?
@@ -1199,7 +1215,8 @@ impl JevClient {
             let others = self.other_providers(provider);
             if matches!(response.status, 429 | 529) || (response.status == 402 && others) {
                 self.release_unrun(reservation, attempt > 0, response.status != 402);
-                self.cool_provider(provider, wait);
+                refusals += 1;
+                self.cool_provider(provider, wait)?;
                 trace["state"] = json!("rate_limited");
                 trace["accounting"] =
                     json!("Reservation released; the provider did not run the request.");
@@ -1209,6 +1226,7 @@ impl JevClient {
             }
             // Rejected credentials disable only this provider while another remains.
             if matches!(response.status, 401 | 403) && others {
+                refusals += 1;
                 self.disable_provider(provider);
                 self.release_unrun(reservation, attempt > 0, false);
                 trace["state"] = json!("provider_disabled");
@@ -1500,6 +1518,74 @@ fn providers_from_env() -> Result<Vec<Backend>> {
 
 /// Provider names in their default chain order.
 const PROVIDERS: [&str; 3] = ["cloudflare", "typesafe", "openrouter"];
+
+/// Requests per minute each provider may receive from this host, below the rate where it starts
+/// refusing: the Cloudflare gateway refuses past about 1,100 in a rolling minute and then for
+/// about a minute; TypeSafe and OpenRouter each accept several thousand, and TypeSafe also limits
+/// tokens per second, which scoring calls (about 3,400 tokens) reach near 4,400 per minute.
+fn default_rpm(backend: &Backend) -> f64 {
+    match backend {
+        Backend::Cloudflare { .. } => 900.0,
+        Backend::TypeSafe { .. } | Backend::OpenRouter { .. } => 3_600.0,
+        #[cfg(test)]
+        Backend::Loopback { .. } => 60_000.0,
+        Backend::Fixture => 60_000.0,
+    }
+}
+
+/// `JEV_PROVIDER_RPM` (for example `typesafe=3000,cloudflare=600`) replaces defaults. A malformed
+/// value or an unknown provider name is an error, never ignored.
+fn rpm_overrides(value: Option<String>) -> Result<BTreeMap<String, f64>> {
+    let mut overrides = BTreeMap::new();
+    for pair in value.iter().flat_map(|v| v.split(',')).map(str::trim) {
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, rpm) = pair
+            .split_once('=')
+            .with_context(|| format!("JEV_PROVIDER_RPM entry {pair:?} is not NAME=NUMBER"))?;
+        let name = name.trim();
+        ensure!(
+            PROVIDERS.contains(&name),
+            "JEV_PROVIDER_RPM names an unknown provider {name:?}"
+        );
+        let rpm: f64 = rpm
+            .trim()
+            .parse()
+            .ok()
+            .filter(|v: &f64| v.is_finite() && *v > 0.0)
+            .with_context(|| format!("JEV_PROVIDER_RPM for {name} must be a positive number"))?;
+        overrides.insert(name.to_owned(), rpm);
+    }
+    Ok(overrides)
+}
+
+/// The provider's host budget identity and rate. The key is the provider name plus a digest of the
+/// account and gateway, or of the key, so separate credentials keep separate budgets.
+fn provider_budget(
+    backend: &Backend,
+    overrides: &BTreeMap<String, f64>,
+) -> crate::governor::ProviderBudget {
+    use sha2::{Digest, Sha256};
+    let identity = match backend {
+        Backend::Cloudflare {
+            account, gateway, ..
+        } => format!("{account}/{gateway}"),
+        Backend::TypeSafe { key } | Backend::OpenRouter { key } => key.clone(),
+        #[cfg(test)]
+        Backend::Loopback { url, .. } => url.clone(),
+        Backend::Fixture => String::new(),
+    };
+    let name = backend.name();
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    crate::governor::ProviderBudget {
+        key: format!("{name}:{}", &digest[..12]),
+        per_minute: overrides
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| default_rpm(backend)),
+    }
+}
 
 /// The provider chain. `JEV_PROVIDERS` (comma-separated) sets the order and must name only
 /// configured providers; without it, every configured provider is used in the default order.
@@ -3019,6 +3105,23 @@ mod tests {
     }
 
     #[test]
+    fn provider_rate_overrides_are_strict() {
+        let parsed = rpm_overrides(Some("typesafe=3000, cloudflare=600".into())).unwrap();
+        assert_eq!(parsed["typesafe"], 3000.0);
+        assert_eq!(parsed["cloudflare"], 600.0);
+        assert!(rpm_overrides(None).unwrap().is_empty());
+        for bad in [
+            "typesafe",
+            "typesafe=fast",
+            "typesafe=0",
+            "example=10",
+            "typesafe=-5",
+        ] {
+            assert!(rpm_overrides(Some(bad.into())).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |key: &str| {
@@ -3158,7 +3261,7 @@ mod tests {
         b.await.unwrap();
         let usage = client.usage();
         assert_eq!((usage.requests, usage.rate_limited_requests), (1, 0));
-        assert!(client.providers.lock().unwrap()[0].cooling_until.is_some());
+        assert!(!client.send_now(0));
         assert!(client.spending_stop_reason().is_none());
     }
 

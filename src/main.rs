@@ -64,6 +64,19 @@ struct Cli {
     document_threshold: f64,
     #[arg(long, global = true, hide = true, default_value_t = 0.15)]
     uncertain_threshold: f64,
+    /// Searches that may run at once on this host, across processes that share the output
+    /// directory. Also accepts JEV_MAX_SEARCHES.
+    #[arg(
+        long,
+        global = true,
+        hide = true,
+        env = "JEV_MAX_SEARCHES",
+        default_value_t = 6
+    )]
+    max_searches: usize,
+    /// How long a search waits for a free slot before it reports `busy`.
+    #[arg(long, global = true, hide = true, default_value_t = 60)]
+    admission_wait_secs: u64,
 }
 
 #[derive(Subcommand)]
@@ -112,6 +125,9 @@ enum Command {
     /// Check local settings and authentication presence without network requests.
     Doctor,
 }
+
+/// A refused search is told to retry after about this long.
+const BUSY_RETRY_AFTER_MS: u64 = 10_000;
 
 /// Compact JSON by default; the full ranked report with --json.
 fn print_report(report: &serde_json::Value, json: bool, limit: usize) -> Result<()> {
@@ -289,6 +305,7 @@ async fn main() -> Result<()> {
         document_threshold: cli.document_threshold,
         uncertain_threshold: cli.uncertain_threshold,
         full_record: true,
+        host_dir: None,
     };
     validate_config(&config)?;
     match cli.command {
@@ -310,11 +327,48 @@ async fn main() -> Result<()> {
             full_record,
         } => {
             config.full_record = full_record;
+            // Searches that share an output directory share one host state folder: admission
+            // slots, Jev provider budgets and cooldowns, and source rate-limit gates.
+            let host_dir = config.output_dir.join(".host");
+            let governor = stellar_raven_jev::governor::Governor::at(&host_dir)?;
+            let Some(admission) = governor
+                .admit(
+                    cli.max_searches,
+                    std::time::Duration::from_secs(cli.admission_wait_secs),
+                )
+                .await?
+            else {
+                // Refused before any source or Jev request, so nothing was spent.
+                println!(
+                    "{}",
+                    json!({"schema_version":1,"compact":true,"question":question,"status":"busy",
+                        "retry_after_ms":BUSY_RETRY_AFTER_MS,"load":{"admission_wait_ms":cli.admission_wait_secs * 1000,"max_searches":cli.max_searches},
+                        "message":"This host is already running its maximum number of searches. Nothing was spent. Retry later."})
+                );
+                std::process::exit(3);
+            };
+            config.host_dir = Some(host_dir);
             let outcome =
                 stellar_raven_jev::pipeline::run_question_scoped(&question, &config, resources)
                     .await?;
-            let report =
+            let mut report =
                 stellar_raven_jev::search::build_report_variant(&outcome, full_text, None)?;
+            report["load"]["admission_wait_ms"] = json!(admission.waited_ms);
+            drop(admission);
+            if outcome.status == "busy" {
+                // Routing ran, but the question found no room in a source's request window.
+                println!(
+                    "{}",
+                    json!({"schema_version":1,"compact":true,"question":question,"status":"busy",
+                        "retry_after_ms":outcome.retry_after_ms.unwrap_or(BUSY_RETRY_AFTER_MS),
+                        "usage":outcome.usage,"load":report["load"],
+                        "message":"A source this question needs has no request capacity left now. Only routing was spent. Retry after retry_after_ms."})
+                );
+                if !full_record {
+                    let _ = stellar_raven_jev::pipeline::keep_report_only(&outcome.directory);
+                }
+                std::process::exit(3);
+            }
             print_report(&report, json, limit)?;
             // Clean up after printing, so a cleanup error never loses a paid result.
             if !full_record {

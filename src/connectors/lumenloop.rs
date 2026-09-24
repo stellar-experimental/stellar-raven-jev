@@ -67,6 +67,18 @@ struct ReadError {
     message: String,
     stop: bool,
     artifact: Option<String>,
+    /// The tool answered with a message instead of records: an answer, not a failed request.
+    notice: bool,
+}
+
+impl ReadError {
+    fn stage(&self) -> &'static str {
+        if self.notice {
+            "search_message"
+        } else {
+            "search"
+        }
+    }
 }
 
 fn decode(status: u16, value: Value, artifact: &str) -> std::result::Result<Value, ReadError> {
@@ -83,6 +95,7 @@ fn decode(status: u16, value: Value, artifact: &str) -> std::result::Result<Valu
             ),
             stop,
             artifact: Some(artifact.into()),
+            notice: false,
         });
     }
     let mut data = value.get("data").cloned().unwrap_or(Value::Null);
@@ -99,7 +112,7 @@ fn decode(status: u16, value: Value, artifact: &str) -> std::result::Result<Valu
         || data.get("content").is_some_and(Value::is_array)
         || data.is_null()
     {
-        return Err(ReadError { message: format!("The tool returned a message or unsupported content instead of records; response: {artifact}"), stop: false, artifact: Some(artifact.into()) });
+        return Err(ReadError { message: format!("The tool returned a message or unsupported content instead of records; response: {artifact}"), stop: false, artifact: Some(artifact.into()), notice: true });
     }
     Ok(data)
 }
@@ -127,11 +140,13 @@ async fn read(
             message: error.to_string(),
             stop: false,
             artifact: None,
+            notice: false,
         })?;
     let envelope = response.json().map_err(|_| ReadError {
         message: format!("Invalid JSON; response: {}", response.artifact),
         stop: matches!(response.status, 401 | 402 | 403 | 429),
         artifact: Some(response.artifact.clone()),
+        notice: false,
     })?;
     let data = decode(response.status, envelope, &response.artifact)?;
     Ok(Reply {
@@ -475,7 +490,7 @@ async fn fetch_jobs(ctx: &FetchContext, source: &Source, question: &str, key: &s
             Err(error) => {
                 result
                     .failures
-                    .push(failure(source, "search", error.message));
+                    .push(failure(source, error.stage(), error.message));
                 break;
             }
         };
@@ -615,7 +630,7 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
         Err(error) => {
             result
                 .failures
-                .push(failure(source, "search", error.message));
+                .push(failure(source, error.stage(), error.message));
             return Ok(result);
         }
     };
@@ -638,9 +653,15 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
     for name in ["__truncated", "_weak_match", "_note", "hint", "note"] {
         if let Some(value) = meta.get(name) {
             if value != &Value::Bool(false) && !value.is_null() {
+                // `_note` says the source fell back from its semantic ranking; the other
+                // annotations describe a normal answer.
                 result.failures.push(failure(
                     source,
-                    "search_limit",
+                    if name == "_note" {
+                        "search_limit"
+                    } else {
+                        "search_annotation"
+                    },
                     format!(
                         "Upstream search annotation {name}={value}; response: {}",
                         reply.artifact
@@ -747,6 +768,7 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                     message: "No project mapping permits an SCF detail lookup.".into(),
                     stop: false,
                     artifact: None,
+                    notice: false,
                 })
             }
         } else if kind == "directory" {
@@ -770,6 +792,7 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                 message: "The document ID cannot convert to an exact API number.".into(),
                 stop: false,
                 artifact: None,
+                notice: false,
             })
         };
         match detail {

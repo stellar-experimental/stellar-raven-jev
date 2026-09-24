@@ -75,6 +75,8 @@ pub struct Usage {
     pub rate_limited_requests: u64,
     /// Settled requests per provider (`cloudflare`, `typesafe`, `openrouter`).
     pub provider_requests: std::collections::BTreeMap<String, u64>,
+    /// Time calls waited because every usable provider was cooling or out of host send budget.
+    pub provider_wait_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -105,6 +107,9 @@ pub struct RunConfig {
     /// Write the full audit record (raw HTTP bodies, Jev traces, document store, and
     /// classification) instead of only the report and the text files it names.
     pub full_record: bool,
+    /// Folder of host-wide state that concurrent searches share (Jev provider budgets and
+    /// cooldowns, source rate-limit gates). `None` keeps that state inside this process.
+    pub host_dir: Option<PathBuf>,
 }
 
 impl Default for RunConfig {
@@ -129,6 +134,7 @@ impl Default for RunConfig {
             document_threshold: 0.4,
             uncertain_threshold: 0.15,
             full_record: true,
+            host_dir: None,
         }
     }
 }

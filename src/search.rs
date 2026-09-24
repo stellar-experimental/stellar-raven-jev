@@ -175,6 +175,11 @@ pub fn build_report_variant(
             results.push(row);
         }
     }
+    let load = load_summary(
+        &failures,
+        &outcome.usage,
+        &read(&root, "load.json").unwrap_or(Value::Null),
+    );
     let report = json!({
         "schema_version":1,"question":question["question"],"mode":if question["config"]["fixture"] == true {"fixture"} else {"live"},
         "status":outcome.status,"directory":root,
@@ -182,7 +187,7 @@ pub fn build_report_variant(
         "replay_variant":variant,
         "currentness":currentness(&intent, &results),
         "counts":{"selected":outcome.selected,"uncertain":outcome.uncertain,"rejected":outcome.rejected,"omitted":omitted.len(),"reports":failures.len()},
-        "usage":outcome.usage,"results":results,"reports":failures,
+        "usage":outcome.usage,"load":load,"results":results,"reports":failures,
         "limitations":["Scores are uncalibrated relevance estimates.","Results can contain summaries or chunks. Full available text is not always the complete original document.","A complete run does not prove complete question coverage.","Remote instructions are source evidence. They are not installed or executed."],
     });
     std::fs::write(
@@ -194,6 +199,111 @@ pub fn build_report_variant(
         crate::pipeline::refresh_manifest_artifacts(&root)?;
     }
     Ok(report)
+}
+
+/// Report stages that mean evidence was lost: a failed request or connector, a failed Jev
+/// judgment, or unavailable host coordination. Connector stages carry a family prefix for some
+/// families (`lumenloop.search`); notices use other stage names.
+const LOSS_STAGES: &[&str] = &[
+    "registry",
+    "route",
+    "intent",
+    "host_state",
+    "fetch",
+    "fetch_deadline",
+    "http",
+    "parse",
+    "search",
+    "auth",
+    "authentication",
+    "document_limit",
+    "document_score",
+    "currentness",
+    "original_lost",
+];
+
+/// What load did to this run. `degraded` is true when evidence was lost: a lost stage (see
+/// `LOSS_STAGES`), a source that answered with a coarser fallback because its own ranking was
+/// limited or down, or a source request refused by a rate limit. Server errors that a retry
+/// recovered, and waits, are shown but do not by themselves mean evidence was lost.
+fn load_summary(failures: &[Failure], usage: &crate::types::Usage, counters: &Value) -> Value {
+    let stage = |f: &Failure| f.stage.rsplit('.').next().unwrap_or_default().to_owned();
+    let count = |name: &str| failures.iter().filter(|f| stage(f) == name).count();
+    let counter = |name: &str| counters[name].as_u64().unwrap_or(0);
+    let lost = failures
+        .iter()
+        .filter(|f| LOSS_STAGES.contains(&stage(f).as_str()))
+        .count();
+    let fallback = count("search_limit");
+    let refused = counter("source_rate_limited_requests");
+    json!({
+        "degraded": lost + fallback > 0 || refused > 0,
+        "lost_evidence_reports": lost,
+        "sources_cut_at_deadline": count("fetch_deadline"),
+        "source_fallback_responses": fallback,
+        "source_rate_limited_requests": refused,
+        "source_server_errors": counter("source_server_errors"),
+        "source_gate_wait_ms": counter("source_gate_wait_ms"),
+        "source_booking_wait_ms": counter("source_booking_wait_ms"),
+        "scoring_failures": count("document_score"),
+        "currentness_failures": count("currentness"),
+        "jev_rate_limited_requests": usage.rate_limited_requests,
+        "jev_wait_ms": usage.provider_wait_ms,
+    })
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    fn report(stage: &str) -> Failure {
+        Failure {
+            stage: stage.into(),
+            source_id: Some("s".into()),
+            message: "m".into(),
+        }
+    }
+
+    #[test]
+    fn only_lost_evidence_marks_a_run_degraded() {
+        let usage = crate::types::Usage::default();
+        for notice in [
+            "coverage",
+            "truncation",
+            "query_plan",
+            "search_notice",
+            "lumenloop.search_message",
+            "lumenloop.search_annotation",
+            "upstream",
+            "original",
+        ] {
+            let load = load_summary(&[report(notice)], &usage, &Value::Null);
+            assert_eq!(load["degraded"], false, "{notice}");
+        }
+        for loss in [
+            "fetch_deadline",
+            "fetch",
+            "route",
+            "http",
+            "parse",
+            "search",
+            "lumenloop.search",
+            "lumenloop.search_limit",
+            "search_limit",
+            "document_score",
+            "document_limit",
+            "original_lost",
+            "currentness",
+            "host_state",
+        ] {
+            let load = load_summary(&[report(loss)], &usage, &Value::Null);
+            assert_eq!(load["degraded"], true, "{loss}");
+        }
+        let refused = load_summary(&[], &usage, &json!({"source_rate_limited_requests": 1}));
+        assert_eq!(refused["degraded"], true);
+        let recovered = load_summary(&[], &usage, &json!({"source_server_errors": 3}));
+        assert_eq!(recovered["degraded"], false);
+    }
 }
 
 /// Selected rows that `currentness` reads for the newest dated evidence.
@@ -407,6 +517,7 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
     json!({
         "schema_version":1,"compact":true,"question":report["question"],"mode":report["mode"],
         "status":report["status"],"counts":report["counts"],"usage":report["usage"],
+        "load":report["load"],
         "source_scope":report["source_scope"]["scope"],
         "currentness":report["currentness"],
         "results":results,
@@ -476,6 +587,7 @@ mod tests {
             uncertain: 0,
             failures: 0,
             usage: Default::default(),
+            retry_after_ms: None,
         };
         let report = build_report_variant(&outcome, false, Some("t")).unwrap();
         assert_eq!(report["results"][0]["id"], "b");
@@ -528,6 +640,7 @@ mod tests {
             uncertain: 1,
             failures: 0,
             usage: Default::default(),
+            retry_after_ms: None,
         };
         let report = build_report_variant(&outcome, false, Some("n")).unwrap();
         let rows = report["results"].as_array().unwrap();

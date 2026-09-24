@@ -20,10 +20,154 @@ pub struct HttpRecorder {
     root: PathBuf,
     config: RunConfig,
     sequence: Arc<AtomicU64>,
-    semaphore: Arc<Semaphore>,
+    hosts: Arc<HostLimits>,
+    shared: Arc<SharedGets>,
+    /// Host-wide rate-limit gates for source requests. Jev requests keep their own provider
+    /// policy, so the Jev clone has none.
+    gates: Option<Arc<crate::governor::Governor>>,
+    /// Requests this run booked in advance per source scope, with the window they were booked in.
+    /// They are not counted again while that window lasts.
+    prepaid: Arc<Mutex<std::collections::HashMap<String, (u64, u64)>>>,
+    load: Arc<LoadCounters>,
     allow_loopback: bool,
     limits: Option<Arc<RequestLimits>>,
 }
+
+/// In-flight requests per host. One slow host cannot hold the permits that other hosts need.
+struct HostLimits {
+    per_host: usize,
+    semaphores: Mutex<std::collections::HashMap<String, Arc<Semaphore>>>,
+}
+
+impl HostLimits {
+    fn new(per_host: usize) -> Arc<Self> {
+        Arc::new(Self {
+            per_host: per_host.max(1),
+            semaphores: Mutex::default(),
+        })
+    }
+
+    fn semaphore(&self, host: &str) -> Arc<Semaphore> {
+        self.semaphores
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(host.to_owned())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.per_host)))
+            .clone()
+    }
+}
+
+/// A source request waits at a closed rate-limit gate only this long; past it, the request fails
+/// at once and is counted, so a closed gate never stalls the whole fetch stage.
+const GATE_WAIT_LIMIT: Duration = Duration::from_secs(4);
+/// Gate closure after a 429 without a numeric Retry-After, and the longest closure any signal
+/// can set.
+const GATE_DEFAULT_CLOSE: Duration = Duration::from_secs(10);
+const GATE_MAX_CLOSE: Duration = Duration::from_secs(600);
+/// The latest reset a source can advertise for a request window.
+const WINDOW_MAX_RESET: Duration = Duration::from_secs(86_400);
+/// How long a question waits for room in a source's advertised window before it sends without a
+/// booking: one full window of a one-minute source.
+const BOOKING_WAIT_LIMIT: Duration = Duration::from_secs(65);
+
+/// Source requests refused by rate limits, source server errors, and gate waits in this run.
+#[derive(Default)]
+struct LoadCounters {
+    rate_limited: AtomicU64,
+    server_errors: AtomicU64,
+    gate_wait_ms: AtomicU64,
+    booking_wait_ms: AtomicU64,
+}
+
+/// A source request that was not sent because the source's rate-limit gate is closed.
+#[derive(Debug)]
+pub struct SourceRateLimited {
+    pub scope: String,
+    pub wait: Duration,
+}
+
+impl std::fmt::Display for SourceRateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Source rate limit: {} is closed for {} ms more; the request was not sent",
+            self.scope,
+            self.wait.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for SourceRateLimited {}
+
+/// An HTTP-date in the preferred form (`Wed, 21 Oct 2026 07:28:00 GMT`), as Unix seconds.
+fn http_date_seconds(text: &str) -> Option<i64> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let [_, day, month, year, time, "GMT"] = parts[..] else {
+        return None;
+    };
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|m| *m == month)? as i64
+        + 1;
+    let days = crate::rank::civil_days(year.parse().ok()?, month, day.parse().ok()?)?;
+    let clock: Vec<i64> = time
+        .split(':')
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    let [h, m, s] = clock[..] else {
+        return None;
+    };
+    ((0..24).contains(&h) && (0..60).contains(&m) && (0..61).contains(&s))
+        .then_some(days * 86_400 + h * 3_600 + m * 60 + s)
+}
+
+/// The rate-limit signals in a source response. Retry-After is seconds or an HTTP-date. A reset
+/// above 10^9 is a Unix time in seconds; a smaller one is seconds from now. Other values are
+/// ignored, and every duration is capped before conversion, so no header can overflow one.
+fn source_signals(
+    status: u16,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> crate::governor::SourceSignals {
+    let number = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
+    let capped = |value: f64, cap: Duration| Duration::from_secs_f64(value.min(cap.as_secs_f64()));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let retry_after = number("retry-after").or_else(|| {
+        let at = http_date_seconds(headers.get("retry-after")?.trim())?;
+        Some((at as f64 - now.as_secs_f64()).max(0.0))
+    });
+    crate::governor::SourceSignals {
+        status,
+        retry_after: retry_after.map(|s| capped(s, GATE_MAX_CLOSE)),
+        limit: number("x-ratelimit-limit")
+            .filter(|v| *v <= u32::MAX as f64)
+            .map(|v| v as u64),
+        remaining: number("x-ratelimit-remaining")
+            .filter(|v| *v <= u32::MAX as f64)
+            .map(|v| v as u64),
+        reset_ms: number("x-ratelimit-reset").map(|reset| {
+            let until = if reset > 1_000_000_000.0 {
+                capped((reset - now.as_secs_f64()).max(0.0), WINDOW_MAX_RESET)
+            } else {
+                capped(reset, WINDOW_MAX_RESET)
+            };
+            (now + until).as_millis() as u64
+        }),
+    }
+}
+
+/// One response per identical GET within a run, keyed by URL and a digest of the headers.
+type SharedGets = Mutex<
+    std::collections::HashMap<String, Arc<tokio::sync::OnceCell<Result<HttpResponse, String>>>>,
+>;
 
 struct RequestLimits {
     max_requests: u64,
@@ -208,11 +352,84 @@ impl HttpRecorder {
         Ok(recorder)
     }
 
-    /// A clone with its own request limit that shares the run folder and the raw-file sequence.
+    /// A clone with its own per-host request limit that shares the run folder and the raw-file
+    /// sequence.
     pub fn with_concurrency(&self, concurrency: usize) -> Self {
         let mut clone = self.clone();
-        clone.semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+        clone.hosts = HostLimits::new(concurrency);
+        clone.gates = None;
         clone
+    }
+
+    /// A clone whose requests honor, and report, source rate-limit signals shared through
+    /// `governor`.
+    pub fn with_source_gates(&self, governor: Arc<crate::governor::Governor>) -> Self {
+        let mut clone = self.clone();
+        clone.gates = Some(governor);
+        clone
+    }
+
+    /// Source load in this run: requests refused by rate limits (429 responses and requests not
+    /// sent at a closed gate), server errors (5xx), and time spent waiting at gates.
+    pub fn load_summary(&self) -> Value {
+        json!({
+            "source_rate_limited_requests": self.load.rate_limited.load(Ordering::Relaxed),
+            "source_server_errors": self.load.server_errors.load(Ordering::Relaxed),
+            "source_gate_wait_ms": self.load.gate_wait_ms.load(Ordering::Relaxed),
+            "source_booking_wait_ms": self.load.booking_wait_ms.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Book this question's requests in every source scope's advertised window before any is
+    /// sent, all at once, waiting up to about one window for room. `Some(wait)` means there was
+    /// no room in time and nothing is booked: the caller should report busy and retry after
+    /// `wait`. Scopes that advertise no window need no booking.
+    pub async fn book_windows(&self, demands: &[(String, u64)]) -> Result<Option<Duration>> {
+        self.book_windows_within(demands, BOOKING_WAIT_LIMIT).await
+    }
+
+    async fn book_windows_within(
+        &self,
+        demands: &[(String, u64)],
+        limit: Duration,
+    ) -> Result<Option<Duration>> {
+        let Some(gates) = &self.gates else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        loop {
+            match gates.book_windows(demands)? {
+                crate::governor::Booking::Booked(booked) => {
+                    let mut prepaid = self.prepaid.lock().unwrap_or_else(|e| e.into_inner());
+                    for entry in booked {
+                        prepaid.insert(entry.scope, (entry.count, entry.window_epoch));
+                    }
+                    return Ok(None);
+                }
+                crate::governor::Booking::Wait(wait) => {
+                    let remaining = limit.saturating_sub(started.elapsed());
+                    if remaining < wait {
+                        return Ok(Some(wait));
+                    }
+                    self.load
+                        .booking_wait_ms
+                        .fetch_add(wait.as_millis() as u64, Ordering::Relaxed);
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+
+    /// Spend one booked request for `scope`, returning the window it was booked in.
+    fn take_prepaid(&self, scope: &str) -> Option<u64> {
+        let mut prepaid = self.prepaid.lock().unwrap_or_else(|e| e.into_inner());
+        match prepaid.get_mut(scope) {
+            Some((left, reset)) if *left > 0 => {
+                *left -= 1;
+                Some(*reset)
+            }
+            _ => None,
+        }
     }
 
     pub fn run_dir(&self) -> &Path {
@@ -231,7 +448,11 @@ impl HttpRecorder {
             root: run_dir.to_path_buf(),
             config: config.clone(),
             sequence: Arc::new(AtomicU64::new(0)),
-            semaphore: Arc::new(Semaphore::new(config.concurrency)),
+            hosts: HostLimits::new(config.concurrency),
+            shared: Arc::default(),
+            gates: None,
+            prepaid: Arc::default(),
+            load: Arc::default(),
             allow_loopback: false,
             limits: None,
         })
@@ -286,6 +507,38 @@ impl HttpRecorder {
     ) -> Result<HttpResponse> {
         self.request_recorded(method, url, headers, body, true, SendGate::default())
             .await
+    }
+
+    /// A GET that every caller in this run shares: the first call sends it, and identical later
+    /// calls, including concurrent ones, receive the same response and artifact.
+    pub async fn get_shared(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+    ) -> Result<HttpResponse> {
+        let mut digest = Sha256::new();
+        for (key, value) in &headers {
+            digest.update(key.as_bytes());
+            digest.update([0]);
+            digest.update(value.as_bytes());
+            digest.update([0]);
+        }
+        let key = format!("{url}\n{:x}", digest.finalize());
+        let cell = self
+            .shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_default()
+            .clone();
+        cell.get_or_init(|| async {
+            self.request(Method::GET, url, headers, None)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .clone()
+        .map_err(anyhow::Error::msg)
     }
 
     /// For a caller that saves the exact request body in its own audit record (the Jev trace).
@@ -377,7 +630,38 @@ impl HttpRecorder {
             if record.enabled {
                 write_metadata(&metadata_path, &record.metadata)?;
             }
-            let _permit = self.semaphore.acquire().await?;
+            let scope = format!("{}{}", parsed.host_str().unwrap_or_default(), parsed.path());
+            let authority = format!(
+                "{}:{}",
+                parsed.host_str().unwrap_or_default(),
+                parsed.port_or_known_default().unwrap_or_default()
+            );
+            let semaphore = self.hosts.semaphore(&authority);
+            // Source limits are checked once the request holds its permit, at the moment of
+            // sending, so a refusal seen by another request while this one queued still applies.
+            // A closed scope releases the permit while it waits.
+            let mut waited = Duration::ZERO;
+            let mut booked = None;
+            let _permit = loop {
+                let permit = semaphore.clone().acquire_owned().await?;
+                let Some(gates) = &self.gates else {
+                    break permit;
+                };
+                let booked_epoch = *booked.get_or_insert_with(|| self.take_prepaid(&scope));
+                let Some(wait) = gates.source_ticket(&scope, booked_epoch)? else {
+                    break permit;
+                };
+                drop(permit);
+                if waited + wait > GATE_WAIT_LIMIT {
+                    self.load.rate_limited.fetch_add(1, Ordering::Relaxed);
+                    return Err(SourceRateLimited { scope, wait }.into());
+                }
+                waited += wait;
+                self.load
+                    .gate_wait_ms
+                    .fetch_add(wait.as_millis() as u64, Ordering::Relaxed);
+                tokio::time::sleep(wait).await;
+            };
             if gate.stop.is_some_and(|stop| stop()) {
                 return Err(NotSent.into());
             }
@@ -433,6 +717,9 @@ impl HttpRecorder {
                             | "etag"
                             | "last-modified"
                             | "x-request-id"
+                            | "x-ratelimit-limit"
+                            | "x-ratelimit-remaining"
+                            | "x-ratelimit-reset"
                             | "cf-ray"
                     )
                 })
@@ -443,6 +730,19 @@ impl HttpRecorder {
                     )
                 })
                 .collect();
+            if let Some(gates) = &self.gates {
+                if status == 429 {
+                    self.load.rate_limited.fetch_add(1, Ordering::Relaxed);
+                }
+                if status >= 500 {
+                    self.load.server_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                gates.observe_source(
+                    &scope,
+                    &source_signals(status, &response_headers),
+                    GATE_DEFAULT_CLOSE,
+                )?;
+            }
             record.metadata["response_headers"] = json!(response_headers);
             // Synchronous chunk writes: a cancelled request leaves no write pending.
             let mut file = if record.enabled {
@@ -540,6 +840,278 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    /// Serves `reply` to every connection after `delay`, and counts the requests.
+    async fn counting_server(
+        reply: &'static str,
+        delay: Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0; 4096];
+                    let _ = socket.read(&mut request).await;
+                    served.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    // Each connection serves one reply, so the client must not reuse it.
+                    let reply = reply.replacen("\r\n", "\r\nConnection: close\r\n", 1);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    fn gated(dir: &Path) -> HttpRecorder {
+        let mut recorder = HttpRecorder::new(dir, &RunConfig::default()).unwrap();
+        recorder.allow_loopback = true;
+        recorder.with_source_gates(Arc::new(crate::governor::Governor::local()))
+    }
+
+    #[tokio::test]
+    async fn a_refusal_closes_the_scope_and_later_requests_are_not_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = gated(dir.path());
+        let (url, count) = counting_server(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\n\r\n",
+            Duration::ZERO,
+        )
+        .await;
+        let first = recorder
+            .request(Method::GET, &format!("{url}/api/search?q=a"), vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(first.status, 429);
+        let error = recorder
+            .request(Method::GET, &format!("{url}/api/search?q=b"), vec![], None)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<SourceRateLimited>().is_some());
+        // Another path on the same host stays open.
+        recorder
+            .request(Method::GET, &format!("{url}/api/other"), vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(recorder.load_summary()["source_rate_limited_requests"], 3);
+    }
+
+    #[tokio::test]
+    async fn an_advertised_window_stops_requests_before_the_source_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = gated(dir.path());
+        let (url, count) = counting_server(
+            "HTTP/1.1 200 OK\r\nX-RateLimit-Limit: 2\r\nX-RateLimit-Remaining: 1\r\nX-RateLimit-Reset: 60\r\nContent-Length: 2\r\n\r\n{}",
+            Duration::ZERO,
+        )
+        .await;
+        let search = format!("{url}/api/search");
+        for _ in 0..2 {
+            recorder
+                .request(Method::GET, &search, vec![], None)
+                .await
+                .unwrap();
+        }
+        let error = recorder
+            .request(Method::GET, &search, vec![], None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Source rate limit"));
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // A Jev clone never uses source gates.
+        let jev = recorder.with_concurrency(4);
+        jev.request(Method::GET, &search, vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_request_queued_behind_a_refusal_is_not_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            concurrency: 1,
+            ..RunConfig::default()
+        };
+        let mut recorder = HttpRecorder::new(dir.path(), &config).unwrap();
+        recorder.allow_loopback = true;
+        let recorder = recorder.with_source_gates(Arc::new(crate::governor::Governor::local()));
+        let (url, count) = counting_server(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\n\r\n",
+            Duration::from_millis(200),
+        )
+        .await;
+        let search = format!("{url}/api/search");
+        let first = recorder.request(Method::GET, &search, vec![], None);
+        let queued = async {
+            // Starts while the first request holds the only permit.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            recorder.request(Method::GET, &search, vec![], None).await
+        };
+        let (first, queued) = tokio::join!(first, queued);
+        assert_eq!(first.unwrap().status, 429);
+        assert!(queued
+            .unwrap_err()
+            .downcast_ref::<SourceRateLimited>()
+            .is_some());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn booked_requests_are_sent_without_counting_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = gated(dir.path());
+        let (url, count) = counting_server(
+            "HTTP/1.1 200 OK\r\nX-RateLimit-Limit: 3\r\nX-RateLimit-Remaining: 2\r\nX-RateLimit-Reset: 60\r\nContent-Length: 2\r\n\r\n{}",
+            Duration::ZERO,
+        )
+        .await;
+        let search = format!("{url}/api/search");
+        // Scopes name the host and path, without the port.
+        let scope = "127.0.0.1/api/search".to_owned();
+        // The first response teaches the window: 1 of 3 used.
+        recorder
+            .request(Method::GET, &search, vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorder.book_windows(&[(scope.clone(), 2)]).await.unwrap(),
+            None
+        );
+        assert!(recorder.take_prepaid(&scope).is_some());
+        // Give the checked ticket back: the two requests below spend the booking.
+        recorder.prepaid.lock().unwrap().get_mut(&scope).unwrap().0 += 1;
+        for _ in 0..2 {
+            recorder
+                .request(Method::GET, &search, vec![], None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        // The window is full: an unbooked request is refused, and a booking would wait.
+        assert!(recorder
+            .request(Method::GET, &search, vec![], None)
+            .await
+            .is_err());
+        assert_eq!(recorder.load_summary()["source_booking_wait_ms"], 0);
+        // A question that cannot book in time is told how long to wait, and books nothing.
+        let wait = recorder
+            .book_windows_within(&[(scope.clone(), 1)], Duration::from_millis(100))
+            .await
+            .unwrap()
+            .expect("no room in time");
+        assert!(wait > Duration::from_secs(50));
+    }
+
+    #[test]
+    fn rate_limit_headers_never_overflow_and_long_waits_are_kept() {
+        let headers = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let huge = source_signals(429, &headers(&[("retry-after", "1e30")]));
+        assert_eq!(huge.retry_after, Some(GATE_MAX_CLOSE));
+        let long = source_signals(429, &headers(&[("retry-after", "300")]));
+        assert_eq!(long.retry_after, Some(Duration::from_secs(300)));
+        let longest = source_signals(429, &headers(&[("retry-after", "3600")]));
+        assert_eq!(longest.retry_after, Some(GATE_MAX_CLOSE));
+        // HTTP-dates: a future one waits until then, a past one not at all.
+        let future = source_signals(
+            429,
+            &headers(&[("retry-after", "Sun, 06 Nov 2044 08:49:37 GMT")]),
+        );
+        assert_eq!(future.retry_after, Some(GATE_MAX_CLOSE));
+        let past = source_signals(
+            429,
+            &headers(&[("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")]),
+        );
+        assert_eq!(past.retry_after, Some(Duration::ZERO));
+        assert_eq!(
+            http_date_seconds("Mon, 01 Jan 2024 00:00:10 GMT"),
+            Some(1_704_067_210)
+        );
+        for bad in ["-5", "NaN", "inf", "Wed, 32 Oct 2026 07:28:00 GMT", "soon"] {
+            let signals = source_signals(429, &headers(&[("retry-after", bad)]));
+            assert_eq!(signals.retry_after, None, "{bad}");
+        }
+        let windowed = source_signals(
+            200,
+            &headers(&[
+                ("x-ratelimit-limit", "1e30"),
+                ("x-ratelimit-remaining", "5"),
+                ("x-ratelimit-reset", "9e99"),
+            ]),
+        );
+        assert_eq!(windowed.limit, None);
+        assert_eq!(windowed.remaining, Some(5));
+        assert!(windowed.reset_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn identical_gets_in_one_run_share_one_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = HttpRecorder::new(dir.path(), &RunConfig::default()).unwrap();
+        recorder.allow_loopback = true;
+        let (url, count) = counting_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+            Duration::from_millis(100),
+        )
+        .await;
+        let headers = || vec![("x-key".to_owned(), "a".to_owned())];
+        let (a, b) = tokio::join!(
+            recorder.get_shared(&url, headers()),
+            recorder.get_shared(&url, headers())
+        );
+        assert_eq!(a.unwrap().artifact, b.unwrap().artifact);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // Different headers are a different request.
+        recorder
+            .get_shared(&url, vec![("x-key".into(), "b".into())])
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_slow_host_does_not_hold_the_permits_of_another_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            concurrency: 1,
+            ..RunConfig::default()
+        };
+        let mut recorder = HttpRecorder::new(dir.path(), &config).unwrap();
+        recorder.allow_loopback = true;
+        let (slow, _) = counting_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            Duration::from_secs(2),
+        )
+        .await;
+        let (fast, _) = counting_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            Duration::ZERO,
+        )
+        .await;
+        let slow_request = recorder.request(Method::GET, &slow, vec![], None);
+        let fast_request = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let started = Instant::now();
+            recorder
+                .request(Method::GET, &fast, vec![], None)
+                .await
+                .unwrap();
+            started.elapsed()
+        };
+        let (_, fast_elapsed) = tokio::join!(slow_request, fast_request);
+        assert!(fast_elapsed < Duration::from_secs(1));
+    }
+
     async fn server(reply: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

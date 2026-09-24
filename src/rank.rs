@@ -52,7 +52,7 @@ pub struct DocDate {
     pub days: i64,
 }
 
-fn civil_days(y: i64, m: i64, d: i64) -> Option<i64> {
+pub(crate) fn civil_days(y: i64, m: i64, d: i64) -> Option<i64> {
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
     let month_days = [
         31,

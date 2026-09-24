@@ -1,4 +1,5 @@
 pub mod connectors;
+pub mod governor;
 pub mod http;
 pub mod jev;
 pub mod pipeline;

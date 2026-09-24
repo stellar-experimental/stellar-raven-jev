@@ -81,6 +81,19 @@ const LISTINGS: &[Listing] = &[
     Listing { id: "stablecoins", path: "/api/stablecoins", key: "stablecoins", description: "Tracked stablecoins, fiat pegs, USD market capitalization, and dated usage", paged: false, query: false, limit: 100, roster: &["ticker", "name", "company", "peg", "basis", "assetType", "issuer", "issuerDomain", "supply", "marketCapUSD", "updatedAt", "verified", "note"], every_row: &[], row_dates: &[("/updatedAt", "observed")] },
 ];
 
+/// The request scope (host and path) of a source's first request, as the HTTP recorder names
+/// scopes for source rate limits. Every research origin shares one endpoint.
+pub fn first_request_scope(source: &Source) -> Option<String> {
+    let host = Url::parse(BASE).ok()?.host_str()?.to_owned();
+    if source.id.starts_with("stellarlight.research.") {
+        return Some(format!("{host}/api/research"));
+    }
+    LISTINGS
+        .iter()
+        .find(|entry| source.id == format!("stellarlight.{}", entry.id))
+        .map(|entry| format!("{host}{}", entry.path))
+}
+
 pub fn sources() -> Vec<Source> {
     let mut sources: Vec<_> = LISTINGS
         .iter()
@@ -110,6 +123,9 @@ fn failure(result: &mut FetchResult, source: &Source, stage: &str, message: impl
     });
 }
 
+/// Detail pages read at once by one connector.
+const DETAIL_READS: usize = 6;
+
 fn request_url(path: &str, params: &[(&str, String)]) -> Result<String> {
     let mut url = Url::parse(&format!("{BASE}{path}"))?;
     if !params.is_empty() {
@@ -125,7 +141,14 @@ async fn read(
     result: &mut FetchResult,
     url: &str,
 ) -> Option<(Value, String)> {
-    match ctx.http.request(Method::GET, url, vec![], None).await {
+    let mut response = ctx.http.request(Method::GET, url, vec![], None).await;
+    // Scout answers transient overload with a server error. One late retry recovers most of them;
+    // a second failure is reported.
+    if matches!(&response, Ok(r) if matches!(r.status, 500 | 502 | 503 | 504)) {
+        tokio::time::sleep(retry_delay()).await;
+        response = ctx.http.request(Method::GET, url, vec![], None).await;
+    }
+    match response {
         Ok(response) => {
             if !(200..300).contains(&response.status) {
                 failure(
@@ -165,6 +188,12 @@ async fn read(
             None
         }
     }
+}
+
+/// 250 to 750 ms, spread so that concurrent readers do not retry together.
+fn retry_delay() -> std::time::Duration {
+    let spread = uuid::Uuid::new_v4().as_u128() % 500;
+    std::time::Duration::from_millis(250 + spread as u64)
 }
 
 fn string_field<'a>(row: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -475,6 +504,18 @@ fn notices(source: &Source, meta: &Value, result: &mut FetchResult) {
             failure(result, source, "upstream", format!("Scout {key}: {value}"));
         }
     }
+    // Scout says when its ranking backend is down and it fell back to a coarser match.
+    if let Some(label) = meta["matchModeLabel"]
+        .as_str()
+        .filter(|label| label.contains("unavailable"))
+    {
+        failure(
+            result,
+            source,
+            "search_limit",
+            format!("Scout ranking is degraded: {label}"),
+        );
+    }
 }
 
 fn document(
@@ -677,6 +718,8 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
             .ok_or_else(|| anyhow!("Unknown listing"))?
     };
     let mut seen = HashSet::new();
+    // Detail reads run together after the listing pages and apply in row order.
+    let mut to_hydrate: Vec<usize> = Vec::new();
     let mut offset = 0usize;
     let mut shared_diagnostic = shared_plan_diagnostic(question);
     if entry.id == "builds" {
@@ -790,7 +833,7 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                         doc.provenance["hydration_selection"] = json!({"selected":hydrate_selected,"method":"metadata-keyword-overlap","score":skill_candidate_score(row,question),"maximum":8,"is_jev":false});
                     }
                     if hydrate_selected {
-                        hydrate(ctx, source, entry, &mut result, &mut doc).await?;
+                        to_hydrate.push(result.documents.len());
                     }
                     result.documents.push(doc);
                 }
@@ -850,12 +893,87 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
             break;
         }
     }
+    use futures::StreamExt;
+    let hydrated: Vec<_> = futures::stream::iter(to_hydrate)
+        .map(|position| {
+            let mut doc = result.documents[position].clone();
+            async move {
+                let mut failures = FetchResult::default();
+                let outcome = hydrate(ctx, source, entry, &mut failures, &mut doc).await;
+                (position, doc, failures, outcome)
+            }
+        })
+        .buffered(DETAIL_READS)
+        .collect()
+        .await;
+    for (position, doc, mut failures, outcome) in hydrated {
+        outcome?;
+        result.failures.append(&mut failures.failures);
+        result.documents[position] = doc;
+    }
     Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ranking_fallback_is_reported_and_a_normal_answer_is_not() {
+        let source = &sources()[0];
+        let mut result = FetchResult::default();
+        notices(
+            source,
+            &json!({"matchMode":"vector","matchModeLabel":"vector-similarity ranking"}),
+            &mut result,
+        );
+        assert!(result.failures.is_empty());
+        notices(
+            source,
+            &json!({"matchMode":"keyword","matchModeLabel":"vector search unavailable — coarse keyword match over title and content"}),
+            &mut result,
+        );
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].stage, "search_limit");
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_retried_once_and_a_second_one_is_reported() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Replies in order: 500, 200, then 502 forever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for n in 0.. {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 4096];
+                let _ = socket.read(&mut request).await;
+                let reply: &[u8] = match n {
+                    0 => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+                    1 => b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
+                    _ => b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+                };
+                let _ = socket.write_all(reply).await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig::default();
+        let ctx = FetchContext {
+            http: crate::http::HttpRecorder::loopback_for_test(dir.path(), &config).unwrap(),
+            config,
+        };
+        let source = &sources()[0];
+        let url = format!("http://{addr}/api/x");
+        let mut result = FetchResult::default();
+        let (value, _) = read(&ctx, source, &mut result, &url)
+            .await
+            .expect("the retry succeeds");
+        assert_eq!(value["rows"], json!([]));
+        assert!(result.failures.is_empty());
+        assert!(read(&ctx, source, &mut result, &url).await.is_none());
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].message.contains("HTTP 502"));
+    }
     #[test]
     fn roster_document_keeps_every_registry_row_and_dated_metadata() {
         let source = sources()

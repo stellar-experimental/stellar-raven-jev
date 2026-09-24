@@ -51,6 +51,9 @@ impl Index {
         self.name == DOCS[1] || self.name.ends_with("_asc") || self.name.ends_with("_desc")
     }
 }
+/// Original pages read at once by one connector.
+const ORIGINAL_READS: usize = 6;
+
 fn indices() -> impl Iterator<Item = Index> {
     DOCS.into_iter()
         .map(|name| Index {
@@ -737,19 +740,23 @@ fn html_article_text(text: &str) -> Option<(String, &'static str)> {
     None
 }
 
+/// The original page for one hit. Failures are returned, so concurrent reads can be applied in
+/// hit order.
 async fn original(
     ctx: &FetchContext,
     source: &Source,
     index: Index,
     url: &Url,
-    result: &mut FetchResult,
-) -> (Option<String>, Value, Vec<String>) {
+) -> (Option<String>, Value, Vec<String>, FetchResult) {
+    let mut failures = FetchResult::default();
+    let result = &mut failures;
     if !index.production() {
         return (
             None,
             json!({"kind":"index_record","full_original":false,
             "limitation":"No published original fetch for development or staging records. Published content can differ."}),
             vec![],
+            failures,
         );
     }
     let mut candidates = vec![];
@@ -762,6 +769,8 @@ async fn original(
     }
     candidates.push((url.clone(), "original_html"));
     let mut artifacts = vec![];
+    // A server error or a failed transfer is lost evidence; a missing page is not.
+    let mut server_failed = false;
     for (candidate, kind) in candidates {
         match ctx
             .http
@@ -769,6 +778,7 @@ async fn original(
             .await
         {
             Ok(response) => {
+                server_failed |= response.status >= 500;
                 artifacts.push(response.artifact.clone());
                 let text = response.text();
                 let html = text
@@ -797,6 +807,7 @@ async fn original(
                                     "Extraction does not execute scripts or external CSS. Dynamic and externally hidden content remains uncertain.",
                                     "Markdown can omit generated components. HTML extraction can omit non-text media and layout information."]}),
                             artifacts,
+                            failures,
                         );
                     }
                 }
@@ -811,19 +822,31 @@ async fn original(
                     ),
                 );
             }
-            Err(_) => failure(
-                result,
-                source,
-                "original",
-                "Original request failed. The recorder retains available failure evidence.",
-            ),
+            Err(_) => {
+                server_failed = true;
+                failure(
+                    result,
+                    source,
+                    "original",
+                    "Original request failed. The recorder retains available failure evidence.",
+                )
+            }
         }
+    }
+    if server_failed {
+        failure(
+            result,
+            source,
+            "original_lost",
+            format!("The original page {url} failed with a server or transfer error. The indexed record stands in for it."),
+        );
     }
     (
         None,
         json!({"kind":"index_record","full_original":false,
         "limitation":"The original document was unavailable. Indexed records can contain only sections or metadata."}),
         artifacts,
+        failures,
     )
 }
 
@@ -885,18 +908,354 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
         ("X-Algolia-Application-Id".into(), app.clone()),
         ("X-Algolia-API-Key".into(), key),
     ];
+    if !index.production() {
+        failure(
+            &mut result,
+            source,
+            "source_limit",
+            "Development or staging content does not establish current production facts.",
+        );
+    }
+    let url = endpoint(&app, Some(index.name))?;
+    let docs_queries = if index.scope == "DOCS" {
+        docs_facet_queries(&query_plan, ctx.config.max_pages, ctx.config.max_documents)
+    } else {
+        Vec::new()
+    };
+    let facet_mode = !docs_queries.is_empty();
+    if facet_mode {
+        let mut seen_facets = HashSet::new();
+        for omitted in query_plan
+            .keyword()
+            .into_iter()
+            .filter(|variant| variant.facet.is_some_and(|facet| seen_facets.insert(facet)))
+            .filter(|variant| !docs_queries.contains(&variant.text))
+        {
+            failure(
+                &mut result,
+                source,
+                "query_plan",
+                format!(
+                    "The query or document limit omitted a DOCS facet: {}",
+                    omitted.text
+                ),
+            );
+        }
+    }
+    let size = if facet_mode {
+        ctx.config.max_documents.saturating_mul(3).min(100)
+    } else {
+        ctx.config.max_documents.min(100)
+    };
+    let mut page = 0;
+    let mut relaxed = false;
+    let (mut active_query, mut query_kind) = planned_query(index, &query_plan);
+    let mut keyword_retry = false;
+    let mut variants = Vec::<Value>::new();
+    let mut seen = HashSet::new();
+    let mut pages_by_url: HashMap<String, usize> = HashMap::new();
+    // The index inventory only annotates freshness, so it runs alongside the search. Every
+    // index of one application shares the same inventory response within a run.
+    let mut pending: Vec<(usize, Url)> = Vec::new();
+    let search = async {
+        for request_number in 0..ctx.config.max_pages {
+            let document_ceiling = if facet_mode {
+                let Some(query) = docs_queries.get(request_number) else {
+                    break;
+                };
+                active_query = query.clone();
+                query_kind = "keyword_facet";
+                page = 0;
+                facet_document_ceiling(
+                    ctx.config.max_documents,
+                    result.documents.len(),
+                    docs_queries.len() - request_number,
+                )
+            } else {
+                ctx.config.max_documents
+            };
+            let params = search_params(&active_query, page, size, relaxed);
+            variants.push(json!({"query":active_query,"page":page,"matching_mode":if relaxed {"allOptional"} else {"none"},
+                "kind":query_kind,"variant":if facet_mode {"docs_independent_facet"} else if keyword_retry {"site_shared_keyword_or_local_entity"} else if relaxed {"docs_optional_words"} else {"shared_initial"}}));
+            let response = match ctx
+                .http
+                .request(Method::POST, url.as_str(), headers.clone(), Some(params))
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    failure(
+                        &mut result,
+                        source,
+                        "search",
+                        "The search request failed. Partial results remain available.",
+                    );
+                    break;
+                }
+            };
+            if response.status != 200 {
+                failure(
+                    &mut result,
+                    source,
+                    "search",
+                    format!(
+                        "Search returned HTTP {}. Artifact: {}",
+                        response.status, response.artifact
+                    ),
+                );
+                break;
+            }
+            let body = match response.json() {
+                Ok(body) => body,
+                Err(_) => {
+                    failure(
+                        &mut result,
+                        source,
+                        "search",
+                        format!(
+                            "Search returned malformed JSON. Artifact: {}",
+                            response.artifact
+                        ),
+                    );
+                    break;
+                }
+            };
+            if body.get("message").is_some() {
+                failure(
+                    &mut result,
+                    source,
+                    "search_notice",
+                    format!(
+                        "The search response contains an API warning. Artifact: {}",
+                        response.artifact
+                    ),
+                );
+            }
+            let hits = match body.get("hits").and_then(Value::as_array) {
+                Some(hits) => hits,
+                None => {
+                    failure(
+                        &mut result,
+                        source,
+                        "search",
+                        format!("Search has no hits array. Artifact: {}", response.artifact),
+                    );
+                    break;
+                }
+            };
+            let total = body.get("nbHits").and_then(Value::as_u64);
+            if total.is_none() || body.get("nbPages").and_then(Value::as_u64).is_none() {
+                failure(
+                    &mut result,
+                    source,
+                    "search_notice",
+                    "Search count metadata is missing. Completeness remains unknown.",
+                );
+            }
+            if total.is_some_and(|n| n > 1000) {
+                failure(
+                    &mut result,
+                    source,
+                    "limit",
+                    "Search matches exceed the verified 1,000-record pagination limit.",
+                );
+            }
+            if body.get("exhaustiveNbHits") == Some(&Value::Bool(false))
+                || body.pointer("/exhaustive/nbHits") == Some(&Value::Bool(false))
+            {
+                failure(
+                    &mut result,
+                    source,
+                    "limit",
+                    "Algolia reports an approximate hit count.",
+                );
+            }
+            for hit in hits {
+                let Some(id) = hit.get("objectID").and_then(Value::as_str) else {
+                    failure(
+                        &mut result,
+                        source,
+                        "record",
+                        "An indexed record has no objectID.",
+                    );
+                    continue;
+                };
+                if !seen.insert(id.to_owned()) {
+                    continue;
+                }
+                let canonical = canonical(index, hit);
+                let group = canonical
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("record:{id}"));
+                if let Some(&position) = pages_by_url.get(&group) {
+                    let doc = &mut result.documents[position];
+                    doc.provenance["records"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(hit_provenance(hit));
+                    if doc.provenance["original"]["full_original"] != true {
+                        doc.text.push_str("\n\n");
+                        doc.text.push_str(&record_text(hit));
+                    }
+                    if !doc.raw_artifacts.contains(&response.artifact) {
+                        doc.raw_artifacts.push(response.artifact.clone());
+                    }
+                    continue;
+                }
+                if result.documents.len() >= document_ceiling {
+                    // A later facet can still admit this record into its reserved capacity.
+                    seen.remove(id);
+                    if facet_mode && request_number + 1 < docs_queries.len() {
+                        failure(&mut result, source, "query_facet_limit",
+                            "The connector reserved document capacity for later DOCS facets. Raw responses retain omitted candidates.");
+                        break;
+                    }
+                    failure(&mut result,source,"limit","The document limit omitted indexed candidates. Full search responses retain them.");
+                    break;
+                }
+                let artifacts = vec![response.artifact.clone()];
+                // Originals are read together after the search pages; until then the record stands in.
+                let original_meta = if let Some(url) = &canonical {
+                    pending.push((result.documents.len(), url.clone()));
+                    json!({"kind":"index_record","full_original":false,"limitation":"The original is read after the search."})
+                } else {
+                    failure(&mut result,source,"original","A record has no allowed canonical URL. The connector retained its indexed content.");
+                    json!({"kind":"index_record","full_original":false,"limitation":"No allowed canonical URL."})
+                };
+                let doc = Document {
+                    id: format!("{}:{id}", source.id),
+                    source_id: source.id.clone(),
+                    title: title(hit),
+                    url: canonical.map(|url| url.to_string()).unwrap_or_else(|| {
+                        hit.get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned()
+                    }),
+                    text: record_text(hit),
+                    provenance: json!({"application":index.scope,"index":index.name,"replica":index.replica(),"production":index.production(),
+                        "query":question,"query_variant":{"kind":query_kind,"text":active_query},"query_used":active_query,"query_variants":variants,"relaxed_query":relaxed,"search_page":page,"records":[hit_provenance(hit)],"content_scope":original_meta.get("content_scope").cloned().unwrap_or(json!("indexed_sections_or_metadata")),
+                        "extraction_limitations":original_meta.get("extraction_limitations").cloned().unwrap_or(json!(["Only indexed sections or metadata are available."])),"original":original_meta,
+                        "index_metadata":null,"index_age_seconds":null,"index_inventory_verified_at_unix":null,
+                        "limitations":["Index timestamps do not prove document freshness or corpus completeness.",
+                            "Search can omit documents. Replicas do not supply independent corroboration."]}),
+                    raw_artifacts: artifacts,
+                };
+                pages_by_url.insert(group, result.documents.len());
+                result.documents.push(doc);
+            }
+            if facet_mode {
+                if body
+                    .get("nbPages")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|n| n > 1)
+                {
+                    failure(&mut result, source, "query_facet_limit",
+                        "The bounded DOCS facet search retained one response page. Additional matching records remain unread.");
+                }
+                // Each independent intent gets its reserved capacity before the local cap ends retrieval.
+                if request_number + 1 < docs_queries.len() {
+                    continue;
+                }
+                break;
+            }
+            if hits.is_empty()
+                && page == 0
+                && !keyword_retry
+                && index.scope == "SITE"
+                && total == Some(0)
+                && body.get("message").is_none()
+                && request_number + 1 < ctx.config.max_pages
+            {
+                if let Some(variant) =
+                    site_keyword_variant(question).filter(|variant| variant != &active_query)
+                {
+                    let shared = query_plan.keyword().iter().any(|candidate| {
+                        candidate.kind == crate::query::VariantKind::Keywords
+                            && candidate.text == variant
+                    });
+                    failure(&mut result,source,"query_variant",format!(
+                        "The SITE search returned no hits. One keyword retry retains detected entities. Changes: {}",
+                        json!({"original":question,"variant":variant,
+                            "method":if shared {"shared_keyword"} else {"local_entity_fallback"},
+                            "empty_query":false,"selection":"First nonempty shared keyword preserves entities and does not add AND terms. Otherwise retain the local fallback."})));
+                    active_query = variant;
+                    query_kind = if shared {
+                        "keywords"
+                    } else {
+                        "local_entity_fallback"
+                    };
+                    keyword_retry = true;
+                    continue;
+                }
+            }
+            let pages = body.get("nbPages").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if hits.is_empty()
+                && page == 0
+                && !relaxed
+                && index.scope == "DOCS"
+                && total == Some(0)
+                && body.get("message").is_none()
+                && request_number + 1 < ctx.config.max_pages
+            {
+                relaxed = true;
+                failure(
+                    &mut result,
+                    source,
+                    "query_relaxation",
+                    "The strict search returned no hits. The next query permits optional words.",
+                );
+                continue;
+            }
+            if page + 1 >= pages {
+                break;
+            }
+            if request_number + 1 >= ctx.config.max_pages
+                || result.documents.len() >= ctx.config.max_documents
+                || (page + 1) * size >= 1000
+            {
+                failure(&mut result,source,"limit","The page, document, or Algolia limit stopped retrieval before all matching records.");
+                break;
+            }
+            page += 1;
+        }
+        // Read the originals together, bounded, and apply them in hit order.
+        use futures::StreamExt;
+        let originals: Vec<_> =
+            futures::stream::iter(std::mem::take(&mut pending))
+                .map(|(position, url)| async move {
+                    (position, original(ctx, source, index, &url).await)
+                })
+                .buffered(ORIGINAL_READS)
+                .collect()
+                .await;
+        for (position, (text, meta, artifacts, mut failures)) in originals {
+            result.failures.append(&mut failures.failures);
+            let doc = &mut result.documents[position];
+            if let Some(text) = text {
+                doc.text = text;
+            }
+            doc.provenance["content_scope"] = meta
+                .get("content_scope")
+                .cloned()
+                .unwrap_or(json!("indexed_sections_or_metadata"));
+            doc.provenance["extraction_limitations"] = meta
+                .get("extraction_limitations")
+                .cloned()
+                .unwrap_or(json!(["Only indexed sections or metadata are available."]));
+            doc.provenance["original"] = meta;
+            doc.raw_artifacts.extend(artifacts);
+        }
+    };
+    let inventory_url = endpoint(&app, None)?;
+    let (inventory_response, ()) = tokio::join!(
+        ctx.http.get_shared(inventory_url.as_str(), headers.clone()),
+        search
+    );
     let mut inventory = Value::Null;
     let mut inventory_artifact = None;
-    match ctx
-        .http
-        .request(
-            Method::GET,
-            endpoint(&app, None)?.as_str(),
-            headers.clone(),
-            None,
-        )
-        .await
-    {
+    match inventory_response {
         Ok(response) => {
             inventory_artifact = Some(response.artifact.clone());
             if response.status == 200 {
@@ -949,319 +1308,14 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
             "The index update is older than 48 hours. Records can be stale.",
         );
     }
-    if !index.production() {
-        failure(
-            &mut result,
-            source,
-            "source_limit",
-            "Development or staging content does not establish current production facts.",
-        );
-    }
-    let url = endpoint(&app, Some(index.name))?;
-    let docs_queries = if index.scope == "DOCS" {
-        docs_facet_queries(&query_plan, ctx.config.max_pages, ctx.config.max_documents)
-    } else {
-        Vec::new()
-    };
-    let facet_mode = !docs_queries.is_empty();
-    if facet_mode {
-        let mut seen_facets = HashSet::new();
-        for omitted in query_plan
-            .keyword()
-            .into_iter()
-            .filter(|variant| variant.facet.is_some_and(|facet| seen_facets.insert(facet)))
-            .filter(|variant| !docs_queries.contains(&variant.text))
-        {
-            failure(
-                &mut result,
-                source,
-                "query_plan",
-                format!(
-                    "The query or document limit omitted a DOCS facet: {}",
-                    omitted.text
-                ),
-            );
+    for doc in &mut result.documents {
+        doc.provenance["index_metadata"] = inventory.clone();
+        doc.provenance["index_age_seconds"] = json!(age);
+        doc.provenance["index_inventory_verified_at_unix"] = json!(now);
+        if let Some(artifact) = &inventory_artifact {
+            doc.raw_artifacts
+                .insert(1.min(doc.raw_artifacts.len()), artifact.clone());
         }
-    }
-    let size = if facet_mode {
-        ctx.config.max_documents.saturating_mul(3).min(100)
-    } else {
-        ctx.config.max_documents.min(100)
-    };
-    let mut page = 0;
-    let mut relaxed = false;
-    let (mut active_query, mut query_kind) = planned_query(index, &query_plan);
-    let mut keyword_retry = false;
-    let mut variants = Vec::<Value>::new();
-    let mut seen = HashSet::new();
-    let mut pages_by_url: HashMap<String, usize> = HashMap::new();
-    for request_number in 0..ctx.config.max_pages {
-        let document_ceiling = if facet_mode {
-            let Some(query) = docs_queries.get(request_number) else {
-                break;
-            };
-            active_query = query.clone();
-            query_kind = "keyword_facet";
-            page = 0;
-            facet_document_ceiling(
-                ctx.config.max_documents,
-                result.documents.len(),
-                docs_queries.len() - request_number,
-            )
-        } else {
-            ctx.config.max_documents
-        };
-        let params = search_params(&active_query, page, size, relaxed);
-        variants.push(json!({"query":active_query,"page":page,"matching_mode":if relaxed {"allOptional"} else {"none"},
-            "kind":query_kind,"variant":if facet_mode {"docs_independent_facet"} else if keyword_retry {"site_shared_keyword_or_local_entity"} else if relaxed {"docs_optional_words"} else {"shared_initial"}}));
-        let response = match ctx
-            .http
-            .request(Method::POST, url.as_str(), headers.clone(), Some(params))
-            .await
-        {
-            Ok(response) => response,
-            Err(_) => {
-                failure(
-                    &mut result,
-                    source,
-                    "search",
-                    "The search request failed. Partial results remain available.",
-                );
-                break;
-            }
-        };
-        if response.status != 200 {
-            failure(
-                &mut result,
-                source,
-                "search",
-                format!(
-                    "Search returned HTTP {}. Artifact: {}",
-                    response.status, response.artifact
-                ),
-            );
-            break;
-        }
-        let body = match response.json() {
-            Ok(body) => body,
-            Err(_) => {
-                failure(
-                    &mut result,
-                    source,
-                    "search",
-                    format!(
-                        "Search returned malformed JSON. Artifact: {}",
-                        response.artifact
-                    ),
-                );
-                break;
-            }
-        };
-        if body.get("message").is_some() {
-            failure(
-                &mut result,
-                source,
-                "search",
-                format!(
-                    "The search response contains an API warning. Artifact: {}",
-                    response.artifact
-                ),
-            );
-        }
-        let hits = match body.get("hits").and_then(Value::as_array) {
-            Some(hits) => hits,
-            None => {
-                failure(
-                    &mut result,
-                    source,
-                    "search",
-                    format!("Search has no hits array. Artifact: {}", response.artifact),
-                );
-                break;
-            }
-        };
-        let total = body.get("nbHits").and_then(Value::as_u64);
-        if total.is_none() || body.get("nbPages").and_then(Value::as_u64).is_none() {
-            failure(
-                &mut result,
-                source,
-                "search",
-                "Search count metadata is missing. Completeness remains unknown.",
-            );
-        }
-        if total.is_some_and(|n| n > 1000) {
-            failure(
-                &mut result,
-                source,
-                "limit",
-                "Search matches exceed the verified 1,000-record pagination limit.",
-            );
-        }
-        if body.get("exhaustiveNbHits") == Some(&Value::Bool(false))
-            || body.pointer("/exhaustive/nbHits") == Some(&Value::Bool(false))
-        {
-            failure(
-                &mut result,
-                source,
-                "limit",
-                "Algolia reports an approximate hit count.",
-            );
-        }
-        for hit in hits {
-            let Some(id) = hit.get("objectID").and_then(Value::as_str) else {
-                failure(
-                    &mut result,
-                    source,
-                    "record",
-                    "An indexed record has no objectID.",
-                );
-                continue;
-            };
-            if !seen.insert(id.to_owned()) {
-                continue;
-            }
-            let canonical = canonical(index, hit);
-            let group = canonical
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| format!("record:{id}"));
-            if let Some(&position) = pages_by_url.get(&group) {
-                let doc = &mut result.documents[position];
-                doc.provenance["records"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(hit_provenance(hit));
-                if doc.provenance["original"]["full_original"] != true {
-                    doc.text.push_str("\n\n");
-                    doc.text.push_str(&record_text(hit));
-                }
-                if !doc.raw_artifacts.contains(&response.artifact) {
-                    doc.raw_artifacts.push(response.artifact.clone());
-                }
-                continue;
-            }
-            if result.documents.len() >= document_ceiling {
-                // A later facet can still admit this record into its reserved capacity.
-                seen.remove(id);
-                if facet_mode && request_number + 1 < docs_queries.len() {
-                    failure(&mut result, source, "query_facet_limit",
-                        "The connector reserved document capacity for later DOCS facets. Raw responses retain omitted candidates.");
-                    break;
-                }
-                failure(&mut result,source,"limit","The document limit omitted indexed candidates. Full search responses retain them.");
-                break;
-            }
-            let mut artifacts = vec![response.artifact.clone()];
-            if let Some(a) = &inventory_artifact {
-                artifacts.push(a.clone());
-            }
-            let (original_text, original_meta, original_artifacts) = if let Some(url) = &canonical {
-                original(ctx, source, index, url, &mut result).await
-            } else {
-                failure(&mut result,source,"original","A record has no allowed canonical URL. The connector retained its indexed content.");
-                (
-                    None,
-                    json!({"kind":"index_record","full_original":false,"limitation":"No allowed canonical URL."}),
-                    vec![],
-                )
-            };
-            artifacts.extend(original_artifacts);
-            let doc = Document {
-                id: format!("{}:{id}", source.id),
-                source_id: source.id.clone(),
-                title: title(hit),
-                url: canonical.map(|url| url.to_string()).unwrap_or_else(|| {
-                    hit.get("url")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned()
-                }),
-                text: original_text.unwrap_or_else(|| record_text(hit)),
-                provenance: json!({"application":index.scope,"index":index.name,"replica":index.replica(),"production":index.production(),
-                    "query":question,"query_variant":{"kind":query_kind,"text":active_query},"query_used":active_query,"query_variants":variants,"relaxed_query":relaxed,"search_page":page,"records":[hit_provenance(hit)],"content_scope":original_meta.get("content_scope").cloned().unwrap_or(json!("indexed_sections_or_metadata")),
-                    "extraction_limitations":original_meta.get("extraction_limitations").cloned().unwrap_or(json!(["Only indexed sections or metadata are available."])),"original":original_meta,
-                    "index_metadata":inventory,"index_age_seconds":age,"index_inventory_verified_at_unix":now,
-                    "limitations":["Index timestamps do not prove document freshness or corpus completeness.",
-                        "Search can omit documents. Replicas do not supply independent corroboration."]}),
-                raw_artifacts: artifacts,
-            };
-            pages_by_url.insert(group, result.documents.len());
-            result.documents.push(doc);
-        }
-        if facet_mode {
-            if body
-                .get("nbPages")
-                .and_then(Value::as_u64)
-                .is_some_and(|n| n > 1)
-            {
-                failure(&mut result, source, "query_facet_limit",
-                    "The bounded DOCS facet search retained one response page. Additional matching records remain unread.");
-            }
-            // Each independent intent gets its reserved capacity before the local cap ends retrieval.
-            if request_number + 1 < docs_queries.len() {
-                continue;
-            }
-            break;
-        }
-        if hits.is_empty()
-            && page == 0
-            && !keyword_retry
-            && index.scope == "SITE"
-            && total == Some(0)
-            && body.get("message").is_none()
-            && request_number + 1 < ctx.config.max_pages
-        {
-            if let Some(variant) =
-                site_keyword_variant(question).filter(|variant| variant != &active_query)
-            {
-                let shared = query_plan.keyword().iter().any(|candidate| {
-                    candidate.kind == crate::query::VariantKind::Keywords
-                        && candidate.text == variant
-                });
-                failure(&mut result,source,"query_variant",format!(
-                    "The SITE search returned no hits. One keyword retry retains detected entities. Changes: {}",
-                    json!({"original":question,"variant":variant,
-                        "method":if shared {"shared_keyword"} else {"local_entity_fallback"},
-                        "empty_query":false,"selection":"First nonempty shared keyword preserves entities and does not add AND terms. Otherwise retain the local fallback."})));
-                active_query = variant;
-                query_kind = if shared {
-                    "keywords"
-                } else {
-                    "local_entity_fallback"
-                };
-                keyword_retry = true;
-                continue;
-            }
-        }
-        let pages = body.get("nbPages").and_then(Value::as_u64).unwrap_or(0) as usize;
-        if hits.is_empty()
-            && page == 0
-            && !relaxed
-            && index.scope == "DOCS"
-            && total == Some(0)
-            && body.get("message").is_none()
-            && request_number + 1 < ctx.config.max_pages
-        {
-            relaxed = true;
-            failure(
-                &mut result,
-                source,
-                "query_relaxation",
-                "The strict search returned no hits. The next query permits optional words.",
-            );
-            continue;
-        }
-        if page + 1 >= pages {
-            break;
-        }
-        if request_number + 1 >= ctx.config.max_pages
-            || result.documents.len() >= ctx.config.max_documents
-            || (page + 1) * size >= 1000
-        {
-            failure(&mut result,source,"limit","The page, document, or Algolia limit stopped retrieval before all matching records.");
-            break;
-        }
-        page += 1;
     }
     Ok(result)
 }

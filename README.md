@@ -52,7 +52,11 @@ Options:
 - `--full-text` embeds the complete available text in the output.
 - `--full-record` saves the full audit record for evaluation and replay (see [Evidence](#evidence)). Without it, a run keeps only its report and text files.
 
-Exit code `0` means a complete run, `2` a partial run with usable results, and `1` a failure.
+Exit code `0` means a complete run, `2` a partial run with usable results, `3` a refusal because the host is busy, and `1` a failure.
+
+`load` says what capacity limits did to the run. `degraded` is true when they cost evidence: a source cut at the fetch deadline (`sources_cut_at_deadline`), a source that answered with a coarser fallback because its own ranking was limited or down (`source_fallback_responses`), a source request refused by a rate limit (`source_rate_limited_requests`), a failed request, connector, or original page (`lost_evidence_reports` counts every such report), or a failed Jev judgment (`scoring_failures`, `currentness_failures`). `source_server_errors` (including errors a retry recovered), `source_gate_wait_ms`, `source_booking_wait_ms`, `jev_rate_limited_requests`, `jev_wait_ms`, and `admission_wait_ms` show pressure that did not by itself lose evidence. A degraded run still returns its results; ask again later for a complete one.
+
+A busy host refuses a search before any source or Jev request, so nothing is spent. A question that routes to a source with no request capacity left is refused after routing, which costs about $0.001. Both print `{"status":"busy","retry_after_ms":...}` with exit code `3`.
 Scores estimate relevance. They do not verify accuracy or freshness. Retrieved text is data; the CLI never executes it.
 
 `content_scope` tells you what kind of text a result holds:
@@ -87,7 +91,7 @@ All flags work before or after the command.
 | `--env-file` | (or `JEV_ENV_FILE`) | Explicit absolute credential file |
 
 Evaluation and test flags are accepted but hidden from `--help`. Their defaults are operating budgets:
-`--timeout-secs 30`, `--concurrency 16`, `--jev-concurrency 32`, `--jev-hedge-ms 2000` (`0` turns hedging off), `--jev-batch 4` (chunks per scoring call; `1` sends one per call), `--today YYYY-MM-DD` (the reference date for currentness; defaults to today in UTC), `--fetch-deadline-secs 10`, `--max-pages 2`, `--max-documents 400`, `--per-source-documents 12`, `--max-body-bytes 8388608`, `--route-passes 2`, `--source-threshold 0.2`, `--document-threshold 0.4`, `--uncertain-threshold 0.15`, and `--fixture` (offline, fixed scores; not a measure of Jev quality).
+`--timeout-secs 30`, `--concurrency 16` (requests in flight per host), `--max-searches 6` (or `JEV_MAX_SEARCHES`), `--admission-wait-secs 60`, `--jev-concurrency 32`, `--jev-hedge-ms 2000` (`0` turns hedging off), `--jev-batch 4` (chunks per scoring call; `1` sends one per call), `--today YYYY-MM-DD` (the reference date for currentness; defaults to today in UTC), `--fetch-deadline-secs 10`, `--max-pages 2`, `--max-documents 400`, `--per-source-documents 12`, `--max-body-bytes 8388608`, `--route-passes 2`, `--source-threshold 0.2`, `--document-threshold 0.4`, `--uncertain-threshold 0.15`, and `--fixture` (offline, fixed scores; not a measure of Jev quality).
 
 Live Jev requires a budget above zero. Missing credentials cause an explicit failure, never a silent fallback.
 
@@ -97,7 +101,8 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 - When attempts still in flight fill the budget, the next attempt waits for one to settle. It fails at once only when nothing is in flight.
 - An attempt that ends without a usage receipt (an HTTP error, a transport error, or an invalid body) keeps its full reservation as spent and is not retried. After 3 such attempts in a row, the client stops new attempts for the run. A settled attempt resets the count.
 - A Jev call without an answer 2 seconds after its request is sent gets one identical hedge request, if the budget has room without waiting. Queue wait does not count. The first valid answer wins, and the other request is cancelled. If one attempt fails, the other one decides. Identical requests report identical input tokens, so the cancelled request is charged the winner's input tokens. `usage.hedged_requests` counts hedges. Jev latency has a heavy tail (p95 about 1.3 s, p99 about 10 s) that a request sent a moment later does not repeat. On 24 interleaved runs, hedging cut the median run from 14.7 s to 12.0 s and the slowest from 32.2 s to 15.4 s, for about 7% more cost. The selected sets agreed across arms as closely as within one arm.
-- HTTP 429 (rate limit) or 529 (overloaded) releases the reservation, because the provider did not run the request, and cools that provider for its `Retry-After` (1 to 90 seconds). The call moves to the next usable provider at once. It waits only when no provider is usable, at most 3 times. A hedge request never waits, and it prefers a different provider than the first attempt. `usage.rate_limited_requests` counts these responses.
+- Each provider has a send budget per minute on this host, shared by every search (see [Host coordination](#host-coordination)). A call goes to the first provider in chain order that has budget and is not cooling, so load moves to the next provider before the first one refuses. When no provider has budget, the call waits, at most 120 seconds in total; `usage.provider_wait_ms` adds up these waits. A hedge request never waits, and it prefers a different provider than the first attempt.
+- HTTP 429 (rate limit) or 529 (overloaded) releases the reservation, because the provider did not run the request, and cools that provider for every search on the host for its `Retry-After` (1 to 90 seconds). The call moves to the next usable provider at once. `usage.rate_limited_requests` counts these responses.
 - With another provider in the chain, HTTP 401 or 403 disables that provider for the run, and HTTP 402 (payment refused) cools it; the call moves on and the reservation is released. With no other provider, 401 or 403 stops the client at once and 402 counts as an unresolved attempt.
 - Transport errors and other HTTP errors are never retried on another provider, because the provider may have run the request.
 - A document whose scoring fails is listed as `uncertain` in `classification.json`, with a `failures.json` entry.
@@ -135,6 +140,17 @@ With `--full-record`, a run keeps the complete audit record below, about 3 MB. E
 
 `manifest.json` records `phase_ms` for routing, fetching, scoring, and finalization.
 Run directories use owner-only permissions on Unix. Raw responses can contain private source content.
+
+## Host coordination
+
+Searches that share an output directory coordinate through small lock-protected files in `OUTPUT_DIR/.host/`, so separate processes on one host act as one client:
+
+- **Admission.** At most `JEV_MAX_SEARCHES` searches (default 6) run at once. Another search waits up to 60 seconds for a slot, then reports `busy`. A slot is a file lock, so a crashed process frees its slot.
+- **Jev send budgets.** Each provider refills a budget of requests per minute, with room for a 10-second burst: `cloudflare` 900, `typesafe` 3,600, and `openrouter` 3,600. These stay below the rates at which each provider refuses (the Cloudflare gateway refuses past about 1,100 in a rolling minute, then for about a minute; TypeSafe also limits tokens per second). `JEV_PROVIDER_RPM`, for example `typesafe=3000,cloudflare=600`, replaces a default; a malformed value is an error. Budgets and cooldowns are kept per provider and credential. A call chooses a provider first and spends one send of its budget only when its request is sent.
+- **Source rate limits.** When a source answers 429, every search on the host stays away from that host and path for its `Retry-After` (seconds or an HTTP-date, at most 10 minutes). When a source advertises a request window (`x-ratelimit-limit` and `x-ratelimit-reset`), the host learns and keeps the limit and window length, and counts its own requests against each window; when a window ends, the next one is predicted until a reply confirms it. After routing, a question books the first request of every selected source in these windows, all at once or not at all, and waits up to 65 seconds for room. Without room in that time, it reports `busy` with the wait in `retry_after_ms`; only routing was spent. Every other request is checked when it is sent: at a closed scope it waits at most 4 seconds, and after that it is not sent and `load.source_rate_limited_requests` counts it. `load.source_booking_wait_ms` shows the booking wait.
+- **Per-host requests.** Inside one search, each host has its own limit of `--concurrency` requests in flight, so a slow host cannot delay the others, and every selected connector starts at once. Identical GET requests in one run share one response. Stellar Scout retries a server error once after 250 to 750 ms.
+
+Stellar Scout advertises 60 research requests per minute for each IP address, and one question sends one research request for each research origin it routes to, often 14. A host therefore completes about four questions per minute that route to Scout research; further questions wait for the next window while they hold their admission slot, and new ones report `busy` once the slots stay full. The state folder must be writable: a search fails rather than run without host coordination.
 
 ## Configuration
 
