@@ -6,4 +6,5 @@ pub mod pipeline;
 pub mod query;
 pub mod rank;
 pub mod search;
+pub mod session;
 pub mod types;

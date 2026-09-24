@@ -70,15 +70,33 @@ Scores estimate relevance. They do not verify accuracy or freshness. Retrieved t
 | `indexed_sections_or_metadata` | Search-index metadata |
 | `synthetic_record` | Generated context from a source registry, not original page text, even when the URL is official |
 
+## Sessions
+
+Every search is a session: its run folder, named in `session.id`. Later calls extend it.
+
+```sh
+stellar-raven-jev more SESSION --pool ID[,ID]     # spend open pools, then print the re-ranked session
+stellar-raven-jev more SESSION --all              # spend every open pool
+stellar-raven-jev check SESSION "CLAIM" ["CLAIM"...]  # which documents support, contradict, or qualify each claim
+```
+
+- `session` reports the folder, the calls so far, the cumulative `usage`, and how many documents are scored and still unscored.
+- `pools` lists what the session has not spent yet, with facts only: the source's name and description, its routing probability (`route`), its `state`, the documents `pending`, what the session already `scored` and `selected` from it with the `best` probability, and the `source_requests` spending it sends. `unscored_tail` means fetched documents that are not scored yet; `unfetched` means a source routed at or above the source threshold that was not fetched. The tool ranks pools by routing probability and gives no advice.
+- `more` scores a pool's unscored documents, or fetches an unfetched source (booked in source request windows like `search`), removes documents the session already holds, scores the new ones against the original question, judges currentness for new selected results only, and prints the same compact output. A `text_path` never changes between calls.
+- `check` asks Jev, for each of up to four claims, three independent questions about every chunk of the selected and uncertain documents (`--scope scored` reads every scored document, `--scope all` also the unscored ones): does the text support the claim, contradict it, or add a condition under which it does not hold. It lists the documents at 0.5 or above in each list, strongest first, with `text_path`, and saves every judgment under `checks/`. It gives no verdict; read a document before you cite it.
+- A session's cumulative Jev spending is capped at three times `--budget-usd`. Each call takes one admission slot for its own duration.
+
+With default settings, the first call fetches and scores what one search always did, so `pools` is usually empty. The hidden flags `--fetch-threshold` (fetch sources routed at or above; default 0.2) and `--score-depth` (score the first N documents of each source, then the rest only where the source routed 0.6 or above or a scored document reached the uncertain threshold; default 0, all) make the first call leaner and leave the rest as pools.
+
 ## Other commands
 
 ```sh
 stellar-raven-jev sources                         # list sources; add --resources agentic
 stellar-raven-jev doctor                          # check local configuration without network calls
-stellar-raven-jev report RUN_DIR --variant NAME   # rebuild a --full-record run's report; no retrieval or scoring
+stellar-raven-jev report RUN_DIR --variant NAME   # rebuild a run's report; no retrieval or scoring
 ```
 
-`report` writes `search-NAME.json` beside the original, which stays unchanged, so ranking changes can be compared on saved evidence at no cost. It needs a run saved with `--full-record`.
+`report` writes `search-NAME.json` beside the original, which stays unchanged, so ranking changes can be compared on saved evidence at no cost.
 
 ## Controls
 
@@ -119,9 +137,9 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 
 ## Evidence
 
-By default a run folder keeps only what the output points to: `search.json` (the full ranked report, including failures and usage), the `search-documents/NNNN.txt` files that `text_path` names, and `manifest.json` (configuration, outcome, cost, and timings). It is usually well under 200 KB.
+By default a run folder keeps what the output points to and what later session calls need: `search.json` (the full ranked report, including failures and usage), the `search-documents/NNNN.txt` files that `text_path` names (NNNN is the document's position in `documents.json`), `manifest.json` (configuration, outcome, cost, and timings), and the session state: `documents.json`, `deferred.json` (unscored documents), `scores.json`, `classification.json`, `source-decisions.json`, `routes.json`, `omitted.json`, `failures.json`, `intent.json`, `usage.json` (cumulative), `load.json`, `session.json` (one entry per call), and `checks/`. It is usually 1 to 3 MB.
 
-With `--full-record`, a run keeps the complete audit record below, about 3 MB. Evaluation passes and `report` need it. All JSON is compact.
+With `--full-record`, a run also keeps raw HTTP bodies and Jev traces, the complete audit record below. Evaluation passes need it. All JSON is compact.
 
 | Path | Holds |
 |---|---|

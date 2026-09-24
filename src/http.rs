@@ -77,6 +77,8 @@ struct LoadCounters {
     server_errors: AtomicU64,
     gate_wait_ms: AtomicU64,
     booking_wait_ms: AtomicU64,
+    /// Source requests sent, per host.
+    sent: Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 /// A source request that was not sent because the source's rate-limit gate is closed.
@@ -377,6 +379,7 @@ impl HttpRecorder {
             "source_server_errors": self.load.server_errors.load(Ordering::Relaxed),
             "source_gate_wait_ms": self.load.gate_wait_ms.load(Ordering::Relaxed),
             "source_booking_wait_ms": self.load.booking_wait_ms.load(Ordering::Relaxed),
+            "source_requests": *self.load.sent.lock().unwrap_or_else(|e| e.into_inner()),
         })
     }
 
@@ -434,6 +437,23 @@ impl HttpRecorder {
 
     pub fn run_dir(&self) -> &Path {
         &self.root
+    }
+
+    /// A recorder for a later call in an existing run folder: raw file numbers continue after the
+    /// ones already there.
+    pub fn resume(run_dir: &Path, config: &RunConfig) -> Result<Self> {
+        let recorder = Self::new(run_dir, config)?;
+        let next = std::fs::read_dir(run_dir.join("raw"))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name();
+                name.to_str()?.split('.').next()?.parse::<u64>().ok()
+            })
+            .max()
+            .map_or(0, |n| n + 1);
+        recorder.sequence.store(next, Ordering::Relaxed);
+        Ok(recorder)
     }
 
     pub fn new(run_dir: &Path, config: &RunConfig) -> Result<Self> {
@@ -665,6 +685,15 @@ impl HttpRecorder {
             if gate.stop.is_some_and(|stop| stop()) {
                 return Err(NotSent.into());
             }
+            if self.gates.is_some() {
+                *self
+                    .load
+                    .sent
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(parsed.host_str().unwrap_or_default().to_owned())
+                    .or_default() += 1;
+            }
             if let Some(sent) = gate.notify {
                 sent.notify_one();
             }
@@ -871,6 +900,19 @@ mod tests {
         let mut recorder = HttpRecorder::new(dir, &RunConfig::default()).unwrap();
         recorder.allow_loopback = true;
         recorder.with_source_gates(Arc::new(crate::governor::Governor::local()))
+    }
+
+    #[test]
+    fn a_resumed_recorder_numbers_raw_files_after_the_existing_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("raw")).unwrap();
+        std::fs::write(dir.path().join("raw/000007.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join("raw/000003.body.gz"), b"").unwrap();
+        let recorder = HttpRecorder::resume(dir.path(), &RunConfig::default()).unwrap();
+        assert_eq!(recorder.sequence.load(Ordering::Relaxed), 8);
+        let empty = tempfile::tempdir().unwrap();
+        let fresh = HttpRecorder::resume(empty.path(), &RunConfig::default()).unwrap();
+        assert_eq!(fresh.sequence.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

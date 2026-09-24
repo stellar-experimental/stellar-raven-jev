@@ -557,6 +557,137 @@ impl JevClient {
             .collect()
     }
 
+    /// Judge each claim against every chunk of each document: does the text support the claim,
+    /// contradict it, or qualify it? Per document and claim, each probability is its maximum over
+    /// the document's chunks, and `chunk` is the byte range that supports the claim best. The three
+    /// questions are independent; low support does not mean contradiction.
+    pub async fn judge_claims(
+        &self,
+        question: &str,
+        claims: &[String],
+        documents: &[Document],
+    ) -> Vec<Result<Vec<ClaimJudgment>>> {
+        let blank = || ClaimJudgment {
+            supports: 0.0,
+            contradicts: 0.0,
+            qualifies: 0.0,
+            chunks: [[0, 0]; 3],
+        };
+        if self.is_fixture() {
+            return documents
+                .iter()
+                .map(|d| {
+                    Ok(claims
+                        .iter()
+                        .map(|_| ClaimJudgment {
+                            supports: 0.5,
+                            chunks: [[0, d.text.len().min(DOCUMENT_CHUNK_BYTES)]; 3],
+                            ..blank()
+                        })
+                        .collect())
+                })
+                .collect();
+        }
+        let mut slots: Vec<(usize, (usize, usize))> = Vec::new();
+        for (d, document) in documents.iter().enumerate() {
+            for range in text_chunks(&document.text, DOCUMENT_CHUNK_BYTES) {
+                slots.push((d, range));
+            }
+        }
+        let base = json!({"user_question":question,"claims":claims,"documents":[]})
+            .to_string()
+            .len();
+        // Each chunk carries three questions per claim, so fewer chunks share a call as claims
+        // grow; the request then stays within its size limit.
+        let per_call = (self.batch.max(1) / claims.len().max(1)).max(1);
+        let mut calls: Vec<Vec<usize>> = Vec::new();
+        let mut bytes = base;
+        for (s, &(d, (start, end))) in slots.iter().enumerate() {
+            let size = json!({"title":documents[d].title,"text":&documents[d].text[start..end]})
+                .to_string()
+                .len()
+                + 1;
+            if calls
+                .last()
+                .is_none_or(|c| c.len() >= per_call || bytes + size > BATCH_STATE_BYTES)
+            {
+                calls.push(Vec::new());
+                bytes = base;
+            }
+            calls.last_mut().unwrap().push(s);
+            bytes += size;
+        }
+        let evaluations = calls.iter().map(|call| {
+            let slots = &slots;
+            async move {
+                let mut questions = Map::new();
+                let mut texts = Vec::new();
+                let mut context = Vec::new();
+                for (k, &s) in call.iter().enumerate() {
+                    let (d, (start, end)) = slots[s];
+                    for j in 0..claims.len() {
+                        questions.extend(claim_questions(k, j));
+                    }
+                    texts.push(json!({"title":documents[d].title,"text":&documents[d].text[start..end]}));
+                    context.push(json!({"document_id":documents[d].id,"utf8_byte_start":start,"utf8_byte_end":end}));
+                }
+                self.evaluate(
+                    json!({"user_question":question,"claims":claims,"documents":texts}),
+                    questions,
+                    json!({"stage":"claim_check","chunks":context}),
+                )
+                .await
+            }
+        });
+        let outcomes = futures::future::join_all(evaluations).await;
+        let mut judged: Vec<Result<Vec<ClaimJudgment>>> = documents
+            .iter()
+            .map(|_| Ok(claims.iter().map(|_| blank()).collect()))
+            .collect();
+        for (call, outcome) in calls.iter().zip(outcomes) {
+            match outcome {
+                Ok((answers, _)) => {
+                    for (k, &s) in call.iter().enumerate() {
+                        let (d, (start, end)) = slots[s];
+                        let Ok(per_claim) = judged[d].as_mut() else {
+                            continue;
+                        };
+                        for (j, judgment) in per_claim.iter_mut().enumerate() {
+                            let get = |name: &str| {
+                                answers
+                                    .get(&format!("d{k}_c{j}_{name}"))
+                                    .copied()
+                                    .unwrap_or(0.0)
+                            };
+                            let range = [start, end];
+                            let values = [get("supports"), get("contradicts"), get("qualifies")];
+                            let best = [
+                                &mut judgment.supports,
+                                &mut judgment.contradicts,
+                                &mut judgment.qualifies,
+                            ];
+                            for (i, (value, best)) in values.into_iter().zip(best).enumerate() {
+                                if value > *best || judgment.chunks[i] == [0, 0] {
+                                    judgment.chunks[i] = range;
+                                }
+                                *best = best.max(value);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    for &s in call {
+                        let d = slots[s].0;
+                        if judged[d].is_ok() {
+                            judged[d] = Err(anyhow!("{error:#}"));
+                        }
+                    }
+                }
+            }
+        }
+        judged
+    }
+
     /// Combine one document's chunk answers into its score and write its coverage record.
     fn assemble_score(
         &self,
@@ -1468,6 +1599,35 @@ fn evidence_questions(path: &str, prefix: &str) -> Map<String, Value> {
 /// The one currentness question. It sees today's date and the document's code-extracted date, so
 /// it can judge age against how fast the subject changes. It compares no dates itself: code
 /// supplies both, and the question asks for a judgment, not arithmetic.
+/// Jev's judgment of one claim against one document.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ClaimJudgment {
+    pub supports: f64,
+    pub contradicts: f64,
+    pub qualifies: f64,
+    /// UTF-8 byte ranges of the chunks that gave each probability: support, contradiction, and
+    /// qualification. Each probability is the maximum over the chunks, independently.
+    pub chunks: [[usize; 2]; 3],
+}
+
+/// The three questions for claim `j` against chunk `k` of a claim check.
+fn claim_questions(k: usize, j: usize) -> Map<String, Value> {
+    json!({
+        format!("d{k}_c{j}_supports"): {"type":"noul",
+            "instructions":format!("Does `documents[{k}].text` state, or give facts that directly establish, that `claims[{j}]` is true?"),
+            "criteria":{"true":"The text asserts the claim, or states facts from which the claim follows without outside knowledge.",
+                "false":"The text does not establish the claim. Being about the same subject does not qualify."}},
+        format!("d{k}_c{j}_contradicts"): {"type":"noul",
+            "instructions":format!("Does `documents[{k}].text` state, or give facts that directly establish, that `claims[{j}]` is false or has a different value?"),
+            "criteria":{"true":"The text asserts something incompatible with the claim, such as a different value, version, or outcome.",
+                "false":"The text does not conflict with the claim, or does not address it."}},
+        format!("d{k}_c{j}_qualifies"): {"type":"noul",
+            "instructions":format!("Does `documents[{k}].text` add a condition, exception, version, or date limit under which `claims[{j}]` stops holding or holds differently?"),
+            "criteria":{"true":"The text names a case in which the claim does not hold as stated.",
+                "false":"The text adds no such limit, or only repeats the claim."}}
+    }).as_object().unwrap().clone()
+}
+
 fn currentness_question() -> Map<String, Value> {
     json!({
         "still_current":{"type":"noul","instructions":"Is what `document.text` says about the subject of `user_question` likely still true on `today`, given `document.date`?","criteria":{

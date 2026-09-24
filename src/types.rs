@@ -102,6 +102,13 @@ pub struct RunConfig {
     pub max_body_bytes: usize,
     pub route_passes: usize,
     pub source_threshold: f64,
+    /// Sources routed at or above this are fetched in the first call; sources routed between
+    /// `source_threshold` and this stay in the session as pools for `more`.
+    pub fetch_threshold: f64,
+    /// Score the first this many documents of each fetched source, then the rest only where the
+    /// source routed high or a scored document reached `uncertain_threshold`; the others stay in
+    /// the session as pools. Zero scores every fetched document.
+    pub score_depth: usize,
     pub document_threshold: f64,
     pub uncertain_threshold: f64,
     /// Write the full audit record (raw HTTP bodies, Jev traces, document store, and
@@ -131,6 +138,8 @@ impl Default for RunConfig {
             max_body_bytes: 8 * 1024 * 1024,
             route_passes: 2,
             source_threshold: 0.2,
+            fetch_threshold: 0.2,
+            score_depth: 0,
             document_threshold: 0.4,
             uncertain_threshold: 0.15,
             full_record: true,

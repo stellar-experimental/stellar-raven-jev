@@ -1,5 +1,5 @@
 use crate::{connectors, http::HttpRecorder, jev::JevClient, types::*};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ pub struct RunOutcome {
 }
 
 #[derive(Default, Serialize)]
-struct Evidence {
+pub(crate) struct Evidence {
     routes: Vec<serde_json::Value>,
     source_decisions: Vec<serde_json::Value>,
     documents: Vec<Document>,
@@ -35,6 +35,8 @@ struct Evidence {
     rejected: Vec<Document>,
     uncertain: Vec<Document>,
     omitted: Vec<Document>,
+    /// Fetched and admitted but not yet scored (`--score-depth`); `more` can score them.
+    deferred: Vec<Document>,
     failures: Vec<Failure>,
     /// The question time intent. See `rank`.
     intent: serde_json::Value,
@@ -43,6 +45,9 @@ struct Evidence {
     /// Set when the question found no room in a source's request window in time.
     #[serde(skip)]
     retry_after_ms: Option<u64>,
+    /// The session's usage before this call, so checkpoints save cumulative usage.
+    #[serde(skip)]
+    prior_usage: Usage,
     #[serde(skip)]
     timings: BTreeMap<&'static str, u64>,
 }
@@ -155,6 +160,7 @@ pub fn validate_config(config: &RunConfig) -> Result<()> {
     }
     for (flag, value) in [
         ("source-threshold", config.source_threshold),
+        ("fetch-threshold", config.fetch_threshold),
         ("document-threshold", config.document_threshold),
         ("uncertain-threshold", config.uncertain_threshold),
     ] {
@@ -196,6 +202,8 @@ fn prepare(question: &str, config: &RunConfig) -> Result<(RunConfig, HttpRecorde
         .output_dir
         .join(format!("{stamp}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&config.output_dir)?;
+    // Absolute, so the session id works from any directory.
+    config.output_dir = config.output_dir.canonicalize()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -257,6 +265,7 @@ fn persist(
         &json!({"selected":ids(&evidence.selected),"uncertain":ids(&evidence.uncertain),"rejected":ids(&evidence.rejected)}),
     )?;
     write_json(root.join("omitted.json"), &evidence.omitted)?;
+    write_json(root.join("deferred.json"), &evidence.deferred)?;
     write_json(root.join("failures.json"), &evidence.failures)?;
     write_json(root.join("usage.json"), usage)?;
     write_json(root.join("intent.json"), &evidence.intent)?;
@@ -307,9 +316,28 @@ fn collect_artifacts(root: &Path) -> Result<serde_json::Value> {
     Ok(json!({"files":files,"directories":directories}))
 }
 
-/// The default light record: keep only manifest.json, search.json, and the search-documents
-/// text files that the report's text_path fields name. Run after the report is built.
-pub fn keep_report_only(root: &Path) -> Result<()> {
+/// Files a session needs for later calls (`more`, `check`, `report`).
+pub(crate) const SESSION_FILES: &[&str] = &[
+    "question.json",
+    "routes.json",
+    "source-scope.json",
+    "source-decisions.json",
+    "documents.json",
+    "deferred.json",
+    "scores.json",
+    "classification.json",
+    "omitted.json",
+    "failures.json",
+    "intent.json",
+    "usage.json",
+    "load.json",
+    "session.json",
+];
+
+/// The default light record: keep the report, the text files its text_path fields name, the
+/// manifest, and the session state; remove raw bodies, Jev traces, and intermediate files. Run
+/// after the report is built.
+pub fn keep_session_record(root: &Path) -> Result<()> {
     anyhow::ensure!(
         root.join("search.json").is_file() && root.join("manifest.json").is_file(),
         "The report must exist before the run folder is reduced to it"
@@ -317,10 +345,15 @@ pub fn keep_report_only(root: &Path) -> Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name();
+        let name = name.to_string_lossy();
         if matches!(
-            name.to_str(),
-            Some("manifest.json" | "search.json" | "search-documents")
-        ) {
+            name.as_ref(),
+            "manifest.json" | "search.json" | "search-documents" | "checks" | "session.lock"
+        )
+            || SESSION_FILES.contains(&name.as_ref())
+            // Replay variants: search-NAME.json and search-documents-NAME.
+            || name.starts_with("search-")
+        {
             continue;
         }
         if entry.path().is_dir() {
@@ -494,7 +527,13 @@ async fn execute(
         persist(config, &evidence, &backend.usage(), "running")?;
     }
     for source in sources {
-        evidence.source_decisions.push(json!({"source_id":source.id,"max_probability":maxima.get(&source.id),"selected":selected.contains(&source.id),"reason":if selected.contains(&source.id) {"selected by union across passes"} else if valid_passes == 0 {"not retrieved because all route passes failed"} else {"below source threshold in all valid passes"}}));
+        let now = selected.contains(&source.id)
+            && maxima
+                .get(&source.id)
+                .is_some_and(|p| *p >= config.fetch_threshold);
+        // `fetched` turns true once the fetch ran, so a call refused before it keeps the source
+        // as a pool.
+        evidence.source_decisions.push(json!({"source_id":source.id,"max_probability":maxima.get(&source.id),"selected":selected.contains(&source.id),"fetched":false,"reason":if now {"selected by union across passes"} else if selected.contains(&source.id) {"routed below the fetch threshold; kept in the session as a pool"} else if valid_passes == 0 {"not retrieved because all route passes failed"} else {"below source threshold in all valid passes"}}));
     }
     if valid_passes == 0 {
         return persist(config, &evidence, &backend.usage(), "failed");
@@ -502,15 +541,24 @@ async fn execute(
     evidence
         .timings
         .insert("route", run_started.elapsed().as_millis() as u64);
-    // Book the first request of every selected source in any window its source advertises, so
+    // Sources routed at or above the fetch threshold are fetched now; the others stay in the
+    // session as pools that `more` can spend.
+    let fetch_now: Vec<&Source> = sources
+        .iter()
+        .filter(|source| {
+            selected.contains(&source.id)
+                && maxima
+                    .get(&source.id)
+                    .is_some_and(|p| *p >= config.fetch_threshold)
+        })
+        .collect();
+    // Book the first request of every source fetched now in any window its source advertises, so
     // the question waits for room instead of losing sources to a refusal mid-fetch. Without room
     // in about one window, the question is refused as busy: only routing was spent.
-    let demands = connectors::first_requests(
-        sources
-            .iter()
-            .filter(|source| selected.contains(&source.id)),
-    );
-    match http.book_windows(&demands).await {
+    match http
+        .book_windows(&connectors::first_requests(fetch_now.iter().copied()))
+        .await
+    {
         Ok(None) => {}
         Ok(Some(wait)) => {
             evidence.failures.push(failure(
@@ -531,26 +579,55 @@ async fn execute(
                 .push(failure("host_state", None, error.to_string()));
         }
     }
-    let jobs = stream::iter(
-        sources
-            .iter()
-            .filter(|source| selected.contains(&source.id)),
+    let fetched =
+        fetch_sources(question, config, &http, backend, &fetch_now, &mut evidence).await?;
+    mark_fetched(&mut evidence, &fetch_now);
+    evidence
+        .timings
+        .insert("fetch", run_started.elapsed().as_millis() as u64);
+    let admitted = admit(config, &mut evidence, fetched);
+    persist(config, &evidence, &backend.usage(), "running")?;
+    score_stage(question, config, backend, &mut evidence, admitted, &maxima).await?;
+    finish(
+        question,
+        config,
+        &http,
+        backend,
+        evidence,
+        &intent,
+        &Usage::default(),
+        run_started,
     )
-    .map(|source| {
-        let mut source_config = config.clone();
-        source_config.max_documents = config.max_documents.min(config.per_source_documents);
-        let ctx = FetchContext {
-            http: http.clone(),
-            config: source_config,
-        };
-        async move {
-            (
-                source.id.clone(),
-                backend.fetch(&ctx, source, question).await,
-            )
-        }
-    })
-    .buffer_unordered(selected.len().max(1));
+    .await
+}
+
+/// Fetch the chosen sources in parallel within the fetch deadline. A connector still running at
+/// the deadline is recorded and dropped.
+pub(crate) async fn fetch_sources(
+    question: &str,
+    config: &RunConfig,
+    http: &HttpRecorder,
+    backend: &dyn Backend,
+    chosen: &[&Source],
+    evidence: &mut Evidence,
+) -> Result<Vec<Document>> {
+    let selected: BTreeSet<String> = chosen.iter().map(|s| s.id.clone()).collect();
+    let jobs = stream::iter(chosen.iter().copied())
+        .map(|source| {
+            let mut source_config = config.clone();
+            source_config.max_documents = config.max_documents.min(config.per_source_documents);
+            let ctx = FetchContext {
+                http: http.clone(),
+                config: source_config,
+            };
+            async move {
+                (
+                    source.id.clone(),
+                    backend.fetch(&ctx, source, question).await,
+                )
+            }
+        })
+        .buffer_unordered(selected.len().max(1));
     // Every selected connector starts at once; the recorder bounds requests per host, so a slow
     // host cannot delay the connectors of other hosts.
     // Heap-pinned so the stream, and every in-flight connector with its HTTP permit, can be dropped early.
@@ -603,9 +680,16 @@ async fn execute(
         config.output_dir.join("retrieved.json"),
         &retrieved_index(&fetched),
     )?;
-    evidence
-        .timings
-        .insert("fetch", run_started.elapsed().as_millis() as u64);
+    Ok(fetched)
+}
+
+/// Namespace fetched documents by source and admit them round-robin across sources, each source
+/// in upstream order, up to the session's document limit. Returns them in admission order.
+pub(crate) fn admit(
+    config: &RunConfig,
+    evidence: &mut Evidence,
+    fetched: Vec<Document>,
+) -> Vec<Document> {
     // BTreeMap gives stable source order. Each source queue preserves upstream document rank.
     // Round-robin admission gives every selected source a place before a source takes a second place.
     let mut groups: BTreeMap<String, std::collections::VecDeque<Document>> = BTreeMap::new();
@@ -617,7 +701,14 @@ async fn execute(
             .or_default()
             .push_back(document);
     }
-    let mut seen = BTreeSet::new();
+    let mut seen: BTreeSet<String> = evidence
+        .documents
+        .iter()
+        .chain(&evidence.deferred)
+        .map(|d| d.id.clone())
+        .collect();
+    let capacity = config.max_documents.saturating_sub(seen.len());
+    let mut admitted = Vec::new();
     loop {
         let mut any = false;
         for group in groups.values_mut() {
@@ -633,8 +724,8 @@ async fn execute(
                         ),
                     ));
                     evidence.omitted.push(document);
-                } else if evidence.documents.len() < config.max_documents {
-                    evidence.documents.push(document);
+                } else if admitted.len() < capacity {
+                    admitted.push(document);
                 } else {
                     evidence.omitted.push(document);
                 }
@@ -662,24 +753,67 @@ async fn execute(
             ),
         ));
     }
-    persist(config, &evidence, &backend.usage(), "running")?;
+    admitted
+}
+
+/// Score documents with Jev and classify them. Exact duplicates, within the batch or of a document
+/// the session already scored, are scored once and the score, or the failure, is copied.
+pub(crate) async fn score_batch(
+    question: &str,
+    config: &RunConfig,
+    backend: &dyn Backend,
+    evidence: &mut Evidence,
+    batch: Vec<Document>,
+) -> Result<()> {
     // Exact duplicates are scored once. Jev sees the title and the text, so both are in the key.
     // The score, or the failure, fans back to every original ID with its own provenance, so counts,
     // labels, and run status do not change.
+    // A tuple key, not a joined string: a separator can appear inside either field.
+    let key = |document: &Document| {
+        (
+            document.url.clone(),
+            document.title.clone(),
+            text_digest(&document.text),
+        )
+    };
+    // Documents this session already scored, so a later call reuses their scores.
+    let scored: BTreeMap<&str, &DocumentScore> = evidence
+        .scores
+        .iter()
+        .map(|s| (s.document_id.as_str(), s))
+        .collect();
+    let known: BTreeMap<(String, String, String), DocumentScore> = evidence
+        .documents
+        .iter()
+        .filter(|d| !d.url.is_empty())
+        .filter_map(|d| scored.get(d.id.as_str()).map(|s| (key(d), (*s).clone())))
+        .collect();
+    // A document already stored (left unscored by a stopped call) keeps its position.
+    let stored: BTreeSet<String> = evidence.documents.iter().map(|d| d.id.clone()).collect();
+    evidence
+        .documents
+        .extend(batch.iter().filter(|d| !stored.contains(&d.id)).cloned());
     let mut representatives: BTreeMap<(String, String, String), String> = BTreeMap::new();
     let mut duplicates: BTreeMap<String, Vec<Document>> = BTreeMap::new();
     let mut to_score = Vec::new();
-    for document in evidence.documents.clone() {
+    for document in batch {
         if document.url.is_empty() {
             to_score.push(document);
             continue;
         }
-        // A tuple key, not a joined string: a separator can appear inside either field.
-        let key = (
-            document.url.clone(),
-            document.title.clone(),
-            text_digest(&document.text),
-        );
+        let key = key(&document);
+        if let Some(score) = known.get(&key) {
+            let mut copied = score.clone();
+            copied.reason = format!(
+                "Score copied from {} (same URL, title, and text). {}",
+                score.document_id, score.reason
+            );
+            copied.document_id = document.id.clone();
+            // Currentness depends on the document's own date, which can differ.
+            copied.still_current = None;
+            classify(evidence, config, document, copied);
+            continue;
+        }
         match representatives.get(&key) {
             Some(representative) => duplicates
                 .entry(representative.clone())
@@ -726,9 +860,9 @@ async fn execute(
                         "Score copied from {} (same URL, title, and text). {}",
                         document.id, score.reason
                     );
-                    classify(&mut evidence, config, copy, copied);
+                    classify(evidence, config, copy, copied);
                 }
-                classify(&mut evidence, config, document, score);
+                classify(evidence, config, document, score);
             }
             Err(error) => {
                 evidence.failures.push(failure(
@@ -753,10 +887,93 @@ async fn execute(
             }
         }
         if checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
-            persist(config, &evidence, &backend.usage(), "running")?;
+            persist(
+                config,
+                evidence,
+                &add_usage(&evidence.prior_usage, &backend.usage()),
+                "running",
+            )?;
             checkpoint = std::time::Instant::now();
         }
     }
+    Ok(())
+}
+
+/// A source whose routing reached this is promising enough to score beyond `--score-depth`.
+const EXTEND_ROUTE: f64 = 0.6;
+
+/// Score admitted documents. With `--score-depth`, score the first documents of each source,
+/// then the rest of a source only where it routed at `EXTEND_ROUTE` or above or one of its scored
+/// documents reached `--uncertain-threshold`; other documents stay in the session unscored.
+pub(crate) async fn score_stage(
+    question: &str,
+    config: &RunConfig,
+    backend: &dyn Backend,
+    evidence: &mut Evidence,
+    admitted: Vec<Document>,
+    routes: &BTreeMap<String, f64>,
+) -> Result<()> {
+    if config.score_depth == 0 {
+        return score_batch(question, config, backend, evidence, admitted).await;
+    }
+    let mut first = Vec::new();
+    let mut tails: BTreeMap<String, Vec<Document>> = BTreeMap::new();
+    let mut taken: BTreeMap<String, usize> = BTreeMap::new();
+    for document in admitted {
+        let count = taken.entry(document.source_id.clone()).or_default();
+        if *count < config.score_depth {
+            *count += 1;
+            first.push(document);
+        } else {
+            tails
+                .entry(document.source_id.clone())
+                .or_default()
+                .push(document);
+        }
+    }
+    score_batch(question, config, backend, evidence, first).await?;
+    let source_of: BTreeMap<&str, &str> = evidence
+        .documents
+        .iter()
+        .map(|d| (d.id.as_str(), d.source_id.as_str()))
+        .collect();
+    let promising: BTreeSet<String> = evidence
+        .scores
+        .iter()
+        .filter(|s| s.probability >= config.uncertain_threshold)
+        .filter_map(|s| {
+            source_of
+                .get(s.document_id.as_str())
+                .map(|s| (*s).to_owned())
+        })
+        .collect();
+    let mut second = Vec::new();
+    for (source, tail) in tails {
+        if promising.contains(&source) || routes.get(&source).is_some_and(|p| *p >= EXTEND_ROUTE) {
+            second.extend(tail);
+        } else {
+            evidence.deferred.extend(tail);
+        }
+    }
+    if !second.is_empty() {
+        score_batch(question, config, backend, evidence, second).await?;
+    }
+    Ok(())
+}
+
+/// Judge currentness where the intent asks for it, then save the run and its manifest. `prior` is
+/// the session's usage before this call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn finish(
+    question: &str,
+    config: &RunConfig,
+    http: &HttpRecorder,
+    backend: &dyn Backend,
+    mut evidence: Evidence,
+    intent: &crate::rank::Intent,
+    prior: &Usage,
+    run_started: std::time::Instant,
+) -> Result<RunOutcome> {
     evidence
         .timings
         .insert("score", run_started.elapsed().as_millis() as u64);
@@ -764,10 +981,21 @@ async fn execute(
         let today = crate::rank::iso_date_days(&config.today).unwrap_or_default();
         propagate_url_dates(&mut evidence, today);
         if !config.fixture {
-            backfill_page_dates(&http, &mut evidence, today).await;
+            backfill_page_dates(http, &mut evidence, today).await;
             propagate_url_dates(&mut evidence, today);
         }
         assess_currentness(question, config, backend, &mut evidence, today).await;
+        // Dates found for selected documents belong to the stored documents too.
+        let dated: BTreeMap<String, serde_json::Value> = evidence
+            .selected
+            .iter()
+            .map(|d| (d.id.clone(), d.provenance.clone()))
+            .collect();
+        for document in &mut evidence.documents {
+            if let Some(provenance) = dated.get(&document.id) {
+                document.provenance = provenance.clone();
+            }
+        }
         evidence
             .timings
             .insert("currentness", run_started.elapsed().as_millis() as u64);
@@ -788,7 +1016,8 @@ async fn execute(
     } else {
         "partial"
     };
-    let outcome = persist(config, &evidence, &backend.usage(), status)
+    let usage = add_usage(prior, &backend.usage());
+    let outcome = persist(config, &evidence, &usage, status)
         .context("Could not finalize the run evidence")?;
     // Record the export cost without rewriting every artifact again.
     let mut manifest: serde_json::Value =
@@ -796,6 +1025,274 @@ async fn execute(
     manifest["phase_ms"]["finalize"] = json!(run_started.elapsed().as_millis() as u64);
     write_json(config.output_dir.join("manifest.json"), &manifest)?;
     Ok(outcome)
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(root: &Path, name: &str) -> Result<T> {
+    serde_json::from_slice(&std::fs::read(root.join(name))?)
+        .with_context(|| format!("{name} in the session is unreadable"))
+}
+
+/// The session state saved in a run folder.
+pub(crate) fn load_evidence(root: &Path, config: &RunConfig) -> Result<Evidence> {
+    let documents: Vec<Document> = read_json(root, "documents.json")?;
+    let classification: serde_json::Value = read_json(root, "classification.json")?;
+    let by_id: BTreeMap<&str, &Document> = documents.iter().map(|d| (d.id.as_str(), d)).collect();
+    let list = |status: &str| -> Result<Vec<Document>> {
+        classification[status]
+            .as_array()
+            .with_context(|| format!("classification.json lacks {status}"))?
+            .iter()
+            .map(|id| {
+                let id = id.as_str().context("Classification IDs must be strings")?;
+                by_id
+                    .get(id)
+                    .map(|d| (*d).clone())
+                    .with_context(|| format!("documents.json lacks classified document {id}"))
+            })
+            .collect()
+    };
+    // A call that stopped while scoring leaves documents that are neither scored nor classified.
+    // They keep their positions (and so their text paths) and are scored by a later call.
+    let scores: Vec<DocumentScore> = read_json(root, "scores.json")?;
+    let scored: BTreeSet<&str> = scores.iter().map(|s| s.document_id.as_str()).collect();
+    let classified: BTreeSet<&str> = ["selected", "uncertain", "rejected"]
+        .iter()
+        .flat_map(|status| classification[*status].as_array().into_iter().flatten())
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    // A stopped call can also leave a scored or classified document in the unscored pool.
+    let mut deferred: Vec<Document> = read_json::<Vec<Document>>(root, "deferred.json")?
+        .into_iter()
+        .filter(|d| !scored.contains(d.id.as_str()) && !classified.contains(d.id.as_str()))
+        .collect();
+    let pending: BTreeSet<String> = deferred.iter().map(|d| d.id.clone()).collect();
+    deferred.extend(
+        documents
+            .iter()
+            .filter(|d| {
+                !scored.contains(d.id.as_str())
+                    && !classified.contains(d.id.as_str())
+                    && !pending.contains(&d.id)
+            })
+            .cloned(),
+    );
+    let mut evidence = Evidence {
+        selected: list("selected")?,
+        uncertain: list("uncertain")?,
+        rejected: list("rejected")?,
+        routes: read_json(root, "routes.json")?,
+        source_decisions: read_json(root, "source-decisions.json")?,
+        omitted: read_json(root, "omitted.json")?,
+        failures: read_json(root, "failures.json")?,
+        intent: read_json(root, "intent.json")?,
+        scores: Vec::new(),
+        deferred,
+        documents,
+        ..Evidence::default()
+    };
+    // A document scored just before a call stopped, but not yet classified, is classified now.
+    let by_id: BTreeMap<String, Document> = evidence
+        .documents
+        .iter()
+        .map(|d| (d.id.clone(), d.clone()))
+        .collect();
+    for score in scores {
+        match by_id.get(&score.document_id) {
+            Some(document) if !classified.contains(score.document_id.as_str()) => {
+                classify(&mut evidence, config, document.clone(), score)
+            }
+            _ => evidence.scores.push(score),
+        }
+    }
+    Ok(evidence)
+}
+
+/// Save the documents, scores, classification, and unscored pool of a session.
+fn save_session_state(root: &Path, evidence: &Evidence) -> Result<()> {
+    let ids = |documents: &[Document]| documents.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+    write_json(root.join("documents.json"), &evidence.documents)?;
+    write_json(root.join("scores.json"), &evidence.scores)?;
+    write_json(
+        root.join("classification.json"),
+        &json!({"selected":ids(&evidence.selected),"uncertain":ids(&evidence.uncertain),"rejected":ids(&evidence.rejected)}),
+    )?;
+    write_json(root.join("deferred.json"), &evidence.deferred)
+}
+
+/// A session's cumulative Jev spending is capped at this multiple of `--budget-usd`.
+pub const SESSION_BUDGET_MULTIPLE: f64 = 3.0;
+
+/// What a session has not spent yet: unscored documents per source, and sources routed at or
+/// above the source threshold but not fetched.
+pub(crate) fn open_pools(evidence: &Evidence) -> (BTreeMap<String, usize>, Vec<String>) {
+    let mut tails: BTreeMap<String, usize> = BTreeMap::new();
+    for document in &evidence.deferred {
+        *tails.entry(document.source_id.clone()).or_default() += 1;
+    }
+    let unfetched = evidence
+        .source_decisions
+        .iter()
+        .filter(|d| d["selected"] == true && d["fetched"] == false)
+        .filter_map(|d| d["source_id"].as_str().map(str::to_owned))
+        .collect();
+    (tails, unfetched)
+}
+
+/// Spend a session's pools: score the unscored documents of the named sources and fetch the named
+/// sources that were not fetched, then re-rank the session. `None` spends every pool. Settings
+/// come from the session; the budget and host folder come from this call.
+pub async fn continue_session(
+    root: &Path,
+    pools: Option<&[String]>,
+    current: &RunConfig,
+) -> Result<RunOutcome> {
+    let root = root
+        .canonicalize()
+        .context("The session folder does not exist")?;
+    let record: serde_json::Value = read_json(&root, "question.json")?;
+    let question = record["question"]
+        .as_str()
+        .context("question.json lacks the question")?
+        .to_owned();
+    let mut config: RunConfig = serde_json::from_value(record["config"].clone())
+        .context("question.json has unreadable settings")?;
+    config.output_dir = root.clone();
+    config.host_dir = current.host_dir.clone();
+    let mut evidence = load_evidence(&root, &config)?;
+    // Save what loading repaired after a stopped call, before anything can end this call early.
+    save_session_state(&root, &evidence)?;
+    // Charge a call that stopped earlier before this call's allowance is set.
+    crate::session::settle_stopped_call(&root)?;
+    let prior: Usage = read_json(&root, "usage.json")?;
+    evidence.prior_usage = prior.clone();
+    let cap = crate::session::budget_cap(&root)?;
+    let remaining = cap - prior.cost_usd;
+    ensure!(
+        config.fixture || remaining > 0.001,
+        "The session has spent its budget of ${cap:.3}"
+    );
+    config.budget_usd = current.budget_usd.min(remaining);
+    let (tails, unfetched) = open_pools(&evidence);
+    let requested: BTreeSet<String> = match pools {
+        None => tails
+            .keys()
+            .cloned()
+            .chain(unfetched.iter().cloned())
+            .collect(),
+        Some(ids) => {
+            for id in ids {
+                ensure!(
+                    tails.contains_key(id) || unfetched.contains(id),
+                    "{id} is not an open pool of this session; open pools: {}",
+                    tails
+                        .keys()
+                        .chain(unfetched.iter())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            ids.iter().cloned().collect()
+        }
+    };
+    ensure!(!requested.is_empty(), "The session has no open pools");
+    // Mark this call as spending up to its budget until it saves its usage.
+    crate::session::begin_call(&root, config.budget_usd)?;
+    let governor = match &config.host_dir {
+        Some(dir) => crate::governor::Governor::at(dir)?,
+        None => crate::governor::Governor::local(),
+    };
+    let http =
+        HttpRecorder::resume(&root, &config)?.with_source_gates(std::sync::Arc::new(governor));
+    let jev = JevClient::new(&config, &http.with_concurrency(config.jev_concurrency))?;
+    let backend = LiveBackend { jev };
+    let run_started = std::time::Instant::now();
+    let registry = connectors::sources();
+    let chosen: Vec<&Source> = registry
+        .iter()
+        .filter(|source| unfetched.contains(&source.id) && requested.contains(&source.id))
+        .collect();
+    if !chosen.is_empty() {
+        if let Some(wait) = http
+            .book_windows(&connectors::first_requests(chosen.iter().copied()))
+            .await?
+        {
+            // Nothing in the session changes; the caller retries later.
+            crate::session::end_call(&root)?;
+            return Ok(RunOutcome {
+                directory: root.clone(),
+                status: "busy".into(),
+                selected: evidence.selected.len(),
+                rejected: evidence.rejected.len(),
+                uncertain: evidence.uncertain.len(),
+                failures: evidence.failures.len(),
+                usage: prior,
+                retry_after_ms: Some(wait.as_millis() as u64),
+            });
+        }
+    }
+    let fetched =
+        fetch_sources(&question, &config, &http, &backend, &chosen, &mut evidence).await?;
+    mark_fetched(&mut evidence, &chosen);
+    let admitted = admit(&config, &mut evidence, fetched);
+    let (mut batch, kept): (Vec<Document>, Vec<Document>) = std::mem::take(&mut evidence.deferred)
+        .into_iter()
+        .partition(|d| requested.contains(&d.source_id));
+    evidence.deferred = kept;
+    batch.extend(admitted);
+    score_batch(&question, &config, &backend, &mut evidence, batch).await?;
+    let intent: crate::rank::Intent = if evidence.intent["intent"].is_null() {
+        crate::rank::Intent {
+            kind: "timeless".into(),
+            confidence: 0.0,
+            versioned: 0.0,
+        }
+    } else {
+        serde_json::from_value(evidence.intent["intent"].clone())?
+    };
+    let outcome = finish(
+        &question,
+        &config,
+        &http,
+        &backend,
+        evidence,
+        &intent,
+        &prior,
+        run_started,
+    )
+    .await?;
+    crate::session::end_call(&root)?;
+    Ok(outcome)
+}
+
+/// Record that these sources were fetched.
+fn mark_fetched(evidence: &mut Evidence, sources: &[&Source]) {
+    for decision in &mut evidence.source_decisions {
+        if decision["source_id"]
+            .as_str()
+            .is_some_and(|id| sources.iter().any(|s| s.id == id))
+        {
+            decision["fetched"] = json!(true);
+        }
+    }
+}
+
+/// The sum of two usage records.
+pub(crate) fn add_usage(a: &Usage, b: &Usage) -> Usage {
+    let mut provider_requests = a.provider_requests.clone();
+    for (provider, count) in &b.provider_requests {
+        *provider_requests.entry(provider.clone()).or_default() += count;
+    }
+    Usage {
+        requests: a.requests + b.requests,
+        input_tokens: a.input_tokens + b.input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        cost_usd: a.cost_usd + b.cost_usd,
+        hedged_requests: a.hedged_requests + b.hedged_requests,
+        rate_limited_requests: a.rate_limited_requests + b.rate_limited_requests,
+        provider_requests,
+        provider_wait_ms: a.provider_wait_ms + b.provider_wait_ms,
+    }
 }
 
 fn text_digest(text: &str) -> String {
@@ -900,9 +1397,11 @@ async fn assess_currentness(
     evidence: &mut Evidence,
     today: i64,
 ) {
+    // Documents judged in an earlier call of the session keep their judgment.
     let scores: BTreeMap<String, (f64, [usize; 2])> = evidence
         .scores
         .iter()
+        .filter(|s| s.still_current.is_none())
         .map(|s| (s.document_id.clone(), (s.usable_top2_mean, s.best_chunk)))
         .collect();
     let mut targets: Vec<&Document> = evidence
@@ -977,7 +1476,9 @@ async fn assess_currentness(
         }
     }
     for score in &mut evidence.scores {
-        score.still_current = judged.get(&score.document_id).copied();
+        if let Some(value) = judged.get(&score.document_id) {
+            score.still_current = Some(*value);
+        }
     }
 }
 
@@ -1050,6 +1551,10 @@ mod tests {
         distinct_title: bool,
         distinct_text: bool,
         nul_collision: bool,
+        /// Fixed routing probability per source index, the same in every pass.
+        routes: Option<Vec<f64>>,
+        /// Sources whose documents score low.
+        low_sources: Vec<String>,
     }
     #[async_trait]
     impl Backend for Mock {
@@ -1067,7 +1572,11 @@ mod tests {
                 .enumerate()
                 .map(|(i, s)| SourceScore {
                     source_id: s.id.clone(),
-                    probability: if i == pass { 0.9 } else { 0.05 },
+                    probability: match &self.routes {
+                        Some(routes) => routes[i],
+                        None if i == pass => 0.9,
+                        None => 0.05,
+                    },
                     reason: "fixture".into(),
                 })
                 .collect())
@@ -1180,9 +1689,14 @@ mod tests {
             if self.fail_score {
                 bail!("actual scoring failure");
             }
+            let probability = if self.low_sources.contains(&document.source_id) {
+                0.05
+            } else {
+                0.8
+            };
             Ok(DocumentScore {
                 document_id: document.id.clone(),
-                probability: 0.8,
+                probability,
                 reason: "fixture".into(),
                 signals: Default::default(),
                 signals_aggregation: Default::default(),
@@ -1209,6 +1723,8 @@ mod tests {
             distinct_title: false,
             distinct_text: false,
             nul_collision: false,
+            routes: None,
+            low_sources: vec![],
         }
     }
     fn sources() -> Vec<Source> {
@@ -1221,6 +1737,163 @@ mod tests {
                 family: "test".into(),
             })
             .collect()
+    }
+    #[tokio::test]
+    async fn score_depth_scores_the_first_documents_and_keeps_unpromising_tails_unscored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = mock();
+        backend.fill_source_limit = true;
+        // a routes high; b routes low but its first document scores well; c does neither.
+        backend.routes = Some(vec![0.9, 0.3, 0.3]);
+        backend.low_sources = vec!["c".into()];
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().into(),
+            per_source_documents: 4,
+            score_depth: 1,
+            ..Default::default()
+        };
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        assert_eq!(backend.scored.load(Ordering::SeqCst), 9);
+        let deferred: Vec<Document> = read_json(&outcome.directory, "deferred.json").unwrap();
+        assert_eq!(deferred.len(), 3);
+        assert!(deferred.iter().all(|d| d.source_id == "c"));
+        let evidence = load_evidence(&outcome.directory, &config).unwrap();
+        let (tails, unfetched) = open_pools(&evidence);
+        assert_eq!(tails, BTreeMap::from([("c".to_owned(), 3)]));
+        assert!(unfetched.is_empty());
+    }
+    #[tokio::test]
+    async fn a_fetch_threshold_keeps_low_routed_sources_as_unfetched_pools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = mock();
+        backend.routes = Some(vec![0.9, 0.3, 0.1]);
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().into(),
+            fetch_threshold: 0.4,
+            ..Default::default()
+        };
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        assert_eq!(*backend.fetched.lock().unwrap(), vec!["a".to_owned()]);
+        let evidence = load_evidence(&outcome.directory, &config).unwrap();
+        let (tails, unfetched) = open_pools(&evidence);
+        assert!(tails.is_empty());
+        // b routed above the source threshold, c below it.
+        assert_eq!(unfetched, vec!["b".to_owned()]);
+    }
+    #[tokio::test]
+    async fn a_later_copy_of_a_scored_document_reuses_relevance_but_not_currentness() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = mock();
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let document = |id: &str, source: &str| Document {
+            id: id.into(),
+            source_id: source.into(),
+            title: "Same".into(),
+            url: "https://example.org/same".into(),
+            text: "Same text".into(),
+            provenance: json!({}),
+            raw_artifacts: vec![],
+        };
+        let mut evidence = Evidence::default();
+        score_batch(
+            "q",
+            &config,
+            &backend,
+            &mut evidence,
+            vec![document("a::1", "a")],
+        )
+        .await
+        .unwrap();
+        evidence.scores[0].still_current = Some(0.9);
+        score_batch(
+            "q",
+            &config,
+            &backend,
+            &mut evidence,
+            vec![document("b::1", "b")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(backend.scored.load(Ordering::SeqCst), 1);
+        let copy = evidence
+            .scores
+            .iter()
+            .find(|s| s.document_id == "b::1")
+            .unwrap();
+        assert_eq!(copy.probability, 0.8);
+        assert_eq!(copy.still_current, None);
+    }
+    #[tokio::test]
+    async fn documents_left_unscored_by_a_stopped_call_return_to_the_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = mock();
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        let root = outcome.directory;
+        let mut documents: Vec<Document> = read_json(&root, "documents.json").unwrap();
+        let mut unfinished = documents[0].clone();
+        unfinished.id = "a::unfinished".into();
+        documents.push(unfinished);
+        write_json(root.join("documents.json"), &documents).unwrap();
+        let position = documents.len();
+        let mut evidence = load_evidence(&root, &config).unwrap();
+        assert_eq!(evidence.deferred.len(), 1);
+        assert_eq!(evidence.deferred[0].id, "a::unfinished");
+        // Scoring it later keeps its position and adds no second copy.
+        let pending = std::mem::take(&mut evidence.deferred);
+        score_batch("question", &config, &backend, &mut evidence, pending)
+            .await
+            .unwrap();
+        assert_eq!(evidence.documents.len(), position);
+        assert_eq!(evidence.documents[position - 1].id, "a::unfinished");
+    }
+    #[tokio::test]
+    async fn recovery_drops_finished_documents_from_the_pool_and_classifies_saved_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = mock();
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        let root = outcome.directory;
+        // A stopped call left a classified document in the pool, and a scored document without
+        // its classification.
+        let documents: Vec<Document> = read_json(&root, "documents.json").unwrap();
+        write_json(root.join("deferred.json"), &vec![documents[0].clone()]).unwrap();
+        let mut classification: serde_json::Value =
+            read_json(&root, "classification.json").unwrap();
+        let unclassified = documents[1].id.clone();
+        for status in ["selected", "uncertain", "rejected"] {
+            classification[status]
+                .as_array_mut()
+                .unwrap()
+                .retain(|id| id.as_str() != Some(unclassified.as_str()));
+        }
+        write_json(root.join("classification.json"), &classification).unwrap();
+        let evidence = load_evidence(&root, &config).unwrap();
+        assert!(evidence.deferred.is_empty());
+        assert!(evidence.selected.iter().any(|d| d.id == unclassified));
+        assert_eq!(evidence.scores.len(), documents.len());
     }
     #[tokio::test]
     async fn per_source_limit_bounds_retrieval_without_reducing_global_scoring_capacity() {

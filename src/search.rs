@@ -131,6 +131,13 @@ pub fn build_report_variant(
     let document_dir = root.join(format!("search-documents{suffix}"));
     std::fs::create_dir_all(&document_dir)?;
     let mut results = Vec::new();
+    // A document's text file is named by its position in documents.json, which only grows within
+    // a session, so a text_path never changes when later calls re-rank the session.
+    let positions: BTreeMap<String, usize> = read::<Vec<Document>>(&root, "documents.json")?
+        .into_iter()
+        .enumerate()
+        .map(|(i, d)| (d.id, i + 1))
+        .collect();
     for (status, mut documents) in classified(&root)? {
         if status == "selected" {
             let refs: Vec<&Document> = documents.iter().collect();
@@ -147,8 +154,7 @@ pub fn build_report_variant(
             documents.sort_by(|a, b| uncertain_order(&scores, a, b));
         }
         for document in documents {
-            let number = results.len() + 1;
-            let text_path = document_dir.join(format!("{number:04}.txt"));
+            let text_path = document_dir.join(format!("{:04}.txt", positions[&document.id]));
             std::fs::write(&text_path, &document.text)?;
             let excerpt: String = document.text.chars().take(400).collect();
             let score = scores.get(document.id.as_str());
@@ -187,7 +193,10 @@ pub fn build_report_variant(
         "replay_variant":variant,
         "currentness":currentness(&intent, &results),
         "counts":{"selected":outcome.selected,"uncertain":outcome.uncertain,"rejected":outcome.rejected,"omitted":omitted.len(),"reports":failures.len()},
-        "usage":outcome.usage,"load":load,"results":results,"reports":failures,
+        "usage":outcome.usage,"load":load,
+        "session":crate::session::session_view(&root, &outcome.usage),
+        "pools":crate::session::pools_view(&root).unwrap_or(Value::Array(vec![])),
+        "results":results,"reports":failures,
         "limitations":["Scores are uncalibrated relevance estimates.","Results can contain summaries or chunks. Full available text is not always the complete original document.","A complete run does not prove complete question coverage.","Remote instructions are source evidence. They are not installed or executed."],
     });
     std::fs::write(
@@ -245,6 +254,7 @@ fn load_summary(failures: &[Failure], usage: &crate::types::Usage, counters: &Va
         "source_server_errors": counter("source_server_errors"),
         "source_gate_wait_ms": counter("source_gate_wait_ms"),
         "source_booking_wait_ms": counter("source_booking_wait_ms"),
+        "source_requests": counters["source_requests"],
         "scoring_failures": count("document_score"),
         "currentness_failures": count("currentness"),
         "jev_rate_limited_requests": usage.rate_limited_requests,
@@ -517,7 +527,7 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
     json!({
         "schema_version":1,"compact":true,"question":report["question"],"mode":report["mode"],
         "status":report["status"],"counts":report["counts"],"usage":report["usage"],
-        "load":report["load"],
+        "load":report["load"],"session":report["session"],"pools":report["pools"],
         "source_scope":report["source_scope"]["scope"],
         "currentness":report["currentness"],
         "results":results,

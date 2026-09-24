@@ -187,15 +187,37 @@ fn default_search_prints_compact_json_and_keeps_a_light_record() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, ["manifest.json", "search-documents", "search.json"]);
+    // It also keeps the session state that `more` and `check` read.
+    assert_eq!(
+        names,
+        [
+            "classification.json",
+            "deferred.json",
+            "documents.json",
+            "failures.json",
+            "intent.json",
+            "load.json",
+            "manifest.json",
+            "omitted.json",
+            "question.json",
+            "routes.json",
+            "scores.json",
+            "search-documents",
+            "search.json",
+            "session.json",
+            "source-decisions.json",
+            "source-scope.json",
+            "usage.json"
+        ]
+    );
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["record"], "light");
     assert_eq!(manifest["config"]["full_record"], false);
-    // A light record cannot be replayed, and says why.
+    // A light record keeps the session, so it can be replayed.
     let replay = cli().arg("report").arg(root).output().unwrap();
-    assert_eq!(replay.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&replay.stderr).contains("--full-record"));
+    assert!(matches!(replay.status.code(), Some(0 | 2)));
+    assert!(root.join("search-replay.json").is_file());
 }
 
 #[test]
@@ -232,4 +254,68 @@ fn configured_file_works_outside_project_and_missing_file_fails_without_run() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn a_session_spends_its_pools_and_checks_claims() {
+    let temp = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = cli()
+            .args(["--fixture", "--output-dir"])
+            .arg(temp.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            matches!(output.status.code(), Some(0 | 2)),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    // Every fixture source routes at 0.85, so a fetch threshold of 0.9 fetches nothing and keeps
+    // every routed source as a pool.
+    let first = run(&[
+        "search",
+        "How does the fictional Quillon ledger batch its receipts?",
+        "--fetch-threshold",
+        "0.9",
+    ]);
+    let session = first["session"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(first["session"]["calls"], 1);
+    assert_eq!(first["session"]["documents_scored"], 0);
+    let pools = first["pools"].as_array().unwrap();
+    assert!(!pools.is_empty());
+    assert!(pools.iter().all(|p| p["state"] == "unfetched"));
+    let pool = pools
+        .iter()
+        .find(|p| p["id"] == "algolia:docs:primary")
+        .expect("the docs index is an open pool");
+    assert_eq!(pool["source_requests"], 1);
+    let more = run(&["more", &session, "--pool", "algolia:docs:primary"]);
+    assert_eq!(more["session"]["calls"], 2);
+    assert_eq!(more["session"]["documents_scored"], 1);
+    assert_eq!(more["results"].as_array().unwrap().len(), 1);
+    assert!(more["pools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["id"] != "algolia:docs:primary"));
+    // A text path stays the same when later calls re-rank the session.
+    let text_path = more["results"][0]["text_path"].as_str().unwrap().to_owned();
+    let unknown = cli()
+        .args(["--fixture", "--output-dir"])
+        .arg(temp.path())
+        .args(["more", &session, "--pool", "not-a-pool"])
+        .output()
+        .unwrap();
+    assert_eq!(unknown.status.code(), Some(1));
+    let check = run(&["check", &session, "Quillon batches receipts every block."]);
+    assert_eq!(check["session"]["calls"], 3);
+    let claim = &check["claims"][0];
+    assert_eq!(claim["documents_judged"], 1);
+    assert_eq!(claim["supporting"][0]["text_path"], text_path.as_str());
+    let all = run(&["more", &session, "--all"]);
+    assert_eq!(all["pools"].as_array().unwrap().len(), 0);
+    assert_eq!(all["results"][0]["text_path"], text_path.as_str());
 }

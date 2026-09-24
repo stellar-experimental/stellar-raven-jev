@@ -60,6 +60,10 @@ struct Cli {
     route_passes: usize,
     #[arg(long, global = true, hide = true, default_value_t = 0.2)]
     source_threshold: f64,
+    #[arg(long, global = true, hide = true, default_value_t = 0.2)]
+    fetch_threshold: f64,
+    #[arg(long, global = true, hide = true, default_value_t = 0)]
+    score_depth: usize,
     #[arg(long, global = true, hide = true, default_value_t = 0.4)]
     document_threshold: f64,
     #[arg(long, global = true, hide = true, default_value_t = 0.15)]
@@ -122,8 +126,150 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Continue a session: spend open pools (score a source's unscored documents, or fetch a
+    /// source that was routed but not fetched), then print the re-ranked session.
+    More {
+        /// The session folder (`session.id` of an earlier call).
+        session: PathBuf,
+        /// Pool IDs from the `pools` list, comma separated.
+        #[arg(long, value_delimiter = ',', required_unless_present = "all")]
+        pool: Vec<String>,
+        /// Spend every open pool.
+        #[arg(long, conflicts_with = "pool")]
+        all: bool,
+        /// Print the full ranked report.
+        #[arg(long)]
+        json: bool,
+        /// Include full available text in output.
+        #[arg(long)]
+        full_text: bool,
+        /// Results in the compact output, one per URL. Zero shows all selected results.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Ask Jev which session documents support, contradict, or qualify each claim you give.
+    Check {
+        /// The session folder (`session.id` of an earlier call).
+        session: PathBuf,
+        /// One to four claims, each a short statement to test against the documents.
+        #[arg(required = true, num_args = 1..=4)]
+        claims: Vec<String>,
+        /// Which documents to read: selected (selected and uncertain), scored, or all.
+        #[arg(long, value_enum, default_value = "selected")]
+        scope: stellar_raven_jev::session::CheckScope,
+        /// Rows per list.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
     /// Check local settings and authentication presence without network requests.
     Doctor,
+}
+
+/// The question a session was started with.
+fn session_question(session: &std::path::Path) -> Result<String> {
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(session.join("question.json"))
+            .with_context(|| format!("{} is not a session folder", session.display()))?,
+    )?;
+    record["question"]
+        .as_str()
+        .map(str::to_owned)
+        .context("The session lacks its question")
+}
+
+/// Hold the session for this call, or print `busy` and exit 3 when another call holds it.
+fn hold_session(session: &std::path::Path, question: &str) -> Result<std::fs::File> {
+    match stellar_raven_jev::session::lock(session)? {
+        Some(file) => Ok(file),
+        None => {
+            println!(
+                "{}",
+                json!({"schema_version":1,"compact":true,"question":question,"status":"busy",
+                    "retry_after_ms":5_000,"session":{"id":session},
+                    "message":"Another call is using this session. Nothing was spent. Retry when it finishes."})
+            );
+            std::process::exit(3);
+        }
+    }
+}
+
+/// Whether a session keeps its full audit record.
+fn session_full_record(session: &std::path::Path) -> Result<bool> {
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(session.join("question.json"))?)?;
+    Ok(record["config"]["full_record"] == true)
+}
+
+/// Take one of this host's search slots, or print `busy` and exit 3 without spending. Calls that
+/// share an output directory share one host state folder: admission slots, Jev provider budgets
+/// and cooldowns, and source rate-limit gates.
+async fn admit(
+    slots: (usize, u64),
+    config: &mut RunConfig,
+    question: &str,
+) -> Result<stellar_raven_jev::governor::Admission> {
+    let (max_searches, admission_wait_secs) = slots;
+    let host_dir = config.output_dir.join(".host");
+    let governor = stellar_raven_jev::governor::Governor::at(&host_dir)?;
+    let Some(admission) = governor
+        .admit(
+            max_searches,
+            std::time::Duration::from_secs(admission_wait_secs),
+        )
+        .await?
+    else {
+        println!(
+            "{}",
+            json!({"schema_version":1,"compact":true,"question":question,"status":"busy",
+                "retry_after_ms":BUSY_RETRY_AFTER_MS,"load":{"admission_wait_ms":admission_wait_secs * 1000,"max_searches":max_searches},
+                "message":"This host is already running its maximum number of searches. Nothing was spent. Retry later."})
+        );
+        std::process::exit(3);
+    };
+    config.host_dir = Some(host_dir);
+    Ok(admission)
+}
+
+/// Print a run or session report, reduce a light record, and exit with the run's status code.
+fn deliver(
+    outcome: &RunOutcome,
+    question: &str,
+    admission: stellar_raven_jev::governor::Admission,
+    json: bool,
+    full_text: bool,
+    limit: usize,
+    full_record: bool,
+) -> Result<()> {
+    if outcome.status == "busy" {
+        drop(admission);
+        // The question found no room in a source's request window.
+        println!(
+            "{}",
+            json!({"schema_version":1,"compact":true,"question":question,"status":"busy",
+                "retry_after_ms":outcome.retry_after_ms.unwrap_or(BUSY_RETRY_AFTER_MS),
+                "usage":outcome.usage,
+                "session":{"id":outcome.directory},
+                "message":"A source this question needs has no request capacity left now. Nothing more was spent. Retry after retry_after_ms."})
+        );
+        if !full_record {
+            let _ = stellar_raven_jev::pipeline::keep_session_record(&outcome.directory);
+        }
+        std::process::exit(3);
+    }
+    let mut report = stellar_raven_jev::search::build_report_variant(outcome, full_text, None)?;
+    report["load"]["admission_wait_ms"] = json!(admission.waited_ms);
+    drop(admission);
+    print_report(&report, json, limit)?;
+    // Clean up after printing, so a cleanup error never loses a paid result.
+    if !full_record {
+        if let Err(error) = stellar_raven_jev::pipeline::keep_session_record(&outcome.directory) {
+            eprintln!("Run folder cleanup failed; intermediate files remain: {error}");
+        }
+    }
+    if outcome.status != "complete" {
+        std::process::exit(if outcome.status == "partial" { 2 } else { 1 });
+    }
+    Ok(())
 }
 
 /// A refused search is told to retry after about this long.
@@ -284,7 +430,7 @@ async fn main() -> Result<()> {
     }
     let mut config = RunConfig {
         fixture: cli.fixture,
-        output_dir: cli.output_dir,
+        output_dir: cli.output_dir.clone(),
         budget_usd: cli.budget_usd,
         timeout_secs: cli.timeout_secs,
         concurrency: cli.concurrency,
@@ -302,12 +448,15 @@ async fn main() -> Result<()> {
         max_body_bytes: cli.max_body_bytes,
         route_passes: cli.route_passes,
         source_threshold: cli.source_threshold,
+        fetch_threshold: cli.fetch_threshold,
+        score_depth: cli.score_depth,
         document_threshold: cli.document_threshold,
         uncertain_threshold: cli.uncertain_threshold,
         full_record: true,
         host_dir: None,
     };
     validate_config(&config)?;
+    let slots = (cli.max_searches, cli.admission_wait_secs);
     match cli.command {
         Command::Sources { resources } => println!(
             "{}",
@@ -327,60 +476,76 @@ async fn main() -> Result<()> {
             full_record,
         } => {
             config.full_record = full_record;
-            // Searches that share an output directory share one host state folder: admission
-            // slots, Jev provider budgets and cooldowns, and source rate-limit gates.
-            let host_dir = config.output_dir.join(".host");
-            let governor = stellar_raven_jev::governor::Governor::at(&host_dir)?;
-            let Some(admission) = governor
-                .admit(
-                    cli.max_searches,
-                    std::time::Duration::from_secs(cli.admission_wait_secs),
-                )
-                .await?
-            else {
-                // Refused before any source or Jev request, so nothing was spent.
-                println!(
-                    "{}",
-                    json!({"schema_version":1,"compact":true,"question":question,"status":"busy",
-                        "retry_after_ms":BUSY_RETRY_AFTER_MS,"load":{"admission_wait_ms":cli.admission_wait_secs * 1000,"max_searches":cli.max_searches},
-                        "message":"This host is already running its maximum number of searches. Nothing was spent. Retry later."})
-                );
-                std::process::exit(3);
-            };
-            config.host_dir = Some(host_dir);
+            let admission = admit(slots, &mut config, &question).await?;
             let outcome =
                 stellar_raven_jev::pipeline::run_question_scoped(&question, &config, resources)
                     .await?;
-            let mut report =
-                stellar_raven_jev::search::build_report_variant(&outcome, full_text, None)?;
-            report["load"]["admission_wait_ms"] = json!(admission.waited_ms);
+            stellar_raven_jev::session::record_call(
+                &outcome.directory,
+                "search",
+                json!({"question":question,"resources":format!("{resources:?}").to_lowercase()}),
+                &outcome.usage,
+            )?;
+            stellar_raven_jev::session::set_budget_cap(&outcome.directory, config.budget_usd)?;
+            deliver(
+                &outcome,
+                &question,
+                admission,
+                json,
+                full_text,
+                limit,
+                full_record,
+            )?;
+        }
+        Command::More {
+            session,
+            pool,
+            all,
+            json,
+            full_text,
+            limit,
+        } => {
+            let question = session_question(&session)?;
+            let _held = hold_session(&session, &question)?;
+            let admission = admit(slots, &mut config, &question).await?;
+            let outcome = stellar_raven_jev::pipeline::continue_session(
+                &session,
+                (!all).then_some(pool.as_slice()),
+                &config,
+            )
+            .await?;
+            if outcome.status != "busy" {
+                stellar_raven_jev::session::record_call(
+                    &outcome.directory,
+                    "more",
+                    json!({"pools": if all { json!("all") } else { json!(pool) }}),
+                    &outcome.usage,
+                )?;
+            }
+            let full_record = session_full_record(&session)?;
+            deliver(
+                &outcome,
+                &question,
+                admission,
+                json,
+                full_text,
+                limit,
+                full_record,
+            )?;
+        }
+        Command::Check {
+            session,
+            claims,
+            scope,
+            limit,
+        } => {
+            let question = session_question(&session)?;
+            let _held = hold_session(&session, &question)?;
+            let admission = admit(slots, &mut config, &question).await?;
+            let result =
+                stellar_raven_jev::session::check(&session, &claims, scope, limit, &config).await?;
             drop(admission);
-            if outcome.status == "busy" {
-                // Routing ran, but the question found no room in a source's request window.
-                println!(
-                    "{}",
-                    json!({"schema_version":1,"compact":true,"question":question,"status":"busy",
-                        "retry_after_ms":outcome.retry_after_ms.unwrap_or(BUSY_RETRY_AFTER_MS),
-                        "usage":outcome.usage,"load":report["load"],
-                        "message":"A source this question needs has no request capacity left now. Only routing was spent. Retry after retry_after_ms."})
-                );
-                if !full_record {
-                    let _ = stellar_raven_jev::pipeline::keep_report_only(&outcome.directory);
-                }
-                std::process::exit(3);
-            }
-            print_report(&report, json, limit)?;
-            // Clean up after printing, so a cleanup error never loses a paid result.
-            if !full_record {
-                if let Err(error) =
-                    stellar_raven_jev::pipeline::keep_report_only(&outcome.directory)
-                {
-                    eprintln!("Run folder cleanup failed; intermediate files remain: {error}");
-                }
-            }
-            if outcome.status != "complete" {
-                std::process::exit(if outcome.status == "partial" { 2 } else { 1 });
-            }
+            println!("{}", serde_json::to_string(&result)?);
         }
         Command::Report {
             directory,
@@ -391,7 +556,7 @@ async fn main() -> Result<()> {
         } => {
             anyhow::ensure!(
                 directory.join("documents.json").is_file(),
-                "report needs a run saved with --full-record; {} holds only the search report",
+                "report needs a run folder with its session state; {} has none",
                 directory.display()
             );
             let manifest: serde_json::Value =
