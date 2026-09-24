@@ -87,6 +87,8 @@ pub struct RunConfig {
     /// Send one hedge request for a Jev call still unanswered after this many milliseconds.
     /// Zero turns hedging off.
     pub jev_hedge_ms: u64,
+    /// Document chunks packed into one Jev scoring call. 1 sends one chunk per call.
+    pub jev_batch: usize,
     /// The reference date for currentness judgments, as YYYY-MM-DD in UTC.
     pub today: String,
     pub max_pages: usize,
@@ -113,6 +115,7 @@ impl Default for RunConfig {
             concurrency: 16,
             jev_concurrency: 32,
             jev_hedge_ms: 2000,
+            jev_batch: 4,
             today: crate::rank::today_utc(),
             max_pages: 2,
             max_documents: 400,

@@ -38,6 +38,8 @@ struct Cli {
     jev_concurrency: usize,
     #[arg(long, global = true, hide = true, default_value_t = 2000)]
     jev_hedge_ms: u64,
+    #[arg(long, global = true, hide = true, default_value_t = 4)]
+    jev_batch: usize,
     /// Reference date (YYYY-MM-DD) for currentness judgments. Defaults to today in UTC.
     #[arg(long, global = true, hide = true)]
     today: Option<String>,
@@ -267,6 +269,7 @@ async fn main() -> Result<()> {
         concurrency: cli.concurrency,
         jev_concurrency: cli.jev_concurrency,
         jev_hedge_ms: cli.jev_hedge_ms,
+        jev_batch: cli.jev_batch,
         today: cli
             .today
             .clone()

@@ -54,7 +54,12 @@ pub trait Backend: Send + Sync {
         source: &Source,
         question: &str,
     ) -> Result<FetchResult>;
-    async fn score_document(&self, question: &str, document: &Document) -> Result<DocumentScore>;
+    /// Scores in input order, one per document.
+    async fn score_documents(
+        &self,
+        question: &str,
+        documents: &[Document],
+    ) -> Vec<Result<DocumentScore>>;
     async fn classify_intent(&self, question: &str) -> Result<BTreeMap<String, f64>>;
     async fn assess_currentness(
         &self,
@@ -88,8 +93,12 @@ impl Backend for LiveBackend {
     ) -> Result<FetchResult> {
         connectors::fetch(ctx, source, question).await
     }
-    async fn score_document(&self, question: &str, document: &Document) -> Result<DocumentScore> {
-        self.jev.score_document(question, document).await
+    async fn score_documents(
+        &self,
+        question: &str,
+        documents: &[Document],
+    ) -> Vec<Result<DocumentScore>> {
+        self.jev.score_documents(question, documents).await
     }
     async fn classify_intent(&self, question: &str) -> Result<BTreeMap<String, f64>> {
         self.jev.classify_intent(question).await
@@ -112,6 +121,9 @@ impl Backend for LiveBackend {
 }
 
 pub fn validate_config(config: &RunConfig) -> Result<()> {
+    if config.jev_batch > 8 {
+        bail!("--jev-batch must be 8 or less");
+    }
     if crate::rank::iso_date_days(&config.today).is_none() {
         bail!("--today must be a calendar date in YYYY-MM-DD form");
     }
@@ -122,6 +134,7 @@ pub fn validate_config(config: &RunConfig) -> Result<()> {
         ("timeout-secs", config.timeout_secs as usize),
         ("concurrency", config.concurrency),
         ("jev-concurrency", config.jev_concurrency),
+        ("jev-batch", config.jev_batch),
         ("max-pages", config.max_pages),
         ("max-documents", config.max_documents),
         ("per-source-documents", config.per_source_documents),
@@ -634,12 +647,18 @@ async fn execute(
         }
     }
     // Keep Jev budget and retry accounting inside JevClient. Do not cancel its paid requests externally.
-    let scoring = stream::iter(to_score)
-        .map(|document| async move {
-            let result = backend.score_document(question, &document).await;
-            (document, result)
+    // Groups of documents go to the scorer together, so their chunks can share Jev calls.
+    let groups: Vec<Vec<Document>> = to_score
+        .chunks(config.jev_batch)
+        .map(<[Document]>::to_vec)
+        .collect();
+    let scoring = stream::iter(groups)
+        .map(|group| async move {
+            let results = backend.score_documents(question, &group).await;
+            group.into_iter().zip(results).collect::<Vec<_>>()
         })
-        .buffer_unordered(config.jev_concurrency);
+        .buffer_unordered(config.jev_concurrency)
+        .flat_map(stream::iter);
     tokio::pin!(scoring);
     // A full checkpoint rewrites every artifact. Jev audit files already record each paid attempt,
     // so checkpoint on an interval instead of after every score.
@@ -1076,21 +1095,16 @@ mod tests {
             }
             Ok(result)
         }
-        async fn score_document(&self, _: &str, document: &Document) -> Result<DocumentScore> {
-            self.scored.fetch_add(1, Ordering::SeqCst);
-            if self.fail_score {
-                bail!("actual scoring failure");
+        async fn score_documents(
+            &self,
+            question: &str,
+            documents: &[Document],
+        ) -> Vec<Result<DocumentScore>> {
+            let mut out = Vec::new();
+            for document in documents {
+                out.push(self.score_one(question, document).await);
             }
-            Ok(DocumentScore {
-                document_id: document.id.clone(),
-                probability: 0.8,
-                reason: "fixture".into(),
-                signals: Default::default(),
-                signals_aggregation: Default::default(),
-                best_chunk: [0, document.text.len()],
-                usable_top2_mean: 0.8,
-                still_current: None,
-            })
+            out
         }
         async fn assess_currentness(
             &self,
@@ -1112,6 +1126,24 @@ mod tests {
         }
         fn usage(&self) -> Usage {
             Usage::default()
+        }
+    }
+    impl Mock {
+        async fn score_one(&self, _: &str, document: &Document) -> Result<DocumentScore> {
+            self.scored.fetch_add(1, Ordering::SeqCst);
+            if self.fail_score {
+                bail!("actual scoring failure");
+            }
+            Ok(DocumentScore {
+                document_id: document.id.clone(),
+                probability: 0.8,
+                reason: "fixture".into(),
+                signals: Default::default(),
+                signals_aggregation: Default::default(),
+                best_chunk: [0, document.text.len()],
+                usable_top2_mean: 0.8,
+                still_current: None,
+            })
         }
     }
     fn mock() -> Mock {
@@ -1347,6 +1379,16 @@ mod tests {
         assert_eq!(failures[0].source_id.as_deref(), Some("a"));
         let selected: Vec<Document> = by_status(&outcome.directory, "selected");
         assert_eq!(selected[0].source_id, "b");
+    }
+    #[test]
+    fn jev_batch_must_be_between_one_and_eight() {
+        for (batch, ok) in [(0, false), (1, true), (8, true), (9, false)] {
+            let config = RunConfig {
+                jev_batch: batch,
+                ..Default::default()
+            };
+            assert_eq!(validate_config(&config).is_ok(), ok, "{batch}");
+        }
     }
     #[tokio::test]
     async fn exact_duplicates_score_once_and_fan_back_to_every_id() {
