@@ -117,6 +117,9 @@ pub struct RunConfig {
     /// Folder of host-wide state that concurrent searches share (Jev provider budgets and
     /// cooldowns, source rate-limit gates). `None` keeps that state inside this process.
     pub host_dir: Option<PathBuf>,
+    /// Most questions that may fetch from each named source host at once, across every process
+    /// sharing `host_dir`. A host that is not named is not capped.
+    pub source_slots: std::collections::BTreeMap<String, usize>,
 }
 
 impl Default for RunConfig {
@@ -144,6 +147,7 @@ impl Default for RunConfig {
             uncertain_threshold: 0.15,
             full_record: true,
             host_dir: None,
+            source_slots: Default::default(),
         }
     }
 }

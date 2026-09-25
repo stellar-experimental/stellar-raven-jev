@@ -250,13 +250,20 @@ fn load_summary(failures: &[Failure], usage: &crate::types::Usage, counters: &Va
     json!({
         "degraded": lost + fallback > 0 || refused > 0,
         "lost_evidence_reports": lost,
-        "sources_cut_at_deadline": count("fetch_deadline"),
+                "sources_cut_at_deadline": count("fetch_deadline"),
+        "cut_sources": failures
+            .iter()
+            .filter(|f| stage(f) == "fetch_deadline")
+            .filter_map(|f| f.source_id.clone())
+            .collect::<Vec<_>>(),
         "source_fallback_responses": fallback,
         "source_rate_limited_requests": refused,
         "source_server_errors": counter("source_server_errors"),
         "source_gate_wait_ms": counter("source_gate_wait_ms"),
-        "source_booking_wait_ms": counter("source_booking_wait_ms"),
+                "source_booking_wait_ms": counter("source_booking_wait_ms"),
+        "source_slot_wait_ms": counter("source_slot_wait_ms"),
         "source_requests": counters["source_requests"],
+        "source_latency": counters["source_latency"],
         "scoring_failures": count("document_score"),
         "currentness_failures": count("currentness"),
         "jev_rate_limited_requests": usage.rate_limited_requests,

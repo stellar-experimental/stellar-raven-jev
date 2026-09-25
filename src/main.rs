@@ -85,6 +85,12 @@ struct Cli {
     /// OUTPUT_DIR/.host. Also accepts JEV_HOST_DIR.
     #[arg(long, global = true, env = "JEV_HOST_DIR")]
     host_dir: Option<PathBuf>,
+    /// Most questions that may fetch from a source host at once on this host, as
+    /// `HOST=N[,HOST=N]` (for example `stellarlight.xyz=3`). A question waits up to about a
+    /// minute for a slot on every capped host it fetches from, then reports `busy`. Hosts not
+    /// named are not capped. Also accepts JEV_SOURCE_SLOTS.
+    #[arg(long, global = true, env = "JEV_SOURCE_SLOTS", value_parser = parse_source_slots)]
+    source_slots: Option<std::collections::BTreeMap<String, usize>>,
     /// How long a search waits for a free slot before it reports `busy`.
     #[arg(long, global = true, hide = true, default_value_t = 60)]
     admission_wait_secs: u64,
@@ -205,6 +211,30 @@ fn session_full_record(session: &std::path::Path) -> Result<bool> {
     let record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(session.join("question.json"))?)?;
     Ok(record["config"]["full_record"] == true)
+}
+
+/// `HOST=N[,HOST=N]`, each N at least 1, each host named once.
+fn parse_source_slots(text: &str) -> Result<std::collections::BTreeMap<String, usize>, String> {
+    let mut slots = std::collections::BTreeMap::new();
+    for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (host, count) = part
+            .split_once('=')
+            .ok_or_else(|| format!("`{part}` is not HOST=N"))?;
+        let host = host.trim().to_ascii_lowercase();
+        let count: usize = count
+            .trim()
+            .parse()
+            .map_err(|_| format!("`{part}`: N must be a whole number"))?;
+        if host.is_empty() || count == 0 {
+            return Err(format!(
+                "`{part}`: the host must be named and N must be at least 1"
+            ));
+        }
+        if slots.insert(host, count).is_some() {
+            return Err(format!("`{part}`: the host is named twice"));
+        }
+    }
+    Ok(slots)
 }
 
 /// Take one of this host's search slots, or print `busy` and exit 3 without spending. Calls that
@@ -463,6 +493,7 @@ async fn main() -> Result<()> {
         uncertain_threshold: cli.uncertain_threshold,
         full_record: true,
         host_dir: None,
+        source_slots: cli.source_slots.clone().unwrap_or_default(),
     };
     validate_config(&config)?;
     let slots = (
@@ -642,6 +673,22 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_slots_parse_strictly() {
+        let slots = parse_source_slots("cedar.test=3, Birch.test=1").unwrap();
+        assert_eq!(slots.get("cedar.test"), Some(&3));
+        assert_eq!(slots.get("birch.test"), Some(&1));
+        for bad in [
+            "cedar.test",
+            "cedar.test=0",
+            "=2",
+            "cedar.test=x",
+            "a.test=1,a.test=2",
+        ] {
+            assert!(parse_source_slots(bad).is_err(), "{bad}");
+        }
+    }
 
     fn profile_env(key: &str) -> Option<String> {
         match key {

@@ -394,6 +394,38 @@ impl Governor {
         })
     }
 
+    /// Wait up to `wait` for one fetch slot on every host in `caps` (host, slots), taken all at
+    /// once: a question never holds some hosts while it waits for others. `None` means no room in
+    /// time and nothing is held. Without a state folder nothing is capped.
+    pub async fn hold_hosts(
+        &self,
+        caps: &[(String, usize)],
+        wait: Duration,
+    ) -> Result<Option<HostHold>> {
+        let Some(dir) = &self.dir else {
+            return Ok(Some(HostHold::default()));
+        };
+        let started = std::time::Instant::now();
+        loop {
+            let mut held = Vec::new();
+            for (host, slots) in caps {
+                match try_host_slot(dir, host, *slots)? {
+                    Some(file) => held.push(file),
+                    None => break,
+                }
+            }
+            if held.len() == caps.len() {
+                return Ok(Some(HostHold { _slots: held }));
+            }
+            drop(held);
+            if started.elapsed() >= wait {
+                return Ok(None);
+            }
+            let spread = uuid::Uuid::new_v4().as_u128() % 200;
+            tokio::time::sleep(Duration::from_millis(150 + spread as u64)).await;
+        }
+    }
+
     /// Wait up to `wait` for one of `slots` admission slots. Without a state folder every search
     /// is admitted.
     pub async fn admit(&self, slots: usize, wait: Duration) -> Result<Option<Admission>> {
@@ -433,6 +465,45 @@ impl Governor {
             tokio::time::sleep(Duration::from_millis(150 + spread as u64)).await;
         }
     }
+}
+
+/// Fetch slots held on capped source hosts. Dropping it, or the process ending, frees them.
+#[derive(Debug, Default)]
+pub struct HostHold {
+    _slots: Vec<File>,
+}
+
+/// A host name as a file-name part: letters, digits, dots, and hyphens only.
+fn host_file_part(host: &str) -> String {
+    host.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Try to lock one of `slots` fetch slot files for `host`.
+fn try_host_slot(dir: &Path, host: &str, slots: usize) -> Result<Option<File>> {
+    for i in 0..slots.max(1) {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(format!("fetch-{}-{i}.lock", host_file_part(host))))
+            .context("Cannot open a host fetch slot")?;
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("Cannot lock a host fetch slot")
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The provider's bucket, refilled to `now`. A new bucket starts full.
@@ -783,5 +854,33 @@ mod tests {
         std::fs::remove_dir_all(dir.path().join("host")).unwrap();
         std::fs::write(dir.path().join("host"), b"a file, not a folder").unwrap();
         assert!(governor.consume(&budget("a", 600.0)).is_err());
+    }
+
+    #[tokio::test]
+    async fn host_fetch_slots_cap_one_host_all_or_none_and_free_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Governor::at(dir.path()).unwrap();
+        let second = Governor::at(dir.path()).unwrap();
+        let cedar = |n| vec![("cedar.test".to_owned(), n)];
+        let short = Duration::from_millis(50);
+        let a = first.hold_hosts(&cedar(2), short).await.unwrap().unwrap();
+        let _b = second.hold_hosts(&cedar(2), short).await.unwrap().unwrap();
+        // A third question waits, then gets no slot; another host is not affected.
+        assert!(first.hold_hosts(&cedar(2), short).await.unwrap().is_none());
+        let birch = vec![("birch.test".to_owned(), 1)];
+        let _c = second.hold_hosts(&birch, short).await.unwrap().unwrap();
+        // All or none: with birch full, a question that needs both holds neither.
+        let both = vec![("birch.test".to_owned(), 1), ("cedar.test".to_owned(), 3)];
+        assert!(first.hold_hosts(&both, short).await.unwrap().is_none());
+        assert!(second.hold_hosts(&cedar(3), short).await.unwrap().is_some());
+        // Dropping a hold frees its slot.
+        drop(a);
+        assert!(first.hold_hosts(&cedar(2), short).await.unwrap().is_some());
+        // Without host state nothing is capped.
+        assert!(Governor::local()
+            .hold_hosts(&cedar(1), short)
+            .await
+            .unwrap()
+            .is_some());
     }
 }

@@ -553,6 +553,24 @@ async fn execute(
                     .is_some_and(|p| *p >= config.fetch_threshold)
         })
         .collect();
+    // Hold a fetch slot on every capped host this question fetches from, so a busy host queues
+    // questions instead of starting fetches that its sources cannot finish in time.
+    let Some(hold) = http
+        .hold_hosts(
+            &connectors::host_caps(fetch_now.iter().copied(), &config.source_slots),
+            HOST_SLOT_WAIT,
+        )
+        .await?
+    else {
+        evidence.failures.push(failure(
+            "admission",
+            None,
+            "No fetch slot on a capped source host within the wait limit",
+        ));
+        evidence.retry_after_ms = Some(HOST_SLOT_RETRY_MS);
+        evidence.load = http.load_summary();
+        return persist(config, &evidence, &backend.usage(), "busy");
+    };
     // Book the first request of every source fetched now in any window its source advertises, so
     // the question waits for room instead of losing sources to a refusal mid-fetch. Without room
     // in about one window, the question is refused as busy: only routing was spent.
@@ -582,6 +600,7 @@ async fn execute(
     }
     let fetched =
         fetch_sources(question, config, &http, backend, &fetch_now, &mut evidence).await?;
+    drop(hold);
     mark_fetched(&mut evidence, &fetch_now);
     evidence
         .timings
@@ -601,6 +620,11 @@ async fn execute(
     )
     .await
 }
+
+/// How long a question waits for fetch slots on capped source hosts before it reports busy.
+const HOST_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(65);
+/// The retry hint for a question refused for want of a host fetch slot.
+const HOST_SLOT_RETRY_MS: u64 = 10_000;
 
 /// Fetch the chosen sources in parallel within the fetch deadline. A connector still running at
 /// the deadline is recorded and dropped.
@@ -1164,6 +1188,7 @@ pub async fn continue_session(
         .context("question.json has unreadable settings")?;
     config.output_dir = root.clone();
     config.host_dir = current.host_dir.clone();
+    config.source_slots = current.source_slots.clone();
     let mut evidence = load_evidence(&root, &config)?;
     // Save what loading repaired after a stopped call, before anything can end this call early.
     save_session_state(&root, &evidence)?;
@@ -1218,27 +1243,33 @@ pub async fn continue_session(
         .iter()
         .filter(|source| unfetched.contains(&source.id) && requested.contains(&source.id))
         .collect();
-    if !chosen.is_empty() {
-        if let Some(wait) = http
-            .book_windows(&connectors::first_requests(chosen.iter().copied()))
-            .await?
-        {
-            // Nothing in the session changes; the caller retries later.
-            crate::session::end_call(&root)?;
-            return Ok(RunOutcome {
-                directory: root.clone(),
-                status: "busy".into(),
-                selected: evidence.selected.len(),
-                rejected: evidence.rejected.len(),
-                uncertain: evidence.uncertain.len(),
-                failures: evidence.failures.len(),
-                usage: prior,
-                retry_after_ms: Some(wait.as_millis() as u64),
-            });
+    let caps = connectors::host_caps(chosen.iter().copied(), &config.source_slots);
+    let hold = http.hold_hosts(&caps, HOST_SLOT_WAIT).await?;
+    let window_wait = match (&hold, chosen.is_empty()) {
+        (None, _) => Some(std::time::Duration::from_millis(HOST_SLOT_RETRY_MS)),
+        (Some(_), true) => None,
+        (Some(_), false) => {
+            http.book_windows(&connectors::first_requests(chosen.iter().copied()))
+                .await?
         }
+    };
+    if let Some(wait) = window_wait {
+        // Nothing in the session changes; the caller retries later.
+        crate::session::end_call(&root)?;
+        return Ok(RunOutcome {
+            directory: root.clone(),
+            status: "busy".into(),
+            selected: evidence.selected.len(),
+            rejected: evidence.rejected.len(),
+            uncertain: evidence.uncertain.len(),
+            failures: evidence.failures.len(),
+            usage: prior,
+            retry_after_ms: Some(wait.as_millis() as u64),
+        });
     }
     let fetched =
         fetch_sources(&question, &config, &http, &backend, &chosen, &mut evidence).await?;
+    drop(hold);
     mark_fetched(&mut evidence, &chosen);
     let admitted = admit(&config, &mut evidence, fetched);
     let (mut batch, kept): (Vec<Document>, Vec<Document>) = std::mem::take(&mut evidence.deferred)

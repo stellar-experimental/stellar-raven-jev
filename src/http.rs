@@ -77,8 +77,46 @@ struct LoadCounters {
     server_errors: AtomicU64,
     gate_wait_ms: AtomicU64,
     booking_wait_ms: AtomicU64,
+    /// Time spent waiting for fetch slots on capped source hosts.
+    slot_wait_ms: AtomicU64,
     /// Source requests sent, per host.
     sent: Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Time from send to the last body byte of every completed source response, per host.
+    latency_ms: Mutex<std::collections::BTreeMap<String, Vec<u64>>>,
+    /// Source requests in flight now, and the most at once, per host.
+    in_flight: Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+}
+
+/// One source request in flight; dropping it, also by cancellation, ends it.
+struct InFlight<'a> {
+    load: &'a LoadCounters,
+    host: String,
+}
+
+impl<'a> InFlight<'a> {
+    fn start(load: &'a LoadCounters, host: &str) -> Self {
+        let mut hosts = load.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = hosts.entry(host.to_owned()).or_default();
+        entry.0 += 1;
+        entry.1 = entry.1.max(entry.0);
+        Self {
+            load,
+            host: host.to_owned(),
+        }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let mut hosts = self
+            .load
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = hosts.get_mut(&self.host) {
+            entry.0 = entry.0.saturating_sub(1);
+        }
+    }
 }
 
 /// A source request that was not sent because the source's rate-limit gate is closed.
@@ -378,9 +416,75 @@ impl HttpRecorder {
             "source_rate_limited_requests": self.load.rate_limited.load(Ordering::Relaxed),
             "source_server_errors": self.load.server_errors.load(Ordering::Relaxed),
             "source_gate_wait_ms": self.load.gate_wait_ms.load(Ordering::Relaxed),
-            "source_booking_wait_ms": self.load.booking_wait_ms.load(Ordering::Relaxed),
+                        "source_booking_wait_ms": self.load.booking_wait_ms.load(Ordering::Relaxed),
+            "source_slot_wait_ms": self.load.slot_wait_ms.load(Ordering::Relaxed),
             "source_requests": *self.load.sent.lock().unwrap_or_else(|e| e.into_inner()),
+            "source_latency": self.latency_summary(),
         })
+    }
+
+    /// Per host: completed responses and their send-to-last-byte time (p50, p95, max), requests
+    /// sent that did not complete (failed or cut), and the most requests in flight at once.
+    fn latency_summary(&self) -> Value {
+        let sent = self
+            .load
+            .sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let latency = self
+            .load
+            .latency_ms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let in_flight = self
+            .load
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        sent.iter()
+            .map(|(host, count)| {
+                let mut samples = latency.get(host).cloned().unwrap_or_default();
+                samples.sort_unstable();
+                let percentile = |p: f64| {
+                    (!samples.is_empty())
+                        .then(|| samples[((samples.len() - 1) as f64 * p).round() as usize])
+                };
+                (
+                    host.clone(),
+                    json!({
+                        "completed": samples.len(),
+                        "not_completed": count.saturating_sub(samples.len() as u64),
+                        "p50_ms": percentile(0.5),
+                        "p95_ms": percentile(0.95),
+                        "max_ms": samples.last(),
+                        "peak_in_flight": in_flight.get(host).map_or(0, |entry| entry.1),
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    }
+
+    /// Hold one fetch slot on every capped host in `caps` (host, slots), all at once, waiting up
+    /// to `wait`. `None` means no room in time and nothing is held. Without host state, or with
+    /// no caps, nothing needs holding.
+    pub async fn hold_hosts(
+        &self,
+        caps: &[(String, usize)],
+        wait: Duration,
+    ) -> Result<Option<crate::governor::HostHold>> {
+        match &self.gates {
+            Some(governor) if !caps.is_empty() => {
+                let started = Instant::now();
+                let hold = governor.hold_hosts(caps, wait).await?;
+                self.load
+                    .slot_wait_ms
+                    .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                Ok(hold)
+            }
+            _ => Ok(Some(crate::governor::HostHold::default())),
+        }
     }
 
     /// Book this question's requests in every source scope's advertised window before any is
@@ -685,15 +789,21 @@ impl HttpRecorder {
             if gate.stop.is_some_and(|stop| stop()) {
                 return Err(NotSent.into());
             }
+            let host = parsed.host_str().unwrap_or_default().to_owned();
             if self.gates.is_some() {
                 *self
                     .load
                     .sent
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .entry(parsed.host_str().unwrap_or_default().to_owned())
+                    .entry(host.clone())
                     .or_default() += 1;
             }
+            let _in_flight = self
+                .gates
+                .is_some()
+                .then(|| InFlight::start(&self.load, &host));
+            let sent_at = Instant::now();
             if let Some(sent) = gate.notify {
                 sent.notify_one();
             }
@@ -818,6 +928,15 @@ impl HttpRecorder {
                 std::io::Write::flush(file)?;
             }
             record.metadata["complete"] = json!(true);
+            if self.gates.is_some() {
+                self.load
+                    .latency_ms
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(host)
+                    .or_default()
+                    .push(sent_at.elapsed().as_millis() as u64);
+            }
             if (300..400).contains(&status) {
                 bail!("HTTP redirect {status} refused; credentials were not forwarded");
             }
@@ -1048,6 +1167,27 @@ mod tests {
             .unwrap()
             .expect("no room in time");
         assert!(wait > Duration::from_secs(50));
+    }
+
+    #[tokio::test]
+    async fn source_latency_counts_completed_and_peak_in_flight_per_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = gated(dir.path());
+        let (url, _count) = counting_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+            Duration::from_millis(40),
+        )
+        .await;
+        let search = format!("{url}/api/find");
+        let requests = (0..3).map(|_| recorder.request(Method::GET, &search, vec![], None));
+        for result in futures::future::join_all(requests).await {
+            result.unwrap();
+        }
+        let latency = &recorder.load_summary()["source_latency"]["127.0.0.1"];
+        assert_eq!(latency["completed"], 3);
+        assert_eq!(latency["not_completed"], 0);
+        assert!(latency["p50_ms"].as_u64().unwrap() >= 30);
+        assert!(latency["peak_in_flight"].as_u64().unwrap() >= 2);
     }
 
     #[test]

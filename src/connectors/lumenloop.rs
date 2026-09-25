@@ -7,6 +7,11 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 const BASE: &str = "https://api.lumenloop.com/v1/tools";
+
+/// The host every LumenLoop request goes to.
+pub fn host() -> Option<String> {
+    Some(reqwest::Url::parse(BASE).ok()?.host_str()?.to_owned())
+}
 const WINDOW: usize = 20;
 const COLLECTIONS: &[(&str, &str, &str)] = &[
     ("articles", "Articles", "News and articles about Stellar; AI summaries and original URLs, without full article bodies."),

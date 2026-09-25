@@ -850,6 +850,15 @@ async fn original(
     )
 }
 
+/// The search host of an Algolia source: its application's endpoint, when configured.
+pub fn search_host(source: &Source) -> Option<String> {
+    let index = indices().find(|index| index.id() == source.id)?;
+    let app = std::env::var(format!("ALGOLIA_APPLICATION_ID_{}", index.scope))
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    endpoint(&app, None).ok()?.host_str().map(str::to_owned)
+}
+
 pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Result<FetchResult> {
     let index = indices()
         .find(|index| index.id() == source.id)

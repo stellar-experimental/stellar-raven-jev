@@ -321,6 +321,7 @@ pub async fn check(
         .context("question.json has unreadable settings")?;
     config.output_dir = root.clone();
     config.host_dir = current.host_dir.clone();
+    config.source_slots = current.source_slots.clone();
     settle_stopped_call(&root)?;
     let prior: Usage = read(&root, "usage.json")?;
     let cap = budget_cap(&root)?;

@@ -81,6 +81,11 @@ const LISTINGS: &[Listing] = &[
     Listing { id: "stablecoins", path: "/api/stablecoins", key: "stablecoins", description: "Tracked stablecoins, fiat pegs, USD market capitalization, and dated usage", paged: false, query: false, limit: 100, roster: &["ticker", "name", "company", "peg", "basis", "assetType", "issuer", "issuerDomain", "supply", "marketCapUSD", "updatedAt", "verified", "note"], every_row: &[], row_dates: &[("/updatedAt", "observed")] },
 ];
 
+/// The host every Stellar Scout request goes to.
+pub fn host() -> Option<String> {
+    Some(Url::parse(BASE).ok()?.host_str()?.to_owned())
+}
+
 /// The request scope (host and path) of a source's first request, as the HTTP recorder names
 /// scopes for source rate limits. Every research origin shares one endpoint.
 pub fn first_request_scope(source: &Source) -> Option<String> {

@@ -66,6 +66,29 @@ pub fn first_requests<'a>(sources: impl IntoIterator<Item = &'a Source>) -> Vec<
     demands.into_iter().collect()
 }
 
+/// The host a source's search requests go to, when it is known before fetching.
+pub fn search_host(source: &Source) -> Option<String> {
+    match source.family.as_str() {
+        "stellarlight" => stellarlight::host(),
+        "lumenloop" => lumenloop::host(),
+        "algolia" => algolia::search_host(source),
+        _ => None,
+    }
+}
+
+/// The capped hosts that fetching `sources` uses, with their slot counts, in a stable order.
+pub fn host_caps<'a>(
+    sources: impl IntoIterator<Item = &'a Source>,
+    slots: &std::collections::BTreeMap<String, usize>,
+) -> Vec<(String, usize)> {
+    let hosts: std::collections::BTreeSet<String> =
+        sources.into_iter().filter_map(search_host).collect();
+    hosts
+        .into_iter()
+        .filter_map(|host| slots.get(&host).map(|n| (host, *n)))
+        .collect()
+}
+
 pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Result<FetchResult> {
     match source.family.as_str() {
         "lumenloop" => lumenloop::fetch(ctx, source, question).await,
