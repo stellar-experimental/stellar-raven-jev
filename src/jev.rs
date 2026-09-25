@@ -567,6 +567,34 @@ impl JevClient {
         claims: &[String],
         documents: &[Document],
     ) -> Vec<Result<Vec<ClaimJudgment>>> {
+        // Each claim has its own calls: in a replay of 51 saved checks, claims that shared a call
+        // changed each other's judgments about five times as often as a repeat did.
+        let per_claim =
+            futures::future::join_all(claims.iter().map(|claim| {
+                self.judge_claim_set(question, std::slice::from_ref(claim), documents)
+            }))
+            .await;
+        (0..documents.len())
+            .map(|d| {
+                let mut judgments = Vec::with_capacity(claims.len());
+                for results in &per_claim {
+                    match &results[d] {
+                        Ok(one) => judgments.extend(one.iter().cloned()),
+                        Err(error) => return Err(anyhow!("{error:#}")),
+                    }
+                }
+                Ok(judgments)
+            })
+            .collect()
+    }
+
+    /// Judge `claims` together, as one set per call; `judge_claims` sends one claim per set.
+    async fn judge_claim_set(
+        &self,
+        question: &str,
+        claims: &[String],
+        documents: &[Document],
+    ) -> Vec<Result<Vec<ClaimJudgment>>> {
         let blank = || ClaimJudgment {
             supports: 0.0,
             contradicts: 0.0,
@@ -3241,29 +3269,28 @@ mod tests {
     #[tokio::test]
     async fn claim_checks_map_answers_per_chunk_and_claim_and_split_escaped_text() {
         let dir = tempfile::tempdir().unwrap();
-        // Two documents with one chunk each and two claims share one call at batch 4.
+        // Two documents with one chunk each share a call at batch 4; each claim has its own call.
         let mut answers = serde_json::Map::new();
-        for (k, j, supports, contradicts) in [
-            (0, 0, 0.9, 0.1),
-            (0, 1, 0.2, 0.7),
-            (1, 0, 0.3, 0.0),
-            (1, 1, 0.8, 0.0),
-        ] {
+        for (k, supports, contradicts) in [(0, 0.9, 0.7), (1, 0.3, 0.0)] {
             answers.insert(
-                format!("d{k}_c{j}_supports"),
+                format!("d{k}_c0_supports"),
                 json!({"type":"noul","noul":supports}),
             );
             answers.insert(
-                format!("d{k}_c{j}_contradicts"),
+                format!("d{k}_c0_contradicts"),
                 json!({"type":"noul","noul":contradicts}),
             );
             answers.insert(
-                format!("d{k}_c{j}_qualifies"),
+                format!("d{k}_c0_qualifies"),
                 json!({"type":"noul","noul":0.1}),
             );
         }
         let body = json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":300,"output_tokens":20}});
-        let (url, server) = scripted_server(vec![(0, "200 OK", body.to_string())]).await;
+        let (url, server) = scripted_server(vec![
+            (0, "200 OK", body.to_string()),
+            (0, "200 OK", body.to_string()),
+        ])
+        .await;
         let mut client = hedging_client(dir.path(), url, 1.0);
         client.hedge_after = None;
         // This test packs several chunks per call.
@@ -3278,10 +3305,11 @@ mod tests {
             .await;
         server.await.unwrap();
         let one = judged[0].as_ref().unwrap();
+        assert_eq!(one.len(), 2);
         assert_eq!((one[0].supports, one[1].contradicts), (0.9, 0.7));
         let two = judged[1].as_ref().unwrap();
-        assert_eq!(two[1].supports, 0.8);
-        assert_eq!(client.usage().requests, 1);
+        assert_eq!(two[1].supports, 0.3);
+        assert_eq!(client.usage().requests, 2, "one call per claim");
         // A chunk of control characters serializes six times larger; it is split to fit.
         let escaped = "\u{1}".repeat(DOCUMENT_CHUNK_BYTES);
         let pieces = fit_serialized("t", &escaped, (0, escaped.len()), CLAIM_CHUNK_STATE_BYTES);
@@ -3299,34 +3327,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn four_claims_take_one_chunk_per_call_and_a_failed_call_fails_only_its_document() {
+    async fn a_failed_call_for_one_claim_fails_the_documents_it_covered() {
         let dir = tempfile::tempdir().unwrap();
         let mut answers = serde_json::Map::new();
-        for j in 0..4 {
-            let supports = 0.2 * j as f64;
-            answers.insert(
-                format!("d0_c{j}_supports"),
-                json!({"type":"noul","noul":supports}),
-            );
-            answers.insert(
-                format!("d0_c{j}_contradicts"),
-                json!({"type":"noul","noul":0.0}),
-            );
-            answers.insert(
-                format!("d0_c{j}_qualifies"),
-                json!({"type":"noul","noul":0.0}),
-            );
+        for k in 0..2 {
+            for name in ["supports", "contradicts", "qualifies"] {
+                answers.insert(format!("d{k}_c0_{name}"), json!({"type":"noul","noul":0.2}));
+            }
         }
         let body = json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":300,"output_tokens":20}});
-        // Four claims at batch 4 leave room for one chunk per call: two documents, two calls.
+        // Four claims, two documents in one call each at batch 4: four calls, one of which fails.
         let (url, server) = scripted_server(vec![
+            (0, "200 OK", body.to_string()),
+            (0, "200 OK", body.to_string()),
             (0, "200 OK", body.to_string()),
             (0, "500 Internal Server Error", "{}".into()),
         ])
         .await;
         let mut client = hedging_client(dir.path(), url, 1.0);
         client.hedge_after = None;
-        // This test packs several chunks per call.
         client.batch = 4;
         let documents = vec![
             text_document("one", "First text".into()),
@@ -3337,14 +3356,8 @@ mod tests {
             .judge_claims("A question?", &claims, &documents)
             .await;
         server.await.unwrap();
-        assert_eq!(client.usage().requests, 2);
-        let (ok, failed): (Vec<_>, Vec<_>) = judged.iter().partition(|j| j.is_ok());
-        assert_eq!((ok.len(), failed.len()), (1, 1));
-        let rows = ok[0].as_ref().unwrap();
-        assert_eq!(rows.len(), 4);
-        for (j, row) in rows.iter().enumerate() {
-            assert!((row.supports - 0.2 * j as f64).abs() < 1e-9);
-        }
+        assert_eq!(client.usage().requests, 4);
+        assert!(judged.iter().all(|j| j.is_err()));
     }
 
     fn text_document(id: &str, text: String) -> Document {
