@@ -216,6 +216,34 @@ pub fn pools_view(root: &Path) -> Result<Value> {
     Ok(Value::Array(pools))
 }
 
+/// The compact view of the pools: counts, the best routing and tail probabilities, and only the
+/// pools with a signal an agent can act on: an unscored tail whose best scored document reached
+/// the uncertain threshold, or an unfetched source routed within 0.1 of the fetch threshold. The
+/// full list stays in the full report (`--json`).
+pub fn pool_summary(pools: &Value, config: &Value) -> Value {
+    let rows = pools.as_array().cloned().unwrap_or_default();
+    let uncertain = config["uncertain_threshold"].as_f64().unwrap_or(0.15);
+    let fetch = config["fetch_threshold"].as_f64().unwrap_or(0.2);
+    let of = |state: &'static str| rows.iter().filter(move |p| p["state"] == state);
+    let max = |values: Vec<f64>| values.into_iter().reduce(f64::max);
+    let actionable: Vec<Value> = rows
+        .iter()
+        .filter(|p| match p["state"].as_str() {
+            Some("unscored_tail") => p["best"].as_f64().unwrap_or(0.0) >= uncertain,
+            Some("unfetched") => p["route"].as_f64().unwrap_or(0.0) >= fetch - 0.1,
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    json!({
+        "unfetched": of("unfetched").count(),
+        "unscored_tails": of("unscored_tail").count(),
+        "best_unfetched_route": max(of("unfetched").filter_map(|p| p["route"].as_f64()).collect()),
+        "best_tail_score": max(of("unscored_tail").filter_map(|p| p["best"].as_f64()).collect()),
+        "actionable": actionable,
+    })
+}
+
 /// Which documents a claim check reads.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum CheckScope {
@@ -436,6 +464,30 @@ pub async fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_compact_pool_view_lists_only_pools_with_a_signal() {
+        let pools = json!([
+            {"id":"near","state":"unfetched","route":0.35},
+            {"id":"far","state":"unfetched","route":0.21},
+            {"id":"live","state":"unscored_tail","route":0.5,"best":0.3},
+            {"id":"dead","state":"unscored_tail","route":0.5,"best":0.05},
+        ]);
+        let summary = pool_summary(
+            &pools,
+            &json!({"uncertain_threshold":0.15,"fetch_threshold":0.4}),
+        );
+        let ids: Vec<&str> = summary["actionable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["near", "live"]);
+        assert_eq!(summary["unfetched"], 2);
+        assert_eq!(summary["unscored_tails"], 2);
+        assert_eq!(summary["best_tail_score"], 0.3);
+    }
 
     #[test]
     fn one_call_at_a_time_holds_a_session() {

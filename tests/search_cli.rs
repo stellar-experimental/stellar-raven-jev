@@ -284,7 +284,12 @@ fn a_session_spends_its_pools_and_checks_claims() {
     let session = first["session"]["id"].as_str().unwrap().to_owned();
     assert_eq!(first["session"]["calls"], 1);
     assert_eq!(first["session"]["documents_scored"], 0);
-    let pools = first["pools"].as_array().unwrap();
+    // Routed at 0.85, within 0.1 of the 0.9 fetch threshold, so every pool is actionable.
+    assert_eq!(
+        first["pools"]["unfetched"],
+        first["pools"]["actionable"].as_array().unwrap().len()
+    );
+    let pools = first["pools"]["actionable"].as_array().unwrap();
     assert!(!pools.is_empty());
     assert!(pools.iter().all(|p| p["state"] == "unfetched"));
     let pool = pools
@@ -296,7 +301,7 @@ fn a_session_spends_its_pools_and_checks_claims() {
     assert_eq!(more["session"]["calls"], 2);
     assert_eq!(more["session"]["documents_scored"], 1);
     assert_eq!(more["results"].as_array().unwrap().len(), 1);
-    assert!(more["pools"]
+    assert!(more["pools"]["actionable"]
         .as_array()
         .unwrap()
         .iter()
@@ -316,6 +321,7 @@ fn a_session_spends_its_pools_and_checks_claims() {
     assert_eq!(claim["documents_judged"], 1);
     assert_eq!(claim["supporting"][0]["text_path"], text_path.as_str());
     let all = run(&["more", &session, "--all"]);
-    assert_eq!(all["pools"].as_array().unwrap().len(), 0);
+    assert_eq!(all["pools"]["unfetched"], 0);
+    assert_eq!(all["pools"]["actionable"].as_array().unwrap().len(), 0);
     assert_eq!(all["results"][0]["text_path"], text_path.as_str());
 }

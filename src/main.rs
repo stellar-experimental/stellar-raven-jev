@@ -60,9 +60,11 @@ struct Cli {
     route_passes: usize,
     #[arg(long, global = true, hide = true, default_value_t = 0.2)]
     source_threshold: f64,
-    #[arg(long, global = true, hide = true, default_value_t = 0.2)]
+    /// Sources routed below this stay in the session as pools. 0.2 fetches every routed source.
+    #[arg(long, global = true, hide = true, default_value_t = 0.4)]
     fetch_threshold: f64,
-    #[arg(long, global = true, hide = true, default_value_t = 0)]
+    /// Documents scored per source before the rest waits for promise. 0 scores everything.
+    #[arg(long, global = true, hide = true, default_value_t = 4)]
     score_depth: usize,
     #[arg(long, global = true, hide = true, default_value_t = 0.4)]
     document_threshold: f64,

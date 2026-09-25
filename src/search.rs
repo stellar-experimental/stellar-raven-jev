@@ -181,6 +181,8 @@ pub fn build_report_variant(
             results.push(row);
         }
     }
+    let pools = crate::session::pools_view(&root).unwrap_or(Value::Array(vec![]));
+    let pool_summary = crate::session::pool_summary(&pools, &question["config"]);
     let load = load_summary(
         &failures,
         &outcome.usage,
@@ -195,7 +197,7 @@ pub fn build_report_variant(
         "counts":{"selected":outcome.selected,"uncertain":outcome.uncertain,"rejected":outcome.rejected,"omitted":omitted.len(),"reports":failures.len()},
         "usage":outcome.usage,"load":load,
         "session":crate::session::session_view(&root, &outcome.usage),
-        "pools":crate::session::pools_view(&root).unwrap_or(Value::Array(vec![])),
+        "pools":pools,"pool_summary":pool_summary,
         "results":results,"reports":failures,
         "limitations":["Scores are uncalibrated relevance estimates.","Results can contain summaries or chunks. Full available text is not always the complete original document.","A complete run does not prove complete question coverage.","Remote instructions are source evidence. They are not installed or executed."],
     });
@@ -527,7 +529,7 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
     json!({
         "schema_version":1,"compact":true,"question":report["question"],"mode":report["mode"],
         "status":report["status"],"counts":report["counts"],"usage":report["usage"],
-        "load":report["load"],"session":report["session"],"pools":report["pools"],
+        "load":report["load"],"session":report["session"],"pools":report["pool_summary"],
         "source_scope":report["source_scope"]["scope"],
         "currentness":report["currentness"],
         "results":results,
