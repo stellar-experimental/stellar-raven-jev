@@ -331,6 +331,7 @@ pub(crate) const SESSION_FILES: &[&str] = &[
     "intent.json",
     "usage.json",
     "load.json",
+    "retrieved.json",
     "session.json",
 ];
 
@@ -676,10 +677,15 @@ pub(crate) async fn fetch_sources(
     }
     drop(jobs);
     // Raw response bodies already preserve each connector's evidence while fetching runs.
-    write_json(
-        config.output_dir.join("retrieved.json"),
-        &retrieved_index(&fetched),
-    )?;
+    // Later session calls add to the index, so every call's retrieval stays on record.
+    // The file exists from the first call on; an unreadable one is an error, never a reset.
+    let mut index: Vec<serde_json::Value> = read_json(&config.output_dir, "retrieved.json")?;
+    let call = crate::session::current_call(&config.output_dir)?;
+    index.extend(retrieved_index(&fetched).into_iter().map(|mut r| {
+        r["call"] = json!(call);
+        r
+    }));
+    write_json(config.output_dir.join("retrieved.json"), &index)?;
     Ok(fetched)
 }
 

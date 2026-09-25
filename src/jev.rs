@@ -591,7 +591,16 @@ impl JevClient {
         let mut slots: Vec<(usize, (usize, usize))> = Vec::new();
         for (d, document) in documents.iter().enumerate() {
             for range in text_chunks(&document.text, DOCUMENT_CHUNK_BYTES) {
-                slots.push((d, range));
+                // Text that escapes heavily can serialize past the state limit; split it until
+                // each piece fits, so no document fails for its encoding.
+                for piece in fit_serialized(
+                    &document.title,
+                    &document.text,
+                    range,
+                    CLAIM_CHUNK_STATE_BYTES,
+                ) {
+                    slots.push((d, piece));
+                }
             }
         }
         let base = json!({"user_question":question,"claims":claims,"documents":[]})
@@ -1599,6 +1608,48 @@ fn evidence_questions(path: &str, prefix: &str) -> Map<String, Value> {
 /// The one currentness question. It sees today's date and the document's code-extracted date, so
 /// it can judge age against how fast the subject changes. It compares no dates itself: code
 /// supplies both, and the question asks for a judgment, not arithmetic.
+/// A claim-check chunk serializes to at most this many bytes, so one chunk always fits a call
+/// with its claims and questions.
+const CLAIM_CHUNK_STATE_BYTES: usize = BATCH_STATE_BYTES / 2;
+
+/// Pieces are never split below this size, so an oversized title cannot turn one chunk into
+/// many tiny calls.
+const MIN_CLAIM_PIECE_BYTES: usize = 1_024;
+
+/// Split a byte range of `text` at UTF-8 boundaries until each piece, serialized with the title,
+/// fits in `limit` bytes. A piece that cannot shrink further is returned as it is.
+fn fit_serialized(
+    title: &str,
+    text: &str,
+    range: (usize, usize),
+    limit: usize,
+) -> Vec<(usize, usize)> {
+    let size = |(start, end): (usize, usize)| {
+        json!({"title": title, "text": &text[start..end]})
+            .to_string()
+            .len()
+    };
+    let mut pending = vec![range];
+    let mut fitted = Vec::new();
+    while let Some((start, end)) = pending.pop() {
+        if size((start, end)) <= limit || end - start < 2 * MIN_CLAIM_PIECE_BYTES {
+            fitted.push((start, end));
+            continue;
+        }
+        let mut middle = start + (end - start) / 2;
+        while !text.is_char_boundary(middle) {
+            middle += 1;
+        }
+        if middle >= end {
+            fitted.push((start, end));
+            continue;
+        }
+        pending.push((middle, end));
+        pending.push((start, middle));
+    }
+    fitted
+}
+
 /// Jev's judgment of one claim against one document.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ClaimJudgment {
@@ -3183,6 +3234,111 @@ mod tests {
         assert_eq!(probabilities, [0.9, 0.5, 0.1]);
         assert_eq!(scores[1].as_ref().unwrap().document_id, "two");
         assert_eq!(client.usage().requests, 1, "three chunks, one call");
+    }
+
+    #[tokio::test]
+    async fn claim_checks_map_answers_per_chunk_and_claim_and_split_escaped_text() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two documents with one chunk each and two claims share one call at batch 4.
+        let mut answers = serde_json::Map::new();
+        for (k, j, supports, contradicts) in [
+            (0, 0, 0.9, 0.1),
+            (0, 1, 0.2, 0.7),
+            (1, 0, 0.3, 0.0),
+            (1, 1, 0.8, 0.0),
+        ] {
+            answers.insert(
+                format!("d{k}_c{j}_supports"),
+                json!({"type":"noul","noul":supports}),
+            );
+            answers.insert(
+                format!("d{k}_c{j}_contradicts"),
+                json!({"type":"noul","noul":contradicts}),
+            );
+            answers.insert(
+                format!("d{k}_c{j}_qualifies"),
+                json!({"type":"noul","noul":0.1}),
+            );
+        }
+        let body = json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":300,"output_tokens":20}});
+        let (url, server) = scripted_server(vec![(0, "200 OK", body.to_string())]).await;
+        let mut client = hedging_client(dir.path(), url, 1.0);
+        client.hedge_after = None;
+        let documents = vec![
+            text_document("one", "First text".into()),
+            text_document("two", "Second text".into()),
+        ];
+        let claims = vec!["Claim A".to_owned(), "Claim B".to_owned()];
+        let judged = client
+            .judge_claims("A question?", &claims, &documents)
+            .await;
+        server.await.unwrap();
+        let one = judged[0].as_ref().unwrap();
+        assert_eq!((one[0].supports, one[1].contradicts), (0.9, 0.7));
+        let two = judged[1].as_ref().unwrap();
+        assert_eq!(two[1].supports, 0.8);
+        assert_eq!(client.usage().requests, 1);
+        // A chunk of control characters serializes six times larger; it is split to fit.
+        let escaped = "\u{1}".repeat(DOCUMENT_CHUNK_BYTES);
+        let pieces = fit_serialized("t", &escaped, (0, escaped.len()), CLAIM_CHUNK_STATE_BYTES);
+        assert!(pieces.len() > 1);
+        assert_eq!(
+            pieces.iter().map(|(s, e)| e - s).sum::<usize>(),
+            escaped.len()
+        );
+        assert!(pieces
+            .iter()
+            .all(
+                |&(s, e)| json!({"title":"t","text":&escaped[s..e]}).to_string().len()
+                    <= CLAIM_CHUNK_STATE_BYTES
+            ));
+    }
+
+    #[tokio::test]
+    async fn four_claims_take_one_chunk_per_call_and_a_failed_call_fails_only_its_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut answers = serde_json::Map::new();
+        for j in 0..4 {
+            let supports = 0.2 * j as f64;
+            answers.insert(
+                format!("d0_c{j}_supports"),
+                json!({"type":"noul","noul":supports}),
+            );
+            answers.insert(
+                format!("d0_c{j}_contradicts"),
+                json!({"type":"noul","noul":0.0}),
+            );
+            answers.insert(
+                format!("d0_c{j}_qualifies"),
+                json!({"type":"noul","noul":0.0}),
+            );
+        }
+        let body = json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":300,"output_tokens":20}});
+        // Four claims at batch 4 leave room for one chunk per call: two documents, two calls.
+        let (url, server) = scripted_server(vec![
+            (0, "200 OK", body.to_string()),
+            (0, "500 Internal Server Error", "{}".into()),
+        ])
+        .await;
+        let mut client = hedging_client(dir.path(), url, 1.0);
+        client.hedge_after = None;
+        let documents = vec![
+            text_document("one", "First text".into()),
+            text_document("two", "Second text".into()),
+        ];
+        let claims: Vec<String> = (0..4).map(|j| format!("Claim {j}")).collect();
+        let judged = client
+            .judge_claims("A question?", &claims, &documents)
+            .await;
+        server.await.unwrap();
+        assert_eq!(client.usage().requests, 2);
+        let (ok, failed): (Vec<_>, Vec<_>) = judged.iter().partition(|j| j.is_ok());
+        assert_eq!((ok.len(), failed.len()), (1, 1));
+        let rows = ok[0].as_ref().unwrap();
+        assert_eq!(rows.len(), 4);
+        for (j, row) in rows.iter().enumerate() {
+            assert!((row.supports - 0.2 * j as f64).abs() < 1e-9);
+        }
     }
 
     fn text_document(id: &str, text: String) -> Document {

@@ -80,6 +80,11 @@ struct Cli {
         default_value_t = 6
     )]
     max_searches: usize,
+    /// Folder of host-wide state (admission slots, Jev budgets, source rate limits). Every search
+    /// that should share this host's capacity uses the same folder. Defaults to
+    /// OUTPUT_DIR/.host. Also accepts JEV_HOST_DIR.
+    #[arg(long, global = true, env = "JEV_HOST_DIR")]
+    host_dir: Option<PathBuf>,
     /// How long a search waits for a free slot before it reports `busy`.
     #[arg(long, global = true, hide = true, default_value_t = 60)]
     admission_wait_secs: u64,
@@ -206,12 +211,12 @@ fn session_full_record(session: &std::path::Path) -> Result<bool> {
 /// share an output directory share one host state folder: admission slots, Jev provider budgets
 /// and cooldowns, and source rate-limit gates.
 async fn admit(
-    slots: (usize, u64),
+    slots: (usize, u64, Option<PathBuf>),
     config: &mut RunConfig,
     question: &str,
 ) -> Result<stellar_raven_jev::governor::Admission> {
-    let (max_searches, admission_wait_secs) = slots;
-    let host_dir = config.output_dir.join(".host");
+    let (max_searches, admission_wait_secs, host_dir) = slots;
+    let host_dir = host_dir.unwrap_or_else(|| config.output_dir.join(".host"));
     let governor = stellar_raven_jev::governor::Governor::at(&host_dir)?;
     let Some(admission) = governor
         .admit(
@@ -460,7 +465,11 @@ async fn main() -> Result<()> {
         host_dir: None,
     };
     validate_config(&config)?;
-    let slots = (cli.max_searches, cli.admission_wait_secs);
+    let slots = (
+        cli.max_searches,
+        cli.admission_wait_secs,
+        cli.host_dir.clone(),
+    );
     match cli.command {
         Command::Sources { resources } => println!(
             "{}",
@@ -480,7 +489,7 @@ async fn main() -> Result<()> {
             full_record,
         } => {
             config.full_record = full_record;
-            let admission = admit(slots, &mut config, &question).await?;
+            let admission = admit(slots.clone(), &mut config, &question).await?;
             let outcome =
                 stellar_raven_jev::pipeline::run_question_scoped(&question, &config, resources)
                     .await?;
@@ -511,7 +520,7 @@ async fn main() -> Result<()> {
         } => {
             let question = session_question(&session)?;
             let _held = hold_session(&session, &question)?;
-            let admission = admit(slots, &mut config, &question).await?;
+            let admission = admit(slots.clone(), &mut config, &question).await?;
             let outcome = stellar_raven_jev::pipeline::continue_session(
                 &session,
                 (!all).then_some(pool.as_slice()),
@@ -545,7 +554,7 @@ async fn main() -> Result<()> {
         } => {
             let question = session_question(&session)?;
             let _held = hold_session(&session, &question)?;
-            let admission = admit(slots, &mut config, &question).await?;
+            let admission = admit(slots.clone(), &mut config, &question).await?;
             let result =
                 stellar_raven_jev::session::check(&session, &claims, scope, limit, &config).await?;
             drop(admission);

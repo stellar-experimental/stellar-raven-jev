@@ -200,6 +200,7 @@ fn default_search_prints_compact_json_and_keeps_a_light_record() {
             "manifest.json",
             "omitted.json",
             "question.json",
+            "retrieved.json",
             "routes.json",
             "scores.json",
             "search-documents",
@@ -320,8 +321,20 @@ fn a_session_spends_its_pools_and_checks_claims() {
     let claim = &check["claims"][0];
     assert_eq!(claim["documents_judged"], 1);
     assert_eq!(claim["supporting"][0]["text_path"], text_path.as_str());
+    assert!(claim["max_supports"].as_f64().unwrap() >= 0.5);
     let all = run(&["more", &session, "--all"]);
     assert_eq!(all["pools"]["unfetched"], 0);
+    // Each call that fetched sources appends its documents with its own call number: the first
+    // call fetched nothing, `more --pool` is call 2, and `more --all` is call 4.
+    let retrieved: Vec<Value> = serde_json::from_slice(
+        &std::fs::read(temp.path().join(&session).join("retrieved.json")).unwrap(),
+    )
+    .unwrap();
+    let calls: std::collections::BTreeSet<u64> = retrieved
+        .iter()
+        .filter_map(|r| r["call"].as_u64())
+        .collect();
+    assert_eq!(calls.into_iter().collect::<Vec<_>>(), vec![2, 4]);
     assert_eq!(all["pools"]["actionable"].as_array().unwrap().len(), 0);
     assert_eq!(all["results"][0]["text_path"], text_path.as_str());
 }

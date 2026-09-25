@@ -74,7 +74,22 @@ pub fn begin_call(root: &Path, allowance_usd: f64) -> Result<()> {
     settle_stopped_call(root)?;
     let mut session: Value = read(root, "session.json")?;
     session["in_progress_usd"] = json!(allowance_usd);
+    // A stopped call records no entry but keeps its number, so numbers never repeat.
+    let recorded = session["calls"].as_array().map_or(0, Vec::len) as u64;
+    let started = session["calls_started"].as_u64().unwrap_or(0).max(recorded) + 1;
+    session["calls_started"] = json!(started);
     write(root, "session.json", &session)
+}
+
+/// The number of the call now running: 1 for the first search, which starts the session.
+pub fn current_call(root: &Path) -> Result<u64> {
+    if !root.join("session.json").exists() {
+        return Ok(1);
+    }
+    let session: Value = read(root, "session.json")?;
+    session["calls_started"]
+        .as_u64()
+        .context("session.json lacks the running call's number")
 }
 
 /// Charge the whole allowance of a call that stopped before it saved its usage. Run it before a
@@ -222,8 +237,11 @@ pub fn pools_view(root: &Path) -> Result<Value> {
 /// full list stays in the full report (`--json`).
 pub fn pool_summary(pools: &Value, config: &Value) -> Value {
     let rows = pools.as_array().cloned().unwrap_or_default();
-    let uncertain = config["uncertain_threshold"].as_f64().unwrap_or(0.15);
-    let fetch = config["fetch_threshold"].as_f64().unwrap_or(0.2);
+    // Without the run's thresholds, no pool is called actionable.
+    let uncertain = config["uncertain_threshold"]
+        .as_f64()
+        .unwrap_or(f64::INFINITY);
+    let fetch = config["fetch_threshold"].as_f64().unwrap_or(f64::INFINITY);
     let of = |state: &'static str| rows.iter().filter(move |p| p["state"] == state);
     let max = |values: Vec<f64>| values.into_iter().reduce(f64::max);
     let actionable: Vec<Value> = rows
@@ -424,12 +442,20 @@ pub async fn check(
         hits.truncate(limit);
         hits
     };
+    let top = |rows: &[Value], signal: &str| {
+        rows.iter()
+            .filter_map(|r| r[signal].as_f64())
+            .reduce(f64::max)
+    };
     let claims_out: Vec<Value> = claims
         .iter()
         .zip(&per_claim)
         .map(|(claim, rows)| {
             json!({
                 "claim": claim, "documents_judged": rows.len(),
+                "max_supports": top(rows, "supports"),
+                "max_contradicts": top(rows, "contradicts"),
+                "max_qualifies": top(rows, "qualifies"),
                 "supporting": lists(rows, "supports"),
                 "contradicting": lists(rows, "contradicts"),
                 "qualifying": lists(rows, "qualifies"),
@@ -508,8 +534,11 @@ mod tests {
         )
         .unwrap();
         begin_call(dir.path(), 0.5).unwrap();
-        // The process stops here. The next call settles the mark conservatively.
+        assert_eq!(current_call(dir.path()).unwrap(), 2);
+        // The process stops here. The next call settles the mark conservatively and takes the
+        // next number, so the stopped call's number is never reused.
         begin_call(dir.path(), 0.25).unwrap();
+        assert_eq!(current_call(dir.path()).unwrap(), 3);
         let usage: Usage = read(dir.path(), "usage.json").unwrap();
         assert_eq!(usage.cost_usd, 0.5);
         end_call(dir.path()).unwrap();

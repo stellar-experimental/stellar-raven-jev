@@ -158,8 +158,12 @@ impl Governor {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
+        // Absolute, so every working directory names the same host.
+        let dir = dir
+            .canonicalize()
+            .with_context(|| format!("Cannot resolve the host state folder {}", dir.display()))?;
         Ok(Self {
-            dir: Some(dir.to_path_buf()),
+            dir: Some(dir),
             memory: Mutex::default(),
         })
     }
