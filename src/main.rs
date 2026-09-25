@@ -38,6 +38,10 @@ struct Cli {
     jev_concurrency: usize,
     #[arg(long, global = true, hide = true, default_value_t = 2000)]
     jev_hedge_ms: u64,
+    /// A source GET without a response this long after it was sent gets one hedge request on a
+    /// fresh connection. 0 turns source hedging off.
+    #[arg(long, global = true, hide = true, default_value_t = 4000)]
+    source_hedge_ms: u64,
     /// Chunks per scoring call. One per call is the default: in a replay, chunks that shared a
     /// call changed each other's scores (91 of 1,655 documents crossed the selection threshold,
     /// against 18 between two single-chunk runs).
@@ -483,6 +487,7 @@ async fn main() -> Result<()> {
         concurrency: cli.concurrency,
         jev_concurrency: cli.jev_concurrency,
         jev_hedge_ms: cli.jev_hedge_ms,
+        source_hedge_ms: cli.source_hedge_ms,
         jev_batch: cli.jev_batch,
         today: cli
             .today
@@ -682,6 +687,14 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_hedging_defaults_to_four_seconds_and_zero_turns_it_off() {
+        let cli = Cli::try_parse_from(["jev", "sources"]).unwrap();
+        assert_eq!(cli.source_hedge_ms, 4000);
+        let cli = Cli::try_parse_from(["jev", "--source-hedge-ms", "0", "sources"]).unwrap();
+        assert_eq!(cli.source_hedge_ms, 0);
+    }
 
     #[test]
     fn source_slots_parse_strictly() {

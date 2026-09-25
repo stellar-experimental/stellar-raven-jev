@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -33,6 +33,12 @@ pub struct HttpRecorder {
     limits: Option<Arc<RequestLimits>>,
     /// Set on a public reader clone: see `public_reader`.
     public: Option<PublicPolicy>,
+    /// Hedges for stalled source GETs: a client that opens a fresh connection for each request,
+    /// and hedge permits per host apart from the host's request permits.
+    hedge_client: Client,
+    hedge_hosts: Arc<HostLimits>,
+    /// Set on the clone that sends a hedge, so its receipt says so.
+    hedge: bool,
 }
 
 /// The largest body a public read keeps.
@@ -215,6 +221,19 @@ fn public_client(policy: &PublicPolicy) -> Result<Client> {
         .build()?)
 }
 
+/// The builder for source and Jev requests: no redirects and the configured time limit. A `fresh`
+/// client keeps no idle connection, so each request opens its own.
+fn source_client(config: &RunConfig, fresh: bool) -> reqwest::ClientBuilder {
+    let builder = Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_secs(config.timeout_secs));
+    if fresh {
+        builder.pool_max_idle_per_host(0)
+    } else {
+        builder
+    }
+}
+
 /// An error and its causes on one line.
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut text = error.to_string();
@@ -270,6 +289,10 @@ const GATE_DEFAULT_CLOSE: Duration = Duration::from_secs(10);
 const GATE_MAX_CLOSE: Duration = Duration::from_secs(600);
 /// The latest reset a source can advertise for a request window.
 const WINDOW_MAX_RESET: Duration = Duration::from_secs(86_400);
+/// Hedges one run may send, and hedges in flight per host. Hedges never take the permits of the
+/// requests they duplicate.
+const HEDGES_PER_RUN: u64 = 16;
+const HEDGES_PER_HOST: usize = 2;
 /// How long a question waits for room in a source's advertised window before it sends without a
 /// booking: one full window of a one-minute source.
 const BOOKING_WAIT_LIMIT: Duration = Duration::from_secs(65);
@@ -289,6 +312,10 @@ struct LoadCounters {
     latency_ms: Mutex<std::collections::BTreeMap<String, Vec<u64>>>,
     /// Source requests in flight now, and the most at once, per host.
     in_flight: Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    /// Hedge requests sent in this run.
+    hedges: AtomicU64,
+    /// Hedges sent, and hedges whose response was returned, per host.
+    hedged: Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
 }
 
 /// One source request in flight; dropping it, also by cancellation, ends it.
@@ -587,11 +614,8 @@ impl HttpRecorder {
     pub(crate) fn loopback_for_test(run_dir: &Path, config: &RunConfig) -> Result<Self> {
         let mut recorder = Self::new_bounded(run_dir, config, 64, 1024 * 1024, 10)?;
         // Offline tests must not inherit a proxy or relax production URL rules.
-        recorder.client = Client::builder()
-            .no_proxy()
-            .redirect(Policy::none())
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .build()?;
+        recorder.client = source_client(config, false).no_proxy().build()?;
+        recorder.hedge_client = source_client(config, true).no_proxy().build()?;
         recorder.allow_loopback = true;
         Ok(recorder)
     }
@@ -628,7 +652,8 @@ impl HttpRecorder {
     }
 
     /// Per host: completed responses and their send-to-last-byte time (p50, p95, max), requests
-    /// sent that did not complete (failed or cut), and the most requests in flight at once.
+    /// sent that did not complete (failed, cut, or a cancelled hedge race loser), the most requests
+    /// in flight at once, hedges sent, and hedges whose response was returned.
     fn latency_summary(&self) -> Value {
         let sent = self
             .load
@@ -646,6 +671,7 @@ impl HttpRecorder {
             .in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let hedged = self.load.hedged.lock().unwrap_or_else(|e| e.into_inner());
         sent.iter()
             .map(|(host, count)| {
                 let mut samples = latency.get(host).cloned().unwrap_or_default();
@@ -663,6 +689,8 @@ impl HttpRecorder {
                         "p95_ms": percentile(0.95),
                         "max_ms": samples.last(),
                         "peak_in_flight": in_flight.get(host).map_or(0, |entry| entry.1),
+                        "hedged": hedged.get(host).map_or(0, |entry| entry.0),
+                        "hedge_wins": hedged.get(host).map_or(0, |entry| entry.1),
                     }),
                 )
             })
@@ -769,10 +797,7 @@ impl HttpRecorder {
             std::fs::create_dir_all(run_dir.join("raw"))?;
         }
         Ok(Self {
-            client: Client::builder()
-                .redirect(Policy::none())
-                .timeout(Duration::from_secs(config.timeout_secs))
-                .build()?,
+            client: source_client(config, false).build()?,
             root: run_dir.to_path_buf(),
             config: config.clone(),
             sequence: Arc::new(AtomicU64::new(0)),
@@ -784,6 +809,9 @@ impl HttpRecorder {
             allow_loopback: false,
             limits: None,
             public: None,
+            hedge_client: source_client(config, true).build()?,
+            hedge_hosts: HostLimits::new(HEDGES_PER_HOST),
+            hedge: false,
         })
     }
 
@@ -884,6 +912,8 @@ impl HttpRecorder {
         }
     }
 
+    /// A source GET without a body, on the clone with source gates, is hedged: see
+    /// `request_hedged`.
     pub async fn request(
         &self,
         method: Method,
@@ -891,8 +921,132 @@ impl HttpRecorder {
         headers: Vec<(String, String)>,
         body: Option<Value>,
     ) -> Result<HttpResponse> {
+        if self.gates.is_some()
+            && method == Method::GET
+            && body.is_none()
+            && !self.config.fixture
+            && self.config.source_hedge_ms > 0
+        {
+            let after = Duration::from_millis(self.config.source_hedge_ms);
+            return self.request_hedged(url, headers, after).await;
+        }
         self.request_recorded(method, url, headers, body, true, SendGate::default())
             .await
+    }
+
+    /// A GET that gets one hedge, the same request on a fresh connection, when it has no response
+    /// `after` it was sent. The hedge waits for a hedge permit on its host, passes the source gates
+    /// like any request, and is sent only while the run has hedges left. The first decisive
+    /// response wins: one that is not an error, a 429, or a 5xx. The other request is cancelled,
+    /// and its receipt is kept. When neither is decisive, the original's result stands, so the
+    /// caller's own retry still applies.
+    async fn request_hedged(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        after: Duration,
+    ) -> Result<HttpResponse> {
+        let sent = tokio::sync::Notify::new();
+        let first = self.request_recorded(
+            Method::GET,
+            url,
+            headers.clone(),
+            None,
+            true,
+            SendGate {
+                stop: None,
+                notify: Some(&sent),
+            },
+        );
+        tokio::pin!(first);
+        // Queue and gate waits do not count: the delay starts when the original is sent.
+        let delay = async {
+            sent.notified().await;
+            tokio::time::sleep(after).await;
+        };
+        tokio::select! {
+            biased;
+            result = &mut first => return result,
+            _ = delay => {}
+        }
+        if self.load.hedges.load(Ordering::SeqCst) >= HEDGES_PER_RUN {
+            return first.await;
+        }
+        let host = Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_default();
+        let load = &self.load;
+        let hedge_sent = AtomicBool::new(false);
+        // Checked when the hedge is about to be sent, so a hedge that never leaves costs nothing.
+        let take = || {
+            let taken = load
+                .hedges
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    (n < HEDGES_PER_RUN).then_some(n + 1)
+                })
+                .is_ok();
+            if taken {
+                hedge_sent.store(true, Ordering::SeqCst);
+                load.hedged
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(host.clone())
+                    .or_default()
+                    .0 += 1;
+            }
+            !taken
+        };
+        let hedger = Self {
+            client: self.hedge_client.clone(),
+            hosts: self.hedge_hosts.clone(),
+            hedge: true,
+            ..self.clone()
+        };
+        let second = hedger.request_recorded(
+            Method::GET,
+            url,
+            headers,
+            None,
+            true,
+            SendGate {
+                stop: Some(&take),
+                notify: None,
+            },
+        );
+        tokio::pin!(second);
+        let decisive =
+            |r: &Result<HttpResponse>| matches!(r, Ok(r) if r.status != 429 && r.status < 500);
+        let (result, hedge_won) = tokio::select! {
+            result = &mut first => {
+                if decisive(&result) || !hedge_sent.load(Ordering::SeqCst) {
+                    (result, false)
+                } else {
+                    let other = (&mut second).await;
+                    if decisive(&other) {
+                        (other, true)
+                    } else {
+                        (result, false)
+                    }
+                }
+            }
+            result = &mut second => {
+                if decisive(&result) {
+                    (result, true)
+                } else {
+                    ((&mut first).await, false)
+                }
+            }
+        };
+        if hedge_won {
+            load.hedged
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(host.clone())
+                .or_default()
+                .1 += 1;
+        }
+        result
     }
 
     /// A GET that every caller in this run shares: the first call sends it, and identical later
@@ -966,6 +1120,9 @@ impl HttpRecorder {
                 "body_encoding": "identity", "complete": false}),
             finished: false,
         };
+        if self.hedge {
+            record.metadata["hedge"] = json!(true);
+        }
         let started = Instant::now();
         let operation = async {
             let parsed = Url::parse(url).context("Invalid request URL")?;
@@ -1367,6 +1524,333 @@ mod tests {
         let mut recorder = HttpRecorder::new(dir, &RunConfig::default()).unwrap();
         recorder.allow_loopback = true;
         recorder.with_source_gates(Arc::new(crate::governor::Governor::local()))
+    }
+
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const NEVER: Option<Duration> = None;
+
+    fn after(ms: u64) -> Option<Duration> {
+        Some(Duration::from_millis(ms))
+    }
+
+    /// Answers each request, in arrival order, after its script delay with its script reply;
+    /// `NEVER` holds the connection without an answer. Requests past the script get a 200 at
+    /// once. Returns the URL, the request count, and each request's head.
+    async fn scripted_server(
+        script: Vec<(Option<Duration>, &'static str)>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let (served, seen, script) = (count.clone(), heads.clone(), Arc::new(script));
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (served, seen, script) = (served.clone(), seen.clone(), script.clone());
+                tokio::spawn(async move {
+                    let mut request = vec![0; 4096];
+                    let n = socket.read(&mut request).await.unwrap_or(0);
+                    seen.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&request[..n]).into_owned());
+                    let index = served.fetch_add(1, Ordering::SeqCst);
+                    let (delay, reply) = script
+                        .get(index)
+                        .copied()
+                        .unwrap_or((Some(Duration::ZERO), OK));
+                    tokio::time::sleep(delay.unwrap_or(Duration::from_secs(60))).await;
+                    let reply = reply.replacen("\r\n", "\r\nConnection: close\r\n", 1);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}/api/find"), count, heads)
+    }
+
+    fn hedging(dir: &Path, config: RunConfig) -> HttpRecorder {
+        let mut recorder = HttpRecorder::new(dir, &config).unwrap();
+        recorder.allow_loopback = true;
+        recorder.with_source_gates(Arc::new(crate::governor::Governor::local()))
+    }
+
+    fn hedge_after(ms: u64) -> RunConfig {
+        RunConfig {
+            source_hedge_ms: ms,
+            ..RunConfig::default()
+        }
+    }
+
+    /// Raw receipts in sequence order.
+    fn receipts(dir: &Path) -> Vec<Value> {
+        let mut names: Vec<_> = std::fs::read_dir(dir.join("raw"))
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        names.sort();
+        names
+            .iter()
+            .map(|name| serde_json::from_slice(&std::fs::read(dir.join("raw").join(name)).unwrap()))
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stalled_source_get_is_hedged_with_the_same_request_and_the_hedge_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = hedging(dir.path(), hedge_after(200));
+        let (url, count, heads) = scripted_server(vec![(NEVER, OK), (after(100), OK)]).await;
+        let started = Instant::now();
+        let response = recorder
+            .request(
+                Method::GET,
+                &format!("{url}?q=quillon"),
+                vec![("x-fernlet".into(), "7".into())],
+                None,
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(response.status, 200);
+        assert!(
+            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let heads = heads.lock().unwrap().clone();
+        for head in &heads {
+            assert!(
+                head.starts_with("GET /api/find?q=quillon HTTP/1.1"),
+                "{head}"
+            );
+            assert!(head.to_ascii_lowercase().contains("x-fernlet: 7"), "{head}");
+        }
+        let load = recorder.load_summary();
+        assert_eq!(load["source_requests"]["127.0.0.1"], 2);
+        let latency = &load["source_latency"]["127.0.0.1"];
+        assert_eq!(latency["hedged"], 1);
+        assert_eq!(latency["hedge_wins"], 1);
+        assert_eq!(latency["completed"], 1);
+        assert_eq!(latency["not_completed"], 1);
+        // Both attempts keep a receipt; the cancelled original says so.
+        let receipts = receipts(dir.path());
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts[0].get("hedge").is_none());
+        assert_eq!(receipts[0]["complete"], false);
+        assert!(receipts[0]["failure"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"));
+        assert_eq!(receipts[1]["hedge"], true);
+        assert_eq!(receipts[1]["complete"], true);
+        assert_eq!(response.artifact, "raw/000001.body.gz");
+    }
+
+    #[tokio::test]
+    async fn a_hedge_that_answers_first_wins_and_the_slower_original_is_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = hedging(dir.path(), hedge_after(200));
+        let (url, _, _) = scripted_server(vec![(after(1500), OK), (after(300), OK)]).await;
+        let started = Instant::now();
+        let response = recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(1200));
+        assert_eq!(response.artifact, "raw/000001.body.gz");
+        let latency = &recorder.load_summary()["source_latency"]["127.0.0.1"];
+        assert_eq!(latency["hedged"], 1);
+        assert_eq!(latency["hedge_wins"], 1);
+        let original = &receipts(dir.path())[0];
+        assert!(original["failure"].as_str().unwrap().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn the_default_hedge_delay_is_four_seconds() {
+        assert_eq!(RunConfig::default().source_hedge_ms, 4000);
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = hedging(dir.path(), RunConfig::default());
+        let (url, count, _) = scripted_server(vec![(after(1000), OK)]).await;
+        recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recorder.load_summary()["source_latency"]["127.0.0.1"]["hedged"],
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fast_get_a_post_and_fixture_mode_get_no_hedge() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = hedging(dir.path(), hedge_after(300));
+        let (url, count, _) = scripted_server(vec![(after(50), OK)]).await;
+        recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "answered before the delay");
+
+        let recorder = hedging(dir.path(), hedge_after(100));
+        let (url, count, _) = scripted_server(vec![(after(500), OK)]).await;
+        recorder
+            .request(Method::POST, &url, vec![], Some(json!({"q": "quillon"})))
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1, "a POST is never hedged");
+
+        let fixture = tempfile::tempdir().unwrap();
+        let recorder = hedging(
+            fixture.path(),
+            RunConfig {
+                fixture: true,
+                ..hedge_after(100)
+            },
+        );
+        let error = recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("fixture"));
+        assert_eq!(receipts(fixture.path()).len(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_zero_hedge_delay_turns_hedging_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = hedging(dir.path(), hedge_after(0));
+        let (url, count, _) = scripted_server(vec![(after(500), OK)]).await;
+        recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_sends_at_most_sixteen_hedges() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = hedging(dir.path(), hedge_after(100));
+        recorder
+            .load
+            .hedges
+            .store(HEDGES_PER_RUN - 1, Ordering::SeqCst);
+        let (url, count, _) =
+            scripted_server(vec![(after(400), OK), (after(0), OK), (after(400), OK)]).await;
+        // The sixteenth hedge is sent and wins.
+        let started = Instant::now();
+        recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(350));
+        // The seventeenth request waits for its original.
+        let started = Instant::now();
+        recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert_eq!(recorder.load.hedges.load(Ordering::SeqCst), HEDGES_PER_RUN);
+        let latency = &recorder.load_summary()["source_latency"]["127.0.0.1"];
+        assert_eq!(latency["hedged"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_hedge_waits_for_a_hedge_permit_and_never_for_the_originals_permits() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = hedging(dir.path(), hedge_after(200));
+        // Three stalled originals, then two hedges: one answers late, one never.
+        let (url, count, _) = scripted_server(vec![
+            (NEVER, OK),
+            (NEVER, OK),
+            (NEVER, OK),
+            (after(600), OK),
+            (NEVER, OK),
+        ])
+        .await;
+        let started = Instant::now();
+        let requests = (0..3).map(|_| async {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                recorder.request(Method::GET, &url, vec![], None),
+            )
+            .await;
+            (result.is_ok_and(|r| r.is_ok()), started.elapsed())
+        });
+        let probe = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            count.load(Ordering::SeqCst)
+        };
+        let (results, sent_at_probe) = tokio::join!(futures::future::join_all(requests), probe);
+        assert_eq!(sent_at_probe, 5, "two hedges in flight, the third waiting");
+        let answered: Vec<Duration> = results
+            .iter()
+            .filter(|(ok, _)| *ok)
+            .map(|(_, at)| *at)
+            .collect();
+        assert_eq!(answered.len(), 2);
+        // The waiting hedge was sent once the late hedge freed its permit.
+        assert!(answered.iter().all(|at| *at >= Duration::from_millis(750)));
+        assert_eq!(count.load(Ordering::SeqCst), 6);
+        let latency = &recorder.load_summary()["source_latency"]["127.0.0.1"];
+        assert_eq!(latency["hedged"], 3);
+        assert_eq!(latency["hedge_wins"], 2);
+    }
+
+    #[tokio::test]
+    async fn a_429_on_the_hedge_closes_the_gate_and_the_original_decides() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = hedging(dir.path(), hedge_after(200));
+        let refused =
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\n\r\n";
+        let (url, count, _) = scripted_server(vec![(after(600), OK), (after(0), refused)]).await;
+        let response = recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.artifact, "raw/000000.body.gz");
+        let error = recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<SourceRateLimited>().is_some());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let load = recorder.load_summary();
+        assert_eq!(load["source_rate_limited_requests"], 2);
+        assert_eq!(load["source_latency"]["127.0.0.1"]["hedge_wins"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_server_error_on_the_original_lets_a_sent_hedge_decide() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = hedging(dir.path(), hedge_after(200));
+        let failed = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+        let (url, _, _) = scripted_server(vec![(after(400), failed), (after(400), OK)]).await;
+        let response = recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        // Without a hedge in flight, a server error returns at once for the caller's retry.
+        let (url, count, _) = scripted_server(vec![(after(50), failed)]).await;
+        let response = recorder
+            .request(Method::GET, &url, vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 503);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

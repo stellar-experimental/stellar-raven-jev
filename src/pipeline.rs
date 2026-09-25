@@ -1428,6 +1428,7 @@ pub async fn continue_session(
     config.host_dir = current.host_dir.clone();
     config.source_slots = current.source_slots.clone();
     config.original_reads = current.original_reads;
+    config.source_hedge_ms = current.source_hedge_ms;
     let mut evidence = load_evidence(&root, &config)?;
     // Save what loading repaired after a stopped call, before anything can end this call early.
     save_session_state(&root, &evidence)?;
