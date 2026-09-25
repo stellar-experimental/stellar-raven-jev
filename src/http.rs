@@ -1673,8 +1673,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_default_hedge_delay_is_four_seconds() {
-        assert_eq!(RunConfig::default().source_hedge_ms, 4000);
+    async fn source_hedging_is_off_by_default() {
+        assert_eq!(RunConfig::default().source_hedge_ms, 0);
         let dir = tempfile::tempdir().unwrap();
         let recorder = hedging(dir.path(), RunConfig::default());
         let (url, count, _) = scripted_server(vec![(after(1000), OK)]).await;

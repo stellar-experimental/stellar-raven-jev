@@ -40,7 +40,7 @@ struct Cli {
     jev_hedge_ms: u64,
     /// A source GET without a response this long after it was sent gets one hedge request on a
     /// fresh connection. 0 turns source hedging off.
-    #[arg(long, global = true, hide = true, default_value_t = 4000)]
+    #[arg(long, global = true, hide = true, default_value_t = 0)]
     source_hedge_ms: u64,
     /// Chunks per scoring call. One per call is the default: in a replay, chunks that shared a
     /// call changed each other's scores (91 of 1,655 documents crossed the selection threshold,
@@ -689,11 +689,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_hedging_defaults_to_four_seconds_and_zero_turns_it_off() {
+    fn source_hedging_is_off_by_default_and_a_delay_turns_it_on() {
         let cli = Cli::try_parse_from(["jev", "sources"]).unwrap();
-        assert_eq!(cli.source_hedge_ms, 4000);
-        let cli = Cli::try_parse_from(["jev", "--source-hedge-ms", "0", "sources"]).unwrap();
         assert_eq!(cli.source_hedge_ms, 0);
+        let cli = Cli::try_parse_from(["jev", "--source-hedge-ms", "4000", "sources"]).unwrap();
+        assert_eq!(cli.source_hedge_ms, 4000);
     }
 
     #[test]

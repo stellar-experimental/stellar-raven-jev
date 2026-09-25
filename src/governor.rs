@@ -387,6 +387,14 @@ impl Governor {
             if reset_ms + WINDOW_RESET_TOLERANCE_MS < window.reset_ms {
                 return;
             }
+            // A reset past the current window's end names a later window. Replies can report
+            // different resets; extending the current window with them would keep it from ever
+            // ending, and this host's own sends would pile up across real windows. The host
+            // clock rolls to the later window by the learned period.
+            if reset_ms > window.reset_ms + WINDOW_RESET_TOLERANCE_MS {
+                window.limit = limit;
+                return;
+            }
             window.reset_ms = window.reset_ms.max(reset_ms);
             window.period_ms = window.period_ms.max(reset_ms - now);
             window.limit = limit;
@@ -882,5 +890,27 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn a_later_reset_never_extends_the_current_window() {
+        let governor = Governor::local();
+        let scope = "example.org/find";
+        let now = now_ms();
+        governor
+            .observe_source(scope, &window(3, 3, now + 50), Duration::from_secs(10))
+            .unwrap();
+        let ticket = |booked| governor.source_ticket(scope, booked).unwrap();
+        for _ in 0..3 {
+            assert!(ticket(None).is_none());
+        }
+        // A reply from a later window reports a reset past this window's end; it must not hold
+        // this window open, or the three sends would still count after it ends.
+        governor
+            .observe_source(scope, &window(3, 3, now + 65_000), Duration::from_secs(10))
+            .unwrap();
+        assert!(ticket(None).is_some(), "the current window is still full");
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(ticket(None).is_none(), "the window ended and rolled");
     }
 }
