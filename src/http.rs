@@ -1001,6 +1001,8 @@ impl HttpRecorder {
             client: self.hedge_client.clone(),
             hosts: self.hedge_hosts.clone(),
             hedge: true,
+            // A hedge always counts at send; it never spends another request's booked ticket.
+            prepaid: Arc::default(),
             ..self.clone()
         };
         let second = hedger.request_recorded(
