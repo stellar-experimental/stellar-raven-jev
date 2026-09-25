@@ -394,6 +394,9 @@ pub(crate) fn content_scope(document: &Document) -> &str {
 
 /// Project the full report into a small agent response. The saved `search.json` stays complete.
 /// Keeps the highest-ranked selected result per URL. Uncertain rows stay in the full report only.
+/// At most this many other same-URL rows are listed with each compact row.
+const COMPANIONS: usize = 2;
+
 pub fn compact_report(report: &Value, limit: usize) -> Value {
     let mut seen = BTreeSet::new();
     let mut duplicate_urls = 0usize;
@@ -450,6 +453,36 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
     duplicate_urls += moved.len();
     let unique_selected =
         url_counts.len() + order.iter().filter(|row| url_of(row).is_empty()).count();
+    // The other selected rows at each URL, longest first: a short chunk can stand for a URL whose
+    // full page is also selected, and the reader needs a path to it.
+    let mut same_url: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    for row in &order {
+        let url = url_of(row);
+        if !url.is_empty() {
+            same_url.entry(url).or_default().push(row);
+        }
+    }
+    for rows in same_url.values_mut() {
+        rows.sort_by_key(|r| std::cmp::Reverse(r["text_bytes"].as_u64().unwrap_or(0)));
+    }
+    let companions = |row: &Value| -> Vec<Value> {
+        same_url
+            .get(&url_of(row))
+            .into_iter()
+            .flatten()
+            .filter(|other| !std::ptr::eq(**other, row))
+            // A same-size, same-scope copy adds nothing the shown row lacks.
+            .filter(|other| {
+                other["text_bytes"] != row["text_bytes"]
+                    || other["content_scope"] != row["content_scope"]
+            })
+            .take(COMPANIONS)
+            .map(|other| {
+                json!({"content_scope":other["content_scope"],"text_bytes":other["text_bytes"],
+                    "text_path":other["text_path"],"source_id":other["source_id"]})
+            })
+            .collect()
+    };
     // Among rows that share a URL, the one with the best authority tier stands for the URL, at the
     // position of the first one. An official page thus never hides behind a summary of itself.
     let tier = |r: &Value| r["rank"]["authority_tier"].as_u64().unwrap_or(3);
@@ -513,8 +546,12 @@ pub fn compact_report(report: &Value, limit: usize) -> Value {
             "date_kind":row["rank"]["date"]["kind"].as_str().filter(|k| crate::rank::drives_recency(k)),
             "still_current":row["rank"]["still_current"],
             "authority_tier":row["rank"]["authority_tier"],
-            "same_url_others":url_counts.get(url).map(|n| n.saturating_sub(1)).unwrap_or(0),
+                        "same_url_others":url_counts.get(url).map(|n| n.saturating_sub(1)).unwrap_or(0),
         });
+        let others = companions(row);
+        if !others.is_empty() {
+            compact["companions"] = json!(others);
+        }
         if let Some(text) = row.get("text") {
             compact["text"] = text.clone();
         }
@@ -903,5 +940,40 @@ mod tests {
             assert_eq!(compact["results"][0]["title"], "official");
             assert_eq!(compact["not_shown"]["duplicate_urls"], 1);
         }
+    }
+
+    #[test]
+    fn a_shown_chunk_lists_its_longer_same_url_rows_as_companions() {
+        let row = |scope: &str, url: &str, bytes: u64, path: &str| {
+            json!({"title":"Arbor ledger receipts","url":url,"status":"selected","source_id":"s",
+                "content_scope":scope,"text_bytes":bytes,"text_path":path,"rank":{"authority_tier":1}})
+        };
+        let page = "https://arbor.example/receipts";
+        let report = json!({"results":[
+            row("research_chunk", page, 2_000, "/d/0000.txt"),
+            row("research_chunk", "https://arbor.example/other", 900, "/d/0001.txt"),
+            row("published_markdown_main_content", page, 12_000, "/d/0002.txt"),
+            row("indexed_sections_or_metadata", page, 700, "/d/0003.txt"),
+            row("main_visible_text", page, 7_000, "/d/0004.txt"),
+            row("research_chunk", page, 2_000, "/d/0005.txt"),
+        ]});
+        let compact = compact_report(&report, 10);
+        let first = &compact["results"][0];
+        // The top-ranked chunk still stands for its URL; nothing is substituted.
+        assert_eq!(first["text_path"], "/d/0000.txt");
+        assert_eq!(first["same_url_others"], 4);
+        let paths: Vec<_> = first["companions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text_path"].as_str().unwrap())
+            .collect();
+        // Longest first, at most two; a same-size, same-scope copy is not listed.
+        assert_eq!(paths, ["/d/0002.txt", "/d/0004.txt"]);
+        assert_eq!(
+            first["companions"][0]["content_scope"],
+            "published_markdown_main_content"
+        );
+        assert!(compact["results"][1].get("companions").is_none());
     }
 }

@@ -30,7 +30,7 @@ stellar-raven-jev search "How do I rotate a signer key on a Stellar account?"
 ```
 
 It prints one compact JSON object of about 10 KB: the ten best selected results, one per URL, with `probability`, `content_scope`, `url`, `date`, `date_kind`, `authority_tier`, `still_current`, `excerpt`, and `text_path`, plus a top-level `currentness` object.
-Each result carries `same_url_others`, the count of other selected results at the same URL. `not_shown` counts the rest. Uncertain results stay out of the compact list; `not_shown.uncertain` counts them, and the full report keeps them. A limit of `0` shows all selected results after URL deduplication. A result without a URL that has the same title as a result with a URL counts as a duplicate, and the result with the URL takes the better position.
+Each result carries `same_url_others`, the count of other selected results at the same URL, and `companions`: up to two of them, longest first, with `content_scope`, `text_bytes`, `text_path`, and `source_id`. A short chunk can stand for a URL whose full page is also selected; the companion gives the path to that page. `not_shown` counts the rest. Uncertain results stay out of the compact list; `not_shown.uncertain` counts them, and the full report keeps them. A limit of `0` shows all selected results after URL deduplication. A result without a URL that has the same title as a result with a URL counts as a duplicate, and the result with the URL takes the better position.
 A typical call takes about 12 seconds and costs about $0.02 in Jev usage.
 Read the `text_path` file for any result you cite. The excerpt holds 400 characters.
 
