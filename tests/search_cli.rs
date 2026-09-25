@@ -338,3 +338,41 @@ fn a_session_spends_its_pools_and_checks_claims() {
     assert_eq!(all["pools"]["actionable"].as_array().unwrap().len(), 0);
     assert_eq!(all["results"][0]["text_path"], text_path.as_str());
 }
+
+#[test]
+fn a_bundle_holds_the_full_text_of_each_shown_result_in_rank_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = cli()
+        .args(["--fixture", "--output-dir"])
+        .arg(temp.path())
+        .args([
+            "search",
+            "Fernlet receipt batching",
+            "--limit",
+            "3",
+            "--bundle",
+        ])
+        .output()
+        .unwrap();
+    assert!(matches!(output.status.code(), Some(0 | 2)));
+    let compact: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let bundle = std::fs::read_to_string(compact["bundle_path"].as_str().unwrap()).unwrap();
+    let results = compact["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    let mut last = 0;
+    for (rank, row) in results.iter().enumerate() {
+        let header = format!("## Rank {}: ", rank + 1);
+        let at = bundle
+            .find(&header)
+            .expect("every shown result has a section");
+        assert!(at >= last, "sections follow rank order");
+        last = at;
+        let text = std::fs::read_to_string(row["text_path"].as_str().unwrap()).unwrap();
+        assert!(
+            bundle.contains(text.trim_end()),
+            "the section holds the full text"
+        );
+    }
+    // The light record keeps the bundle with the session.
+    assert!(std::path::Path::new(compact["bundle_path"].as_str().unwrap()).is_file());
+}

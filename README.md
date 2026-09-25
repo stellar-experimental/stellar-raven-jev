@@ -15,6 +15,10 @@ The CLI loads `.env` from the working directory or its parents, or from `--env-f
 
 ## Use from an agent
 
+An agent learns the workflow from the CLI itself: `stellar-raven-jev --help` gives the steps (search, read the text files and companions, one narrower search for an unsupported part, an optional `check`), and `stellar-raven-jev search --help`, `check --help`, and `more --help` give the output fields. For agents that load skills, `skills/stellar-raven-jev/SKILL.md` is a short companion skill; copy the folder into the agent's skills directory (for Claude Code, `~/.claude/skills/`).
+
+`search --bundle` (and `more --bundle`) also writes `bundle.md` in the session folder: the full text of every shown result in rank order, each followed by its companions, under a header with the rank, URL, scope, date, and text path. `bundle_path` in the output names it. The light record keeps it.
+
 Set three variables once, for example in `~/.zshenv`:
 
 ```sh

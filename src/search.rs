@@ -403,6 +403,58 @@ pub(crate) fn content_scope(document: &Document) -> &str {
 
 /// Project the full report into a small agent response. The saved `search.json` stays complete.
 /// Keeps the highest-ranked selected result per URL. Uncertain rows stay in the full report only.
+/// Write `bundle.md` in the session folder: the full text of every shown result in rank order,
+/// each followed by its companions, under a header that names the rank, URL, scope, date, and
+/// text path. One file, so a reader need not open each `text_path`. A text file shared by two
+/// rows is written once.
+pub fn write_bundle(compact: &Value, root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "# Evidence for: {}\n\n",
+        compact["question"].as_str().unwrap_or_default()
+    );
+    let mut written = BTreeSet::new();
+    let mut add =
+        |out: &mut String, label: String, row: &Value, url: &Value| -> anyhow::Result<()> {
+            let Some(path) = row["text_path"].as_str() else {
+                return Ok(());
+            };
+            if !written.insert(path.to_owned()) {
+                return Ok(());
+            }
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            writeln!(
+                out,
+                "## {label}: {}\nurl: {} | scope: {} | date: {} | text_path: {path}\n\n{}\n",
+                row["title"].as_str().unwrap_or("(same URL)"),
+                url.as_str().unwrap_or("none"),
+                row["content_scope"].as_str().unwrap_or("unknown"),
+                row["date"].as_str().unwrap_or("none"),
+                text.trim_end()
+            )?;
+            Ok(())
+        };
+    for (rank, row) in compact["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        add(&mut out, format!("Rank {}", rank + 1), row, &row["url"])?;
+        for companion in row["companions"].as_array().into_iter().flatten() {
+            add(
+                &mut out,
+                format!("Rank {} companion", rank + 1),
+                companion,
+                &row["url"],
+            )?;
+        }
+    }
+    let path = root.join("bundle.md");
+    std::fs::write(&path, out)?;
+    Ok(path)
+}
+
 /// At most this many other same-URL rows are listed with each compact row.
 const COMPANIONS: usize = 2;
 

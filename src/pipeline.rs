@@ -340,6 +340,7 @@ pub(crate) const SESSION_FILES: &[&str] = &[
     "load.json",
     "retrieved.json",
     "session.json",
+    "bundle.md",
 ];
 
 /// The default light record: keep the report, the text files its text_path fields name, the
