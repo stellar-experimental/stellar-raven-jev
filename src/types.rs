@@ -120,6 +120,8 @@ pub struct RunConfig {
     /// Most questions that may fetch from each named source host at once, across every process
     /// sharing `host_dir`. A host that is not named is not capped.
     pub source_slots: std::collections::BTreeMap<String, usize>,
+    /// Most original pages one call reads for listing rows (at most 4; 0 reads none).
+    pub original_reads: usize,
 }
 
 impl Default for RunConfig {
@@ -148,6 +150,7 @@ impl Default for RunConfig {
             full_record: true,
             host_dir: None,
             source_slots: Default::default(),
+            original_reads: 4,
         }
     }
 }

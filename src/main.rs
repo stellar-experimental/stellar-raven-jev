@@ -63,12 +63,17 @@ struct Cli {
     route_passes: usize,
     #[arg(long, global = true, hide = true, default_value_t = 0.2)]
     source_threshold: f64,
-    /// Sources routed below this stay in the session as pools. 0.2 fetches every routed source.
-    #[arg(long, global = true, hide = true, default_value_t = 0.4)]
+    /// Sources routed below this stay in the session as pools. The default, equal to the source
+    /// threshold, fetches every routed source; 0.4 is the lean first pass.
+    #[arg(long, global = true, hide = true, default_value_t = 0.2)]
     fetch_threshold: f64,
-    /// Documents scored per source before the rest waits for promise. 0 scores everything.
-    #[arg(long, global = true, hide = true, default_value_t = 4)]
+    /// Documents scored per source before the rest waits for promise. The default 0 scores
+    /// everything; 4 is the lean first pass.
+    #[arg(long, global = true, hide = true, default_value_t = 0)]
     score_depth: usize,
+    /// Most original pages one call reads for listing rows (at most 4). 0 reads none.
+    #[arg(long, global = true, hide = true, default_value_t = 4)]
+    original_reads: usize,
     #[arg(long, global = true, hide = true, default_value_t = 0.4)]
     document_threshold: f64,
     #[arg(long, global = true, hide = true, default_value_t = 0.15)]
@@ -497,6 +502,7 @@ async fn main() -> Result<()> {
         full_record: true,
         host_dir: None,
         source_slots: cli.source_slots.clone().unwrap_or_default(),
+        original_reads: cli.original_reads,
     };
     validate_config(&config)?;
     let slots = (

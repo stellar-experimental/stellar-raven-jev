@@ -780,10 +780,11 @@ fn plan_originals(
             connectors::original::Plan::Reused { .. } => plan.reused += 1,
         }
     }
-    let granted = if plan.reads.is_empty() {
+    let wanted = plan.reads.len().min(config.original_reads);
+    let granted = if wanted == 0 {
         0
     } else {
-        crate::session::reserve_original_reads(&config.output_dir, plan.reads.len())?
+        crate::session::reserve_original_reads(&config.output_dir, wanted)?
     };
     plan.capped = plan.reads.len() - granted;
     plan.reads.truncate(granted);
@@ -1426,6 +1427,7 @@ pub async fn continue_session(
     config.output_dir = root.clone();
     config.host_dir = current.host_dir.clone();
     config.source_slots = current.source_slots.clone();
+    config.original_reads = current.original_reads;
     let mut evidence = load_evidence(&root, &config)?;
     // Save what loading repaired after a stopped call, before anything can end this call early.
     save_session_state(&root, &evidence)?;
@@ -2100,6 +2102,24 @@ mod tests {
         "https://fernlet.test/page-2",
         "https://fernlet.test/page-3",
     ];
+    #[tokio::test]
+    async fn zero_original_reads_sends_no_request_and_charges_nothing() {
+        let (backend, count) = reading_mock(READ_ROWS).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            output_dir: dir.path().into(),
+            original_reads: 0,
+            ..Default::default()
+        };
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let load: serde_json::Value = read_json(&outcome.directory, "load.json").unwrap();
+        assert_eq!(load["original_reads"]["attempted"], 0);
+        assert_eq!(load["original_reads"]["session_charged"], 0);
+    }
+
     #[tokio::test]
     async fn first_pass_reads_append_scored_pages_after_existing_documents() {
         let (backend, count) = reading_mock(READ_ROWS).await;

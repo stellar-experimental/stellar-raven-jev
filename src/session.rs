@@ -364,6 +364,7 @@ pub async fn check(
     config.output_dir = root.clone();
     config.host_dir = current.host_dir.clone();
     config.source_slots = current.source_slots.clone();
+    config.original_reads = current.original_reads;
     settle_stopped_call(&root)?;
     let prior: Usage = read(&root, "usage.json")?;
     let cap = budget_cap(&root)?;
