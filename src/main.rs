@@ -38,7 +38,10 @@ struct Cli {
     jev_concurrency: usize,
     #[arg(long, global = true, hide = true, default_value_t = 2000)]
     jev_hedge_ms: u64,
-    #[arg(long, global = true, hide = true, default_value_t = 4)]
+    /// Chunks per scoring call. One per call is the default: in a replay, chunks that shared a
+    /// call changed each other's scores (91 of 1,655 documents crossed the selection threshold,
+    /// against 18 between two single-chunk runs).
+    #[arg(long, global = true, hide = true, default_value_t = 1)]
     jev_batch: usize,
     /// Reference date (YYYY-MM-DD) for currentness judgments. Defaults to today in UTC.
     #[arg(long, global = true, hide = true)]

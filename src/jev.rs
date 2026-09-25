@@ -3211,6 +3211,8 @@ mod tests {
         let (url, server) = scripted_server(vec![(0, "200 OK", body.to_string())]).await;
         let mut client = hedging_client(dir.path(), url, 1.0);
         client.hedge_after = None;
+        // This test packs several chunks per call.
+        client.batch = 4;
         let documents: Vec<Document> = ["one", "two", "three"]
             .iter()
             .map(|id| Document {
@@ -3264,6 +3266,8 @@ mod tests {
         let (url, server) = scripted_server(vec![(0, "200 OK", body.to_string())]).await;
         let mut client = hedging_client(dir.path(), url, 1.0);
         client.hedge_after = None;
+        // This test packs several chunks per call.
+        client.batch = 4;
         let documents = vec![
             text_document("one", "First text".into()),
             text_document("two", "Second text".into()),
@@ -3322,6 +3326,8 @@ mod tests {
         .await;
         let mut client = hedging_client(dir.path(), url, 1.0);
         client.hedge_after = None;
+        // This test packs several chunks per call.
+        client.batch = 4;
         let documents = vec![
             text_document("one", "First text".into()),
             text_document("two", "Second text".into()),
@@ -3383,6 +3389,8 @@ mod tests {
         .await;
         let mut client = hedging_client(dir.path(), url, 1.0);
         client.hedge_after = None;
+        // This test packs several chunks per call.
+        client.batch = 4;
         // One permit keeps the calls in order, so each reply meets its own request.
         client.http = HttpRecorder::loopback_for_test(
             dir.path(),
@@ -3412,6 +3420,8 @@ mod tests {
             scripted_server(vec![(0, "503 Service Unavailable", "{}".into())]).await;
         let mut client = hedging_client(dir.path(), url, 1.0);
         client.hedge_after = None;
+        // This test packs several chunks per call.
+        client.batch = 4;
         let scores = client
             .score_documents("How does it work?", &documents)
             .await;

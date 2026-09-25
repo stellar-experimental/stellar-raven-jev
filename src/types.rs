@@ -132,7 +132,7 @@ impl Default for RunConfig {
             concurrency: 16,
             jev_concurrency: 32,
             jev_hedge_ms: 2000,
-            jev_batch: 4,
+            jev_batch: 1,
             today: crate::rank::today_utc(),
             max_pages: 2,
             max_documents: 400,
