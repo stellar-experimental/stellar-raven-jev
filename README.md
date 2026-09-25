@@ -137,9 +137,21 @@ Fixture runs read no pages.
 stellar-raven-jev sources                         # list sources; add --resources agentic
 stellar-raven-jev doctor                          # check local configuration without network calls
 stellar-raven-jev report RUN_DIR --variant NAME   # rebuild a run's report; no retrieval or scoring
+stellar-raven-jev prune [--older-than-days N] [--dry-run]   # remove idle run folders
+stellar-raven-jev usage [--days N]                # totals across recent sessions
 ```
 
 `report` writes `search-NAME.json` beside the original, which stays unchanged, so ranking changes can be compared on saved evidence at no cost.
+
+## Operating
+
+**Retention.** Every search is a run folder under `JEV_OUTPUT_DIR`, usually 1 to 3 MB, or more with `--full-record`. After a search or `more` prints its result, run folders with no activity for `--retain-days` days (`JEV_RETAIN_DAYS`, default 7) are removed, at most once a day per output directory; `0` turns this off. A folder's activity is its latest file change, so a session continued with `more` or `check` stays. A session a call is using, the host state in `.host/`, and every name that is not a run folder are never removed. `prune` does the same on demand: `--older-than-days N` sets the age, and `--dry-run` reports what would go and removes nothing. Keep evaluation runs in their own output directory, so pruning never removes evidence an analysis still reads.
+
+**Use.** `usage --days N` sums the sessions active in the last N days (`0`: all): sessions and calls, status counts, Jev spend and requests, sessions with `load.degraded`, sources cut at the deadline, fallback responses, source requests per host, full records, and bytes on disk.
+
+**Capacity.** One host shares admission slots, Jev send budgets, and source windows through `.host/`. In live load tests, Stellar Scout set the limit, not Jev: about 4 full-pass questions per minute were clean, and about 8 were clean while Scout was healthy. Scout has stall episodes of 10 seconds to several minutes in which its research requests hang; they show as `load.sources_cut_at_deadline` and `cut_sources`, whatever the local load. Above about 230 Scout requests a minute, its ranking fell back to keyword matching on key origins. `JEV_MAX_SEARCHES` (default 6) caps searches per host, and `JEV_SOURCE_SLOTS` caps questions per source host.
+
+**Watch.** A rising share of `load.degraded`, deadline cuts on many sessions in a row (a Scout episode), any `source_rate_limited_requests`, `busy` exits (the host is full), and `jev_wait_ms` or `jev_rate_limited_requests` (a Jev provider budget is spent; the chain moves to the next provider). `doctor` checks configuration without network calls.
 
 ## Controls
 

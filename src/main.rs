@@ -156,6 +156,11 @@ struct Cli {
     /// named are not capped. Also accepts JEV_SOURCE_SLOTS.
     #[arg(long, global = true, env = "JEV_SOURCE_SLOTS", value_parser = parse_source_slots)]
     source_slots: Option<std::collections::BTreeMap<String, usize>>,
+    /// Run folders with no activity for this many days are removed, at most once a day, after a
+    /// search or `more` prints its result. 0 turns automatic pruning off. Also accepts
+    /// JEV_RETAIN_DAYS.
+    #[arg(long, global = true, env = "JEV_RETAIN_DAYS", default_value_t = 7)]
+    retain_days: u64,
     /// How long a search waits for a free slot before it reports `busy`.
     #[arg(long, global = true, hide = true, default_value_t = 60)]
     admission_wait_secs: u64,
@@ -251,6 +256,23 @@ enum Command {
     },
     /// Check local settings and authentication presence without network requests.
     Doctor,
+    /// Remove run folders in the output directory with no activity for a number of days. Host
+    /// state and sessions a call is using are never removed. No network requests.
+    Prune {
+        /// Remove folders idle at least this many days. Defaults to --retain-days (7).
+        #[arg(long)]
+        older_than_days: Option<u64>,
+        /// Report what would be removed, and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Summarize the sessions in the output directory: calls, status, Jev spend, source requests,
+    /// capacity signals, and disk use. No network requests.
+    Usage {
+        /// Only sessions active in the last this many days. 0 counts every session.
+        #[arg(long, default_value_t = 7)]
+        days: u64,
+    },
 }
 
 /// The question a session was started with.
@@ -358,6 +380,7 @@ fn deliver(
     admission: stellar_raven_jev::governor::Admission,
     output: Output,
     full_record: bool,
+    retain_days: u64,
 ) -> Result<()> {
     if outcome.status == "busy" {
         drop(admission);
@@ -389,6 +412,11 @@ fn deliver(
     if !full_record {
         if let Err(error) = stellar_raven_jev::pipeline::keep_session_record(&outcome.directory) {
             eprintln!("Run folder cleanup failed; intermediate files remain: {error}");
+        }
+    }
+    if let Some(output_dir) = outcome.directory.parent() {
+        if let Err(error) = stellar_raven_jev::maintenance::auto_prune(output_dir, retain_days) {
+            eprintln!("Automatic prune failed; old run folders remain: {error}");
         }
     }
     if outcome.status != "complete" {
@@ -642,6 +670,7 @@ async fn main() -> Result<()> {
                     bundle,
                 },
                 full_record,
+                cli.retain_days,
             )?;
         }
         Command::More {
@@ -682,6 +711,7 @@ async fn main() -> Result<()> {
                     bundle,
                 },
                 full_record,
+                cli.retain_days,
             )?;
         }
         Command::Check {
@@ -721,6 +751,25 @@ async fn main() -> Result<()> {
                 Some(&variant),
             )?;
             print_report(&report, json, limit, None)?;
+        }
+        Command::Prune {
+            older_than_days,
+            dry_run,
+        } => {
+            let days = older_than_days.unwrap_or(cli.retain_days);
+            anyhow::ensure!(days > 0, "Give --older-than-days of at least 1");
+            let report = stellar_raven_jev::maintenance::prune(
+                &cli.output_dir,
+                std::time::Duration::from_secs(days * 24 * 60 * 60),
+                dry_run,
+            )?;
+            println!("{report}");
+        }
+        Command::Usage { days } => {
+            println!(
+                "{}",
+                stellar_raven_jev::maintenance::usage(&cli.output_dir, days)?
+            );
         }
         Command::Doctor => {
             let directory =

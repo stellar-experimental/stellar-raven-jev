@@ -2,6 +2,7 @@ pub mod connectors;
 pub mod governor;
 pub mod http;
 pub mod jev;
+pub mod maintenance;
 pub mod pipeline;
 pub mod query;
 pub mod rank;
