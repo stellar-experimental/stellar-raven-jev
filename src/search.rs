@@ -409,47 +409,65 @@ pub(crate) fn content_scope(document: &Document) -> &str {
 /// rows is written once.
 pub fn write_bundle(compact: &Value, root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     use std::fmt::Write as _;
-    let mut out = format!(
-        "# Evidence for: {}\n\n",
-        compact["question"].as_str().unwrap_or_default()
-    );
+    // Sections first, each with its line offset in the body, then a contents list that gives
+    // every section's line, so a reader can print one section with `sed -n 'START,ENDp'`.
+    let mut body = String::new();
+    let mut contents: Vec<(String, usize)> = Vec::new();
     let mut written = BTreeSet::new();
-    let mut add =
-        |out: &mut String, label: String, row: &Value, url: &Value| -> anyhow::Result<()> {
-            let Some(path) = row["text_path"].as_str() else {
-                return Ok(());
-            };
-            if !written.insert(path.to_owned()) {
-                return Ok(());
-            }
-            let text = std::fs::read_to_string(path).unwrap_or_default();
-            writeln!(
-                out,
-                "## {label}: {}\nurl: {} | scope: {} | date: {} | text_path: {path}\n\n{}\n",
-                row["title"].as_str().unwrap_or("(same URL)"),
-                url.as_str().unwrap_or("none"),
-                row["content_scope"].as_str().unwrap_or("unknown"),
-                row["date"].as_str().unwrap_or("none"),
-                text.trim_end()
-            )?;
-            Ok(())
+    let mut add = |body: &mut String,
+                   contents: &mut Vec<(String, usize)>,
+                   label: String,
+                   row: &Value,
+                   url: &Value|
+     -> anyhow::Result<()> {
+        let Some(path) = row["text_path"].as_str() else {
+            return Ok(());
         };
+        if !written.insert(path.to_owned()) {
+            return Ok(());
+        }
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let heading = format!("{label}: {}", row["title"].as_str().unwrap_or("(same URL)"));
+        contents.push((heading.clone(), body.lines().count()));
+        writeln!(
+            body,
+            "## {heading}\nurl: {} | scope: {} | date: {} | text_path: {path}\n\n{}\n",
+            url.as_str().unwrap_or("none"),
+            row["content_scope"].as_str().unwrap_or("unknown"),
+            row["date"].as_str().unwrap_or("none"),
+            text.trim_end()
+        )?;
+        Ok(())
+    };
     for (rank, row) in compact["results"]
         .as_array()
         .into_iter()
         .flatten()
         .enumerate()
     {
-        add(&mut out, format!("Rank {}", rank + 1), row, &row["url"])?;
+        add(
+            &mut body,
+            &mut contents,
+            format!("Rank {}", rank + 1),
+            row,
+            &row["url"],
+        )?;
         for companion in row["companions"].as_array().into_iter().flatten() {
-            add(
-                &mut out,
-                format!("Rank {} companion", rank + 1),
-                companion,
-                &row["url"],
-            )?;
+            let label = format!("Rank {} companion", rank + 1);
+            add(&mut body, &mut contents, label, companion, &row["url"])?;
         }
     }
+    // Title, blank, "Contents", one line per section, blank: the body starts after these.
+    let head_lines = 4 + contents.len();
+    let mut out = format!(
+        "# Evidence for: {}\n\nContents (section: first line):\n",
+        compact["question"].as_str().unwrap_or_default()
+    );
+    for (heading, offset) in &contents {
+        writeln!(out, "- {heading}: line {}", head_lines + offset + 1)?;
+    }
+    out.push('\n');
+    out.push_str(&body);
     let path = root.join("bundle.md");
     std::fs::write(&path, out)?;
     Ok(path)

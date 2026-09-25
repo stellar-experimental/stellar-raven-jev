@@ -373,6 +373,12 @@ fn a_bundle_holds_the_full_text_of_each_shown_result_in_rank_order() {
             "the section holds the full text"
         );
     }
+    // The contents list gives the line where each section starts.
+    let lines: Vec<&str> = bundle.lines().collect();
+    for entry in lines.iter().filter(|l| l.starts_with("- Rank ")) {
+        let line: usize = entry.rsplit("line ").next().unwrap().parse().unwrap();
+        assert!(lines[line - 1].starts_with("## Rank "), "{entry}");
+    }
     // The light record keeps the bundle with the session.
     assert!(std::path::Path::new(compact["bundle_path"].as_str().unwrap()).is_file());
 }
