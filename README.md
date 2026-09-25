@@ -15,7 +15,13 @@ The CLI loads `.env` from the working directory or its parents, or from `--env-f
 
 ## Use from an agent
 
-An agent learns the workflow from the CLI itself: `stellar-raven-jev --help` gives the steps (search, read the text files and companions, one narrower search for an unsupported part, an optional `check`), and `stellar-raven-jev search --help`, `check --help`, and `more --help` give the output fields. For agents that load skills, `skills/stellar-raven-jev/SKILL.md` is a short companion skill; copy the folder into the agent's skills directory (for Claude Code, `~/.claude/skills/`).
+An agent learns the workflow from the CLI itself: `stellar-raven-jev --help` gives the steps (search, read the text files and companions, one narrower search for an unsupported part, an optional `check`), and `stellar-raven-jev search --help`, `check --help`, and `more --help` give the output fields.
+
+Maintain the companion skill in `skills/stellar-raven-jev/`.
+For shared local access, link `~/.agents/skills/stellar-raven-jev` to that source directory.
+Link the Claude Code and Codex skill directories to the shared path.
+OpenCode and Grok discover the shared path directly.
+New sessions read source edits through these links. Keep the source checkout available at the linked path.
 
 `search --bundle` (and `more --bundle`) also writes `bundle.md` in the session folder: the full text of every shown result in rank order, each followed by its companions, under a header with the rank, URL, scope, date, and text path. A contents list at the top gives the first line of each section, so `sed -n 'START,ENDp'` prints one. `bundle_path` in the output names it. The light record keeps it.
 
