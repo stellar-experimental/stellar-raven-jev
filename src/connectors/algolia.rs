@@ -404,7 +404,7 @@ fn timestamp_seconds(s: &str) -> Option<u64> {
     Some(days * 86400 + h * 3600 + mi * 60 + se)
 }
 
-fn markdown_for_scoring(text: &str) -> Option<String> {
+pub(crate) fn markdown_for_scoring(text: &str) -> Option<String> {
     let mut fence: Option<(char, usize)> = None;
     let mut hidden: Option<&str> = None;
     let mut output = Vec::new();
@@ -554,7 +554,7 @@ fn tag_attributes(tag: &str) -> HashMap<String, String> {
     }
     attrs
 }
-fn html_article_text(text: &str) -> Option<(String, &'static str)> {
+pub(crate) fn html_article_text(text: &str) -> Option<(String, &'static str)> {
     // Bounded lexical HTML extraction. No scripts, CSS, or network resources execute.
     let lower = text.to_ascii_lowercase();
     let mut stack: Vec<(String, bool)> = Vec::new();
@@ -843,7 +843,7 @@ async fn original(
     }
     (
         None,
-        json!({"kind":"index_record","full_original":false,
+        json!({"kind":"index_record","full_original":false,"requested":true,
         "limitation":"The original document was unavailable. Indexed records can contain only sections or metadata."}),
         artifacts,
         failures,

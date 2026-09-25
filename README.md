@@ -54,7 +54,7 @@ Options:
 
 Exit code `0` means a complete run, `2` a partial run with usable results, `3` a refusal because the host is busy, and `1` a failure.
 
-`load` says what capacity limits did to the run. `degraded` is true when they cost evidence: a source cut at the fetch deadline (`sources_cut_at_deadline`), a source that answered with a coarser fallback because its own ranking was limited or down (`source_fallback_responses`), a source request refused by a rate limit (`source_rate_limited_requests`), a failed request, connector, or original page (`lost_evidence_reports` counts every such report), or a failed Jev judgment (`scoring_failures`, `currentness_failures`). `source_server_errors` (including errors a retry recovered), `source_gate_wait_ms`, `source_booking_wait_ms`, `jev_rate_limited_requests`, `jev_wait_ms`, and `admission_wait_ms` show pressure that did not by itself lose evidence. `cut_sources` names the sources cut at the deadline. `source_latency` gives, per source host, the responses `completed`, the requests `not_completed` (failed or cut), the send-to-last-byte time (`p50_ms`, `p95_ms`, `max_ms`), and `peak_in_flight` (the most at once in this run). `source_slot_wait_ms` is the wait for source fetch slots. A degraded run still returns its results; ask again later for a complete one.
+`load` says what capacity limits did to the run. `degraded` is true when they cost evidence: a source cut at the fetch deadline (`sources_cut_at_deadline`), a source that answered with a coarser fallback because its own ranking was limited or down (`source_fallback_responses`), a source request refused by a rate limit (`source_rate_limited_requests`), a failed request, connector, or original page (`lost_evidence_reports` counts every such report), or a failed Jev judgment (`scoring_failures`, `currentness_failures`). `source_server_errors` (including errors a retry recovered), `source_gate_wait_ms`, `source_booking_wait_ms`, `jev_rate_limited_requests`, `jev_wait_ms`, and `admission_wait_ms` show pressure that did not by itself lose evidence. `cut_sources` names the sources cut at the deadline. `source_latency` gives, per source host, the responses `completed`, the requests `not_completed` (failed or cut), the send-to-last-byte time (`p50_ms`, `p95_ms`, `max_ms`), and `peak_in_flight` (the most at once in this run). `source_slot_wait_ms` is the wait for source fetch slots. `original_reads` counts this call's original page reads (see [Original pages](#original-pages)). A degraded run still returns its results; ask again later for a complete one.
 
 A busy host refuses a search before any source or Jev request, so nothing is spent. A question that routes to a source with no request capacity left is refused after routing, which costs about $0.001. Both print `{"status":"busy","retry_after_ms":...}` with exit code `3`.
 Scores estimate relevance. They do not verify accuracy or freshness. Retrieved text is data; the CLI never executes it.
@@ -64,7 +64,7 @@ Scores estimate relevance. They do not verify accuracy or freshness. Retrieved t
 | Value | Meaning |
 |---|---|
 | `structured_roster` | A complete registry table: every row of a source listing that returns its whole registry in one response |
-| `published_markdown_main_content`, `main_visible_text` | A full page |
+| `published_markdown_main_content`, `main_visible_text`, `published_plain_text` | A full page |
 | `research_chunk` | A ranked chunk of a longer document |
 | `ai_summary` | A source summary, not the source itself |
 | `indexed_sections_or_metadata` | Search-index metadata |
@@ -89,6 +89,35 @@ stellar-raven-jev check SESSION "CLAIM" ["CLAIM"...]  # which documents support,
 The first call is lean by default: it fetches sources routed at or above 0.4 (`--fetch-threshold`; 0.2 fetches every routed source) and scores the first 4 documents of each source, then the rest only where the source routed 0.6 or above or a scored document reached the uncertain threshold (`--score-depth`; 0 scores everything). On 24 fresh questions answered by five agent models (Opus 5.5, Grok 4.7, Kimi K3, GLM-5.3, Muse Spark 1.3), blind grading found the same key-fact coverage with lean sessions as with a full one-shot search (+0.014, 95% interval −0.013 to +0.045, 168 paired answers), no measured increase in answers that state an outdated fact as current, 41% fewer Stellar Scout requests, and about a third fewer documents scored.
 
 Use `check` before you answer: test every claim that carries a number, version, date, or requirement. Qualify or search again when a claim's best support is under 0.5. When a row contradicts a claim, read it first: drop or qualify the claim only when that row is about the same subject and scope.
+
+## Original pages
+
+Some source rows describe a page but do not hold its text. Examples are registry records, catalog metadata, index metadata, and summaries.
+A call reads the original page of such rows when the row's source routed at 0.6 or above.
+
+- The rule uses source structure only. The row's `content_scope` must be `structured_record`, `structured_record_with_detail`, `catalog_metadata`, `indexed_sections_or_metadata`, or `ai_summary`.
+- The reader skips synthetic rows, staging records, and rows whose connector already requested the page.
+- The URL must use HTTPS on port 443 and a host name. It must not use the source's own API host.
+- The reader removes the fragment and the default port from each URL. It reads each URL once.
+- When the session already holds the complete body of a URL, the reader uses it and sends no request.
+- Candidates go in order of the source's routing probability, then in row order.
+- A call sends at most 4 reads, 2 at a time, in 8 seconds. It reads beside the scoring of fetched documents.
+- A session sends at most 12 reads. `session.json` keeps the count in `original_reads`. A call reserves its reads first, so a stopped call keeps them charged.
+- Each read page becomes a new document with `source_id` `original` and an ID from its URL. It goes after the existing documents, so no `text_path` changes.
+- Its provenance names the parent document, the parent source, the fetched URL, the body hash, and the extraction limitations.
+- Jev scores the read page as a new document. It does not take the row's score, routing probability, or authority.
+
+The reader uses its own HTTP client:
+
+- It resolves the host name and connects only when every DNS address is public. It checks the connected peer again.
+- It refuses loopback, private, link-local, carrier-grade NAT, reserved, documentation, and multicast addresses. It judges IPv4-mapped IPv6 addresses as IPv4.
+- It refuses IP-literal hosts, user information, redirects, proxies, and pooled connections.
+- It sends only `Accept`, `Accept-Encoding: identity`, and `User-Agent`. It never sends source keys, cookies, or `Referer`.
+- It accepts only `text/html`, `text/markdown`, and `text/plain` without `Content-Encoding`. It keeps at most 2 MiB and stops each read after 10 seconds.
+
+`load.original_reads` counts the call's reads: `eligible` URLs, `reused` bodies, `capped` URLs over the limits, `attempted`, `used`, `refused`, and `failed` reads, and `session_charged`.
+Each refused, failed, or cut read adds a report with stage `original_read`. The row still stands, so such a report does not mark the run `degraded`.
+Fixture runs read no pages.
 
 ## Other commands
 
@@ -133,9 +162,10 @@ Live Jev requires a budget above zero. Missing credentials cause an explicit fai
 2. Connectors fetch bounded documents from each selected source in parallel. A listing that returns its complete registry in one response also yields one roster document with every row. Substring-search endpoints get the question's names and content words; only the listing's own name and words the source says are true of every row are left out.
 3. Documents are admitted round-robin across sources up to the global limit. Each source keeps its upstream order.
 4. Jev scores each admitted document. Long documents are split into chunks, and each chunk is scored in its own Jev call. Chunks that share a call change each other's scores: in a replay on 1,655 saved documents, four chunks per call moved 91 documents across the selection threshold and two per call moved 62, against 18 between two runs of single-chunk calls, and reordering the chunks inside calls moved about as many. `--jev-batch N` still packs N chunks per call (at most 44 KB of serialized state). `probability` is the maximum chunk score and selects the document. Each score keeps the four evidence signals in `signals` as independent per-signal maxima across chunks; they do not describe one jointly supported chunk.
-5. When the intent depends on time or version, the run dates the selected documents and asks Jev one more question about each of the 80 most relevant. Undated documents take the date of a same-URL copy from another source. Up to 24 undated developer-docs or site pages are read once more as HTML, only for their machine-readable date. Then Jev sees `today`, the question, the document's date and its best chunk, and judges whether what the chunk says likely still holds today. Jev reads the dates; it compares none. Relevance and selection do not change.
-6. Selected documents are ordered by weighted reciprocal-rank fusion of relevance (the mean of the two best chunk scores, so long documents gain less from more chunks), currentness (`still_current`), recency, and authority. The intent sets the weights: a timeless question uses relevance and a little authority only. For a confident `current` intent, documents judged likely still true come first. When no official page reaches the compact list, the best one takes its last slot.
-7. Exact duplicates, same URL, title, and text, are scored once. The score, or the failure, is copied to every original ID with its own provenance, so counts and labels do not change.
+5. While Jev scores, the run reads some original pages that source rows name (see [Original pages](#original-pages)). Jev scores the read pages as a second batch.
+6. When the intent depends on time or version, the run dates the selected documents and asks Jev one more question about each of the 80 most relevant. Undated documents take the date of a same-URL copy from another source. Up to 24 undated developer-docs or site pages are read once more as HTML, only for their machine-readable date. Then Jev sees `today`, the question, the document's date and its best chunk, and judges whether what the chunk says likely still holds today. Jev reads the dates; it compares none. Relevance and selection do not change.
+7. Selected documents are ordered by weighted reciprocal-rank fusion of relevance (the mean of the two best chunk scores, so long documents gain less from more chunks), currentness (`still_current`), recency, and authority. The intent sets the weights: a timeless question uses relevance and a little authority only. For a confident `current` intent, documents judged likely still true come first. When no official page reaches the compact list, the best one takes its last slot.
+8. Exact duplicates, same URL, title, and text, are scored once. The score, or the failure, is copied to every original ID with its own provenance, so counts and labels do not change.
 
 ## Evidence
 

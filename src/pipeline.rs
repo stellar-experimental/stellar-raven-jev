@@ -45,6 +45,9 @@ pub(crate) struct Evidence {
     /// Set when the question found no room in a source's request window in time.
     #[serde(skip)]
     retry_after_ms: Option<u64>,
+    /// This call's original page reads, for `load`.
+    #[serde(skip)]
+    original_reads: serde_json::Value,
     /// The session's usage before this call, so checkpoints save cumulative usage.
     #[serde(skip)]
     prior_usage: Usage,
@@ -82,6 +85,10 @@ pub trait Backend: Send + Sync {
         today: &str,
     ) -> Result<f64>;
     fn usage(&self) -> Usage;
+    /// The client for original page reads. See `HttpRecorder::public_reader`.
+    fn original_reader(&self, http: &HttpRecorder) -> Result<HttpRecorder> {
+        http.public_reader()
+    }
 }
 
 struct LiveBackend {
@@ -606,8 +613,14 @@ async fn execute(
         .timings
         .insert("fetch", run_started.elapsed().as_millis() as u64);
     let admitted = admit(config, &mut evidence, fetched);
+    let originals = plan_originals(config, &evidence, &admitted, &maxima, sources)?;
     persist(config, &evidence, &backend.usage(), "running")?;
-    score_stage(question, config, backend, &mut evidence, admitted, &maxima).await?;
+    let (scored, read) = tokio::join!(
+        score_stage(question, config, backend, &mut evidence, admitted, &maxima),
+        read_originals(backend, &http, &originals.reads)
+    );
+    scored?;
+    add_originals(question, config, backend, &mut evidence, originals, read).await?;
     finish(
         question,
         config,
@@ -701,16 +714,237 @@ pub(crate) async fn fetch_sources(
     }
     drop(jobs);
     // Raw response bodies already preserve each connector's evidence while fetching runs.
-    // Later session calls add to the index, so every call's retrieval stays on record.
-    // The file exists from the first call on; an unreadable one is an error, never a reset.
+    record_retrieved(config, &fetched)?;
+    Ok(fetched)
+}
+
+/// Add this call's fetched documents to retrieved.json. Later session calls add to the index, so
+/// every call's retrieval stays on record. The file exists from the first call on; an unreadable
+/// one is an error, never a reset.
+fn record_retrieved(config: &RunConfig, fetched: &[Document]) -> Result<()> {
     let mut index: Vec<serde_json::Value> = read_json(&config.output_dir, "retrieved.json")?;
     let call = crate::session::current_call(&config.output_dir)?;
-    index.extend(retrieved_index(&fetched).into_iter().map(|mut r| {
+    index.extend(retrieved_index(fetched).into_iter().map(|mut r| {
         r["call"] = json!(call);
         r
     }));
-    write_json(config.output_dir.join("retrieved.json"), &index)?;
-    Ok(fetched)
+    write_json(config.output_dir.join("retrieved.json"), &index)
+}
+
+/// Rows of sources routed at or above this are read at their original URL in the call that
+/// fetches them.
+const ORIGINAL_ROUTE: f64 = 0.6;
+/// Original pages read at once, and the time allowed for all of a call's reads.
+const ORIGINAL_CONCURRENCY: usize = 2;
+const ORIGINAL_PHASE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// A call's original page reads: the reserved requests, in order, and what planning decided.
+#[derive(Default)]
+struct OriginalPlan {
+    reads: Vec<connectors::original::Candidate>,
+    eligible: usize,
+    reused: usize,
+    capped: usize,
+}
+
+/// Choose this call's original page reads: eligible rows of sources routed at `ORIGINAL_ROUTE` or
+/// above, by the source's routing probability and then row order, one per normalized URL. A URL
+/// whose complete body the session holds is reused without a request. Requests are reserved in
+/// the session within its caps; the rest are counted as capped.
+fn plan_originals(
+    config: &RunConfig,
+    evidence: &Evidence,
+    rows: &[Document],
+    routes: &BTreeMap<String, f64>,
+    sources: &[Source],
+) -> Result<OriginalPlan> {
+    if config.fixture {
+        return Ok(OriginalPlan::default());
+    }
+    let route = |d: &Document| routes.get(&d.source_id).copied().unwrap_or(0.0);
+    let mut ordered: Vec<&Document> = rows.iter().filter(|d| route(d) >= ORIGINAL_ROUTE).collect();
+    // A stable sort keeps each source's row order.
+    ordered.sort_by(|a, b| route(b).total_cmp(&route(a)));
+    let plans = connectors::original::plan(
+        ordered,
+        evidence.documents.iter().chain(&evidence.deferred),
+        sources,
+    );
+    let mut plan = OriginalPlan {
+        eligible: plans.len(),
+        ..Default::default()
+    };
+    for entry in plans {
+        match entry {
+            connectors::original::Plan::Read(candidate) => plan.reads.push(candidate),
+            connectors::original::Plan::Reused { .. } => plan.reused += 1,
+        }
+    }
+    let granted = if plan.reads.is_empty() {
+        0
+    } else {
+        crate::session::reserve_original_reads(&config.output_dir, plan.reads.len())?
+    };
+    plan.capped = plan.reads.len() - granted;
+    plan.reads.truncate(granted);
+    Ok(plan)
+}
+
+/// What a call's reads returned: finished outcomes, the reads cut at the phase deadline, and how
+/// many requests started.
+type OriginalResults = (
+    Vec<(
+        connectors::original::Candidate,
+        connectors::original::Outcome,
+    )>,
+    Vec<connectors::original::Candidate>,
+    usize,
+);
+
+/// Read the planned pages, `ORIGINAL_CONCURRENCY` at a time, until `ORIGINAL_PHASE` ends. A read
+/// still running then is dropped; the recorder keeps its receipt.
+async fn read_originals(
+    backend: &dyn Backend,
+    http: &HttpRecorder,
+    reads: &[connectors::original::Candidate],
+) -> OriginalResults {
+    use connectors::original::Outcome;
+    if reads.is_empty() {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let reader = match backend.original_reader(http) {
+        Ok(reader) => reader,
+        Err(error) => {
+            let failed = reads
+                .iter()
+                .map(|c| {
+                    (
+                        c.clone(),
+                        Outcome::Failed(format!("No public reader: {error}")),
+                    )
+                })
+                .collect();
+            return (failed, Vec::new(), 0);
+        }
+    };
+    let started = std::sync::atomic::AtomicUsize::new(0);
+    let mut jobs = Box::pin(
+        stream::iter(reads.iter().enumerate())
+            .map(|(i, candidate)| {
+                let (reader, started) = (&reader, &started);
+                async move {
+                    started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    (
+                        i,
+                        connectors::original::read_original(candidate, reader).await,
+                    )
+                }
+            })
+            .buffer_unordered(ORIGINAL_CONCURRENCY),
+    );
+    let deadline = tokio::time::Instant::now() + ORIGINAL_PHASE;
+    let mut done = BTreeMap::new();
+    while let Ok(Some((i, outcome))) = tokio::time::timeout_at(deadline, jobs.next()).await {
+        done.insert(i, outcome);
+    }
+    drop(jobs);
+    let mut finished = Vec::new();
+    let mut cut = Vec::new();
+    for (i, candidate) in reads.iter().enumerate() {
+        match done.remove(&i) {
+            Some(outcome) => finished.push((candidate.clone(), outcome)),
+            None => cut.push(candidate.clone()),
+        }
+    }
+    (
+        finished,
+        cut,
+        started.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Settle the session's reservation, report failed reads, count the reads for `load`, and append
+/// each read page as a new document scored in its own batch. Existing documents keep their
+/// positions, so their text paths do not change.
+async fn add_originals(
+    question: &str,
+    config: &RunConfig,
+    backend: &dyn Backend,
+    evidence: &mut Evidence,
+    plan: OriginalPlan,
+    (finished, cut, started): OriginalResults,
+) -> Result<()> {
+    use connectors::original::Outcome;
+    if config.fixture {
+        return Ok(());
+    }
+    crate::session::release_original_reads(
+        &config.output_dir,
+        plan.reads.len().saturating_sub(started),
+    )?;
+    let (mut refused, mut failed) = (0, 0);
+    let mut pages = Vec::new();
+    for (candidate, outcome) in finished {
+        let message = match outcome {
+            Outcome::Read(document) => {
+                pages.push(document);
+                continue;
+            }
+            Outcome::Refused(message) => {
+                refused += 1;
+                message
+            }
+            Outcome::Failed(message) => {
+                failed += 1;
+                message
+            }
+        };
+        evidence.failures.push(failure(
+            "original_read",
+            Some(&candidate.parent_source_id),
+            format!(
+                "The original page {} of {} was not read: {message}",
+                candidate.url, candidate.parent_id
+            ),
+        ));
+    }
+    for candidate in &cut {
+        failed += 1;
+        evidence.failures.push(failure(
+            "original_read",
+            Some(&candidate.parent_source_id),
+            format!(
+                "The original page {} of {} was cut at the {}-second read deadline",
+                candidate.url,
+                candidate.parent_id,
+                ORIGINAL_PHASE.as_secs()
+            ),
+        ));
+    }
+    record_retrieved(config, &pages)?;
+    let held: BTreeSet<String> = evidence
+        .documents
+        .iter()
+        .chain(&evidence.deferred)
+        .map(|d| d.id.clone())
+        .collect();
+    let pages: Vec<Document> = pages
+        .into_iter()
+        .map(|mut d| {
+            d.id = format!("{}::{}", d.source_id, d.id);
+            d
+        })
+        .filter(|d| !held.contains(&d.id))
+        .collect();
+    evidence.original_reads = json!({
+        "eligible": plan.eligible, "reused": plan.reused, "capped": plan.capped,
+        "attempted": started, "used": pages.len(), "refused": refused, "failed": failed,
+        "session_charged": crate::session::original_reads(&config.output_dir),
+    });
+    if !pages.is_empty() {
+        score_batch(question, config, backend, evidence, pages).await?;
+    }
+    Ok(())
 }
 
 /// Namespace fetched documents by source and admit them round-robin across sources, each source
@@ -1041,6 +1275,9 @@ pub(crate) async fn finish(
         docs.sort_by(|a, b| a.id.cmp(&b.id));
     }
     evidence.load = http.load_summary();
+    if !evidence.original_reads.is_null() {
+        evidence.load["original_reads"] = evidence.original_reads.clone();
+    }
     let status = if evidence.failures.is_empty() {
         "complete"
     } else {
@@ -1277,7 +1514,23 @@ pub async fn continue_session(
         .partition(|d| requested.contains(&d.source_id));
     evidence.deferred = kept;
     batch.extend(admitted);
-    score_batch(&question, &config, &backend, &mut evidence, batch).await?;
+    let routes: BTreeMap<String, f64> = evidence
+        .source_decisions
+        .iter()
+        .filter_map(|d| {
+            Some((
+                d["source_id"].as_str()?.to_owned(),
+                d["max_probability"].as_f64()?,
+            ))
+        })
+        .collect();
+    let originals = plan_originals(&config, &evidence, &batch, &routes, &registry)?;
+    let (scored, read) = tokio::join!(
+        score_batch(&question, &config, &backend, &mut evidence, batch),
+        read_originals(&backend, &http, &originals.reads)
+    );
+    scored?;
+    add_originals(&question, &config, &backend, &mut evidence, originals, read).await?;
     let intent: crate::rank::Intent = if evidence.intent["intent"].is_null() {
         crate::rank::Intent {
             kind: "timeless".into(),
@@ -1592,6 +1845,10 @@ mod tests {
         routes: Option<Vec<f64>>,
         /// Sources whose documents score low.
         low_sources: Vec<String>,
+        /// URLs of source a's rows, each a record without its page.
+        rows: Vec<String>,
+        /// Test DNS for original reads.
+        reader: Option<crate::http::TestDns>,
     }
     #[async_trait]
     impl Backend for Mock {
@@ -1632,6 +1889,25 @@ mod tests {
             }
             if self.empty_fetch {
                 return Ok(FetchResult::default());
+            }
+            if source.id == "a" && !self.rows.is_empty() {
+                return Ok(FetchResult {
+                    documents: self
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .map(|(i, url)| Document {
+                            id: format!("row-{i}"),
+                            source_id: source.id.clone(),
+                            title: format!("Fernlet record {i}"),
+                            url: url.clone(),
+                            text: format!("{{\"name\":\"fernlet {i}\"}}"),
+                            provenance: json!({"content_scope":"structured_record"}),
+                            raw_artifacts: vec![],
+                        })
+                        .collect(),
+                    failures: vec![],
+                });
             }
             let mut result = FetchResult {
                 documents: vec![Document {
@@ -1719,6 +1995,12 @@ mod tests {
         fn usage(&self) -> Usage {
             Usage::default()
         }
+        fn original_reader(&self, http: &HttpRecorder) -> Result<HttpRecorder> {
+            match &self.reader {
+                Some(dns) => http.public_reader_for_test(dns.clone()),
+                None => http.public_reader(),
+            }
+        }
     }
     impl Mock {
         async fn score_one(&self, _: &str, document: &Document) -> Result<DocumentScore> {
@@ -1762,7 +2044,197 @@ mod tests {
             nul_collision: false,
             routes: None,
             low_sources: vec![],
+            rows: vec![],
+            reader: None,
         }
+    }
+    /// A page server for `fernlet.test` that counts requests, and a mock whose source a (routed
+    /// 0.9) returns `rows`; source b routes 0.3 and c 0.1.
+    async fn reading_mock(rows: &[&str]) -> (Mock, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let served = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0; 4096];
+                    let n = socket.read(&mut request).await.unwrap_or(0);
+                    served.fetch_add(1, Ordering::SeqCst);
+                    let path = String::from_utf8_lossy(&request[..n])
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let body = format!("<html><head><title>t</title></head><body><nav>menu</nav><main><h1>Fernlet page</h1><p>Full text of {path}.</p></main></body></html>");
+                    let reply = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let mut dns = crate::http::TestDns {
+            loopback: true,
+            port: Some(port),
+            ..Default::default()
+        };
+        dns.answers
+            .insert("fernlet.test".into(), vec!["127.0.0.1".parse().unwrap()]);
+        dns.answers.insert(
+            "private.fernlet.test".into(),
+            vec!["10.0.0.7".parse().unwrap()],
+        );
+        let mut backend = mock();
+        backend.routes = Some(vec![0.9, 0.3, 0.1]);
+        backend.rows = rows.iter().map(|u| (*u).to_owned()).collect();
+        backend.reader = Some(dns);
+        (backend, count)
+    }
+    const READ_ROWS: &[&str] = &[
+        "https://fernlet.test/page-0",
+        "https://fernlet.test:443/page-0#again",
+        "https://private.fernlet.test/page",
+        "https://fernlet.test/page-1",
+        "https://fernlet.test/page-2",
+        "https://fernlet.test/page-3",
+    ];
+    #[tokio::test]
+    async fn first_pass_reads_append_scored_pages_after_existing_documents() {
+        let (backend, count) = reading_mock(READ_ROWS).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            output_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        let root = outcome.directory;
+        // One URL per normalized form; four requests reserved, the fifth URL capped; the private
+        // answer is refused before connect.
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        let load: serde_json::Value = read_json(&root, "load.json").unwrap();
+        let reads = &load["original_reads"];
+        assert_eq!(reads["eligible"], 5);
+        assert_eq!(reads["attempted"], 4);
+        assert_eq!(reads["capped"], 1);
+        assert_eq!(reads["used"], 3);
+        assert_eq!(reads["refused"], 1);
+        assert_eq!(reads["session_charged"], 4);
+        let failures: Vec<Failure> = read_json(&root, "failures.json").unwrap();
+        let refused: Vec<_> = failures
+            .iter()
+            .filter(|f| f.stage == "original_read")
+            .collect();
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0].message.contains("private.fernlet.test"));
+        assert_eq!(refused[0].source_id.as_deref(), Some("a"));
+        // Fetched documents keep the positions a run without reads gives them; pages follow.
+        let documents: Vec<Document> = read_json(&root, "documents.json").unwrap();
+        let (fixture_backend, _) = reading_mock(READ_ROWS).await;
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let fixture = RunConfig {
+            fixture: true,
+            output_dir: fixture_dir.path().into(),
+            ..Default::default()
+        };
+        let plain = run_with_backend("question", &fixture, &sources(), &fixture_backend)
+            .await
+            .unwrap();
+        let plain: Vec<Document> = read_json(&plain.directory, "documents.json").unwrap();
+        let ids = |docs: &[Document]| docs.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&documents[..plain.len()]), ids(&plain));
+        let pages = &documents[plain.len()..];
+        assert_eq!(pages.len(), 3);
+        let scores: Vec<DocumentScore> = read_json(&root, "scores.json").unwrap();
+        for page in pages {
+            assert!(page.id.starts_with("original::"));
+            assert_eq!(page.source_id, "original");
+            assert_eq!(page.provenance["parent_source_id"], "a");
+            assert!(page.provenance["parent_document_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("a::row-"));
+            assert_eq!(page.provenance["full_original"], true);
+            assert_eq!(page.provenance["content_scope"], "main_visible_text");
+            assert_eq!(page.provenance["fetched_url"], page.url);
+            assert!(page.text.contains("Full text of /page-") && !page.text.contains("menu"));
+            assert!(scores.iter().any(|s| s.document_id == page.id));
+        }
+        assert_eq!(pages[0].url, "https://fernlet.test/page-0");
+        let retrieved: Vec<serde_json::Value> = read_json(&root, "retrieved.json").unwrap();
+        assert_eq!(
+            retrieved
+                .iter()
+                .filter(|r| r["source_id"] == "original")
+                .count(),
+            3
+        );
+    }
+    #[tokio::test]
+    async fn fixture_mode_reads_no_original_pages() {
+        let (backend, count) = reading_mock(READ_ROWS).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let documents: Vec<Document> = read_json(&outcome.directory, "documents.json").unwrap();
+        assert!(documents.iter().all(|d| d.source_id != "original"));
+        let load: serde_json::Value = read_json(&outcome.directory, "load.json").unwrap();
+        assert!(load["original_reads"].is_null());
+        assert!(!outcome.directory.join("session.json").exists());
+    }
+    #[tokio::test]
+    async fn a_page_the_session_holds_is_reused_without_a_request() {
+        let (backend, count) = reading_mock(&["https://fernlet.test/held#part"]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            output_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let (config, http) = prepare("question", &config).unwrap();
+        let mut evidence = Evidence::default();
+        evidence.documents.push(Document {
+            id: "b::page".into(),
+            source_id: "b".into(),
+            title: "Held page".into(),
+            url: "https://fernlet.test/held".into(),
+            text: "Held body".into(),
+            provenance: json!({"content_scope":"main_visible_text","original":{"full_original":true}}),
+            raw_artifacts: vec![],
+        });
+        let rows = backend
+            .fetch(
+                &FetchContext {
+                    http: http.clone(),
+                    config: config.clone(),
+                },
+                &sources()[0],
+                "q",
+            )
+            .await
+            .unwrap()
+            .documents;
+        let rows = admit(&config, &mut evidence, rows);
+        let routes = BTreeMap::from([("a".to_owned(), 0.9)]);
+        let plan = plan_originals(&config, &evidence, &rows, &routes, &sources()).unwrap();
+        assert!(plan.reads.is_empty());
+        assert_eq!((plan.eligible, plan.reused), (1, 1));
+        let read = read_originals(&backend, &http, &plan.reads).await;
+        add_originals("q", &config, &backend, &mut evidence, plan, read)
+            .await
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(evidence.original_reads["reused"], 1);
+        assert_eq!(evidence.original_reads["session_charged"], 0);
     }
     fn sources() -> Vec<Source> {
         ["a", "b", "c"]

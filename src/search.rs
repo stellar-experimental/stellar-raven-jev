@@ -264,6 +264,7 @@ fn load_summary(failures: &[Failure], usage: &crate::types::Usage, counters: &Va
         "source_slot_wait_ms": counter("source_slot_wait_ms"),
         "source_requests": counters["source_requests"],
         "source_latency": counters["source_latency"],
+        "original_reads": counters["original_reads"],
         "scoring_failures": count("document_score"),
         "currentness_failures": count("currentness"),
         "jev_rate_limited_requests": usage.rate_limited_requests,
@@ -374,7 +375,8 @@ fn scope_rank(document: &Document) -> u8 {
         | "skill_markdown_entrypoint"
         | "stored_editorial_body"
         | "stored_application_body"
-        | "stored_source_body" => 4,
+        | "stored_source_body"
+        | "published_plain_text" => 4,
         "structured_record_with_detail" | "research_chunk" | "transcript_excerpt" => 3,
         "structured_record" | "ai_summary" => 2,
         "indexed_sections_or_metadata"

@@ -1,5 +1,6 @@
 pub mod algolia;
 pub mod lumenloop;
+pub mod original;
 pub mod stellarlight;
 
 use crate::types::*;

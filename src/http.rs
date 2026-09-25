@@ -31,6 +31,205 @@ pub struct HttpRecorder {
     load: Arc<LoadCounters>,
     allow_loopback: bool,
     limits: Option<Arc<RequestLimits>>,
+    /// Set on a public reader clone: see `public_reader`.
+    public: Option<PublicPolicy>,
+}
+
+/// The largest body a public read keeps.
+pub const PUBLIC_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const PUBLIC_TIMEOUT: Duration = Duration::from_secs(10);
+const PUBLIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PUBLIC_TYPES: &[&str] = &["text/html", "text/markdown", "text/plain"];
+/// The only request headers a public read sends.
+const PUBLIC_HEADERS: &[(&str, &str)] = &[
+    ("accept", "text/html, text/markdown;q=0.9, text/plain;q=0.8"),
+    ("accept-encoding", "identity"),
+    (
+        "user-agent",
+        concat!("stellar-raven-jev/", env!("CARGO_PKG_VERSION")),
+    ),
+];
+
+/// A public read that the transport rules refused: a host that is not a public name, a DNS answer
+/// or connected peer that is not public, a redirect, an encoded or unsupported body, or a body
+/// past the limit.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Public read refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// True for a public unicast destination. IPv4-mapped IPv6 addresses are judged as IPv4.
+pub fn public_address(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || a == 0
+                || a >= 240
+                || (a == 100 && (64..128).contains(&b))
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 192 && b == 0 && c == 0))
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            // NAT64 (64:ff9b::/96) carries an IPv4 destination in its low 32 bits.
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                let [.., hi, lo] = s;
+                return public_address(IpAddr::V4(std::net::Ipv4Addr::from(
+                    (u32::from(hi) << 16) | u32::from(lo),
+                )));
+            }
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || s[..6] == [0; 6]
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xffc0) == 0xfec0
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] & 0xfff0) == 0x3ff0)
+        }
+    }
+}
+
+/// Test-only name resolution for a public reader: fixed answers, loopback allowed, and plain
+/// HTTP on a local port in place of HTTPS on 443.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestDns {
+    pub answers: std::collections::HashMap<String, Vec<std::net::IpAddr>>,
+    pub loopback: bool,
+    pub port: Option<u16>,
+    pub timeout: Option<Duration>,
+}
+
+#[derive(Clone, Default)]
+struct PublicPolicy {
+    #[cfg(test)]
+    test: Option<Arc<TestDns>>,
+}
+
+impl PublicPolicy {
+    fn allows(&self, ip: std::net::IpAddr) -> bool {
+        #[cfg(test)]
+        if self.test.as_ref().is_some_and(|t| t.loopback) {
+            let ip = match ip {
+                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+                v4 => v4,
+            };
+            if ip.is_loopback() {
+                return true;
+            }
+        }
+        public_address(ip)
+    }
+}
+
+/// A DNS answer that contained an address the public reader must not connect to.
+#[derive(Debug)]
+struct NonPublicAnswer(String);
+
+impl std::fmt::Display for NonPublicAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the DNS answer for {} is not only public addresses",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NonPublicAnswer {}
+
+/// Resolves through the system resolver and returns the answer only when every address is public,
+/// so the client connects only to checked addresses and keeps the host name for TLS.
+struct PublicResolver(PublicPolicy);
+
+impl reqwest::dns::Resolve for PublicResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let policy = self.0.clone();
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            #[cfg(test)]
+            let fixed = policy
+                .test
+                .as_ref()
+                .and_then(|t| t.answers.get(&host).cloned());
+            #[cfg(not(test))]
+            let fixed: Option<Vec<std::net::IpAddr>> = None;
+            let addresses: Vec<std::net::SocketAddr> = match fixed {
+                Some(ips) => ips
+                    .into_iter()
+                    .map(|ip| std::net::SocketAddr::new(ip, 0))
+                    .collect(),
+                None => tokio::net::lookup_host((host.as_str(), 0)).await?.collect(),
+            };
+            if addresses.is_empty() || !addresses.iter().all(|a| policy.allows(a.ip())) {
+                return Err(Box::new(NonPublicAnswer(host)) as Box<_>);
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// HTTPS only, checked DNS, no redirects, no proxy, no pooled connections (each request resolves
+/// and is checked again), and a total time limit that covers the body.
+fn public_client(policy: &PublicPolicy) -> Result<Client> {
+    #[cfg(test)]
+    let (plain, timeout) = policy.test.as_ref().map_or((false, PUBLIC_TIMEOUT), |t| {
+        (t.port.is_some(), t.timeout.unwrap_or(PUBLIC_TIMEOUT))
+    });
+    #[cfg(not(test))]
+    let (plain, timeout) = (false, PUBLIC_TIMEOUT);
+    Ok(Client::builder()
+        .dns_resolver(Arc::new(PublicResolver(policy.clone())))
+        .https_only(!plain)
+        .redirect(Policy::none())
+        .no_proxy()
+        .referer(false)
+        .pool_max_idle_per_host(0)
+        .connect_timeout(PUBLIC_CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .build()?)
+}
+
+/// An error and its causes on one line.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+/// A media type from a Content-Type value, without parameters.
+fn media_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// In-flight requests per host. One slow host cannot hold the permits that other hosts need.
@@ -579,7 +778,65 @@ impl HttpRecorder {
             load: Arc::default(),
             allow_loopback: false,
             limits: None,
+            public: None,
         })
+    }
+
+    /// A clone that reads public pages named by source rows: only GET with fixed headers, only
+    /// host names whose every DNS address is public, the connected peer checked again, no
+    /// redirects, only declared text bodies without content encoding, and at most
+    /// `PUBLIC_BODY_LIMIT` bytes in 10 seconds. It keeps the run folder, raw receipts, and file
+    /// sequence, and it uses no source rate-limit gates.
+    pub fn public_reader(&self) -> Result<Self> {
+        self.public_reader_with(PublicPolicy::default())
+    }
+
+    fn public_reader_with(&self, policy: PublicPolicy) -> Result<Self> {
+        let mut clone = self.clone();
+        clone.client = public_client(&policy)?;
+        clone.gates = None;
+        clone.hosts = HostLimits::new(self.config.concurrency);
+        clone.shared = Arc::default();
+        clone.config.max_body_bytes = PUBLIC_BODY_LIMIT;
+        clone.public = Some(policy);
+        Ok(clone)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn public_reader_for_test(&self, dns: TestDns) -> Result<Self> {
+        let mut clone = self.public_reader_with(PublicPolicy {
+            test: Some(Arc::new(dns.clone())),
+        })?;
+        clone.allow_loopback = dns.loopback;
+        Ok(clone)
+    }
+
+    /// GET one page through a public reader, with only the fixed headers.
+    pub async fn get_public(&self, url: &str) -> Result<HttpResponse> {
+        anyhow::ensure!(self.public.is_some(), "Public reads need a public reader");
+        #[cfg(test)]
+        let url = &match self
+            .public
+            .as_ref()
+            .and_then(|p| p.test.as_ref())
+            .and_then(|t| t.port)
+        {
+            Some(port) => {
+                let mut local = Url::parse(url).context("Invalid request URL")?;
+                if local.scheme() == "https" && local.port().is_none() {
+                    let _ = local.set_scheme("http");
+                    let _ = local.set_port(Some(port));
+                }
+                local.to_string()
+            }
+            None => url.to_owned(),
+        };
+        let headers = PUBLIC_HEADERS
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        self.request_recorded(Method::GET, url, headers, None, true, SendGate::default())
+            .await
     }
 
     /// Limits cover every clone, including connector calls and Jev requests. Tests only.
@@ -707,10 +964,30 @@ impl HttpRecorder {
         let started = Instant::now();
         let operation = async {
             let parsed = Url::parse(url).context("Invalid request URL")?;
+            if self.public.is_some()
+                && (!parsed.username().is_empty() || parsed.password().is_some())
+            {
+                return Err(Refused("the URL carries user information".into()).into());
+            }
             if !parsed.username().is_empty() || parsed.password().is_some() {
                 bail!("URL credentials are forbidden");
             }
             record.metadata["url"] = json!(safe_url(&parsed));
+            if self.public.is_some() {
+                let host = parsed.host_str().unwrap_or_default();
+                if method != Method::GET || body.is_some() {
+                    return Err(Refused("only GET without a body is allowed".into()).into());
+                }
+                if host.is_empty()
+                    || host
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .parse::<std::net::IpAddr>()
+                        .is_ok()
+                {
+                    return Err(Refused("the URL host is not a host name".into()).into());
+                }
+            }
             record.metadata["request_header_names"] =
                 json!(headers.iter().map(|(key, _)| key).collect::<Vec<_>>());
             // Only explicit safe headers retain values. Unknown headers can contain credentials.
@@ -747,7 +1024,11 @@ impl HttpRecorder {
             if parsed.scheme() != "https"
                 && !(self.allow_loopback
                     && parsed.scheme() == "http"
-                    && parsed.host_str() == Some("127.0.0.1"))
+                    && parsed.host_str().is_some_and(|host| {
+                        host == "127.0.0.1"
+                            || host == "fernlet.test"
+                            || host.ends_with(".fernlet.test")
+                    }))
             {
                 bail!("Request URL must use HTTPS");
             }
@@ -836,10 +1117,21 @@ impl HttpRecorder {
             if let Some(body) = body {
                 request = request.json(&body);
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e.without_url()))?;
+            let response = request.send().await.map_err(|e| {
+                let e = e.without_url();
+                if self.public.is_none() {
+                    return anyhow::anyhow!("HTTP request failed: {e}");
+                }
+                let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+                while let Some(error) = cause {
+                    if let Some(answer) = error.downcast_ref::<NonPublicAnswer>() {
+                        return Refused(format!("{answer}; nothing was sent")).into();
+                    }
+                    cause = error.source();
+                }
+                anyhow::anyhow!("HTTP request failed: {}", error_chain(&e))
+            })?;
+            let peer = response.remote_addr();
             let status = response.status().as_u16();
             record.metadata["status"] = json!(status);
             let response_headers: std::collections::BTreeMap<String, String> = response
@@ -849,6 +1141,7 @@ impl HttpRecorder {
                     matches!(
                         key.as_str(),
                         "content-type"
+                            | "content-encoding"
                             | "content-length"
                             | "retry-after"
                             | "retry-after-ms"
@@ -883,6 +1176,50 @@ impl HttpRecorder {
                 )?;
             }
             record.metadata["response_headers"] = json!(response_headers);
+            if let Some(policy) = &self.public {
+                // The resolver checked every address; the connected peer is checked again.
+                if !peer.is_some_and(|p| policy.allows(p.ip())) {
+                    return Err(Refused("the connected peer is not a public address".into()).into());
+                }
+                if (300..400).contains(&status) {
+                    return Err(Refused(format!(
+                        "HTTP redirect {status}; the Location was not followed"
+                    ))
+                    .into());
+                }
+                let values = |name| {
+                    response
+                        .headers()
+                        .get_all(name)
+                        .iter()
+                        .map(|v| v.to_str().unwrap_or("[BINARY]").to_owned())
+                        .collect::<Vec<_>>()
+                };
+                let encodings = values(reqwest::header::CONTENT_ENCODING);
+                if encodings
+                    .iter()
+                    .any(|e| !e.trim().eq_ignore_ascii_case("identity"))
+                {
+                    return Err(Refused(format!(
+                        "the body has Content-Encoding {}",
+                        encodings.join(", ")
+                    ))
+                    .into());
+                }
+                let types = values(reqwest::header::CONTENT_TYPE);
+                if types.len() != 1 || !PUBLIC_TYPES.contains(&media_type(&types[0]).as_str()) {
+                    return Err(Refused(format!(
+                        "the declared Content-Type is not one text type of {}: {}",
+                        PUBLIC_TYPES.join(", "),
+                        if types.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            types.join(", ")
+                        }
+                    ))
+                    .into());
+                }
+            }
             // Synchronous chunk writes: a cancelled request leaves no write pending.
             let mut file = if record.enabled {
                 Some(std::fs::File::create(self.root.join(&streaming_artifact))?)
@@ -917,6 +1254,13 @@ impl HttpRecorder {
                 if chunk.len() > available {
                     if let Some(file) = file.as_mut() {
                         std::io::Write::flush(file)?;
+                    }
+                    if self.public.is_some() {
+                        return Err(Refused(format!(
+                            "the body exceeds {} bytes; the retained body is incomplete",
+                            self.config.max_body_bytes
+                        ))
+                        .into());
                     }
                     bail!(
                         "Response exceeds --max-body-bytes {}; retained body is incomplete",
@@ -1601,6 +1945,324 @@ mod tests {
             .contains("redirect"));
         assert_eq!(raw_body(&dir.path().join("raw/000000.body.gz")), b"move");
     }
+    /// Serves `reply` to every connection, counts requests, and sends each request's head.
+    async fn page_server(
+        reply: Vec<u8>,
+        delay_after: Option<usize>,
+    ) -> (
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let served = count.clone();
+        let reply = Arc::new(reply);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (served, sender, reply) = (served.clone(), sender.clone(), reply.clone());
+                tokio::spawn(async move {
+                    let mut request = vec![0; 8192];
+                    let n = socket.read(&mut request).await.unwrap_or(0);
+                    served.fetch_add(1, Ordering::SeqCst);
+                    let _ = sender.send(String::from_utf8_lossy(&request[..n]).into_owned());
+                    let split = delay_after.unwrap_or(reply.len()).min(reply.len());
+                    let _ = socket.write_all(&reply[..split]).await;
+                    if split < reply.len() {
+                        let _ = socket.flush().await;
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        let _ = socket.write_all(&reply[split..]).await;
+                    }
+                });
+            }
+        });
+        (port, count, receiver)
+    }
+
+    fn reply(head: &str, body: &[u8]) -> Vec<u8> {
+        let mut bytes = format!(
+            "HTTP/1.1 {head}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn reader(dir: &Path, port: u16, answers: &[(&str, &[&str])]) -> HttpRecorder {
+        let mut dns = TestDns {
+            loopback: true,
+            port: Some(port),
+            ..TestDns::default()
+        };
+        dns.answers
+            .insert("fernlet.test".into(), vec!["127.0.0.1".parse().unwrap()]);
+        for (host, ips) in answers {
+            dns.answers.insert(
+                (*host).into(),
+                ips.iter().map(|ip| ip.parse().unwrap()).collect(),
+            );
+        }
+        HttpRecorder::new(dir, &RunConfig::default())
+            .unwrap()
+            .public_reader_for_test(dns)
+            .unwrap()
+    }
+
+    fn refusal(result: Result<HttpResponse>) -> String {
+        let error = result.unwrap_err();
+        error
+            .downcast_ref::<Refused>()
+            .unwrap_or_else(|| panic!("not a refusal: {error}"))
+            .to_string()
+    }
+
+    #[test]
+    fn only_public_unicast_addresses_pass_the_filter() {
+        for public in ["93.184.216.34", "2606:4700::1111", "::ffff:93.184.216.34"] {
+            assert!(public_address(public.parse().unwrap()), "{public}");
+        }
+        for refused in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.100.100.200",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "198.18.0.1",
+            "192.0.0.192",
+            "::1",
+            "::",
+            "ff02::1",
+            "fc00::1",
+            "fd00:ec2::254",
+            "fe80::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+        ] {
+            assert!(!public_address(refused.parse().unwrap()), "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn answer_sets_with_any_non_public_address_are_refused_before_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, count, _) =
+            page_server(reply("200 OK\r\nContent-Type: text/plain", b"ok"), None).await;
+        let reader = reader(
+            dir.path(),
+            port,
+            &[
+                ("private.fernlet.test", &["10.1.2.3"]),
+                ("mixed.fernlet.test", &["127.0.0.1", "192.168.4.4"]),
+                ("mapped.fernlet.test", &["::ffff:10.9.9.9"]),
+                ("metadata.fernlet.test", &["169.254.169.254"]),
+                ("carrier.fernlet.test", &["100.100.100.200"]),
+                ("ula.fernlet.test", &["fd00:ec2::254"]),
+                ("empty.fernlet.test", &[]),
+            ],
+        );
+        for host in [
+            "private", "mixed", "mapped", "metadata", "carrier", "ula", "empty",
+        ] {
+            let message = refusal(
+                reader
+                    .get_public(&format!("https://{host}.fernlet.test/page"))
+                    .await,
+            );
+            assert!(message.contains("DNS answer"), "{host}: {message}");
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let page = reader
+            .get_public("https://fernlet.test/page")
+            .await
+            .unwrap();
+        assert_eq!(page.body, b"ok");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn literal_address_hosts_and_user_information_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, count, _) =
+            page_server(reply("200 OK\r\nContent-Type: text/plain", b"ok"), None).await;
+        let reader = reader(dir.path(), port, &[]);
+        for url in [
+            "https://127.0.0.1/page",
+            "https://[::1]/page",
+            "https://reader:secret@fernlet.test/page",
+        ] {
+            refusal(reader.get_public(url).await);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn redirects_are_refused_without_following_location() {
+        for status in [
+            "301 Moved Permanently",
+            "302 Found",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (port, count, _) = page_server(
+                reply(
+                    &format!("{status}\r\nLocation: /elsewhere\r\nContent-Type: text/html"),
+                    b"moved",
+                ),
+                None,
+            )
+            .await;
+            let reader = reader(dir.path(), port, &[]);
+            let message = refusal(reader.get_public("https://fernlet.test/page").await);
+            assert!(message.contains("redirect"), "{message}");
+            assert_eq!(count.load(Ordering::SeqCst), 1, "{status}");
+            let metadata: Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("raw/000000.json")).unwrap())
+                    .unwrap();
+            assert!(metadata["failure"].as_str().unwrap().contains("redirect"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_public_read_sends_only_the_fixed_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, _, mut requests) = page_server(
+            reply("200 OK\r\nContent-Type: text/html", b"<main>ok</main>"),
+            None,
+        )
+        .await;
+        let reader = reader(dir.path(), port, &[]);
+        reader
+            .get_public("https://fernlet.test/page")
+            .await
+            .unwrap();
+        let head = requests.recv().await.unwrap();
+        let names: std::collections::BTreeSet<String> = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, _)| name.trim().to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(
+                ["host", "accept", "accept-encoding", "user-agent"].map(String::from)
+            )
+        );
+        assert!(head
+            .to_ascii_lowercase()
+            .contains("accept-encoding: identity"));
+    }
+
+    #[tokio::test]
+    async fn encoded_untyped_and_unsupported_bodies_are_refused() {
+        for head in [
+            "200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip",
+            "200 OK\r\nContent-Type: application/json",
+            "200 OK",
+            "200 OK\r\nContent-Type: text/html\r\nContent-Type: text/plain",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (port, _, _) = page_server(reply(head, b"body"), None).await;
+            let reader = reader(dir.path(), port, &[]);
+            refusal(reader.get_public("https://fernlet.test/page").await);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (port, _, _) = page_server(
+            reply(
+                "200 OK\r\nContent-Type: text/markdown; charset=utf-8",
+                b"# Page",
+            ),
+            None,
+        )
+        .await;
+        let reader = reader(dir.path(), port, &[]);
+        assert!(reader.get_public("https://fernlet.test/page").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_limit_is_cut_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = vec![b'a'; PUBLIC_BODY_LIMIT + 10];
+        let (port, _, _) =
+            page_server(reply("200 OK\r\nContent-Type: text/plain", &body), None).await;
+        let reader = reader(dir.path(), port, &[]);
+        let message = refusal(reader.get_public("https://fernlet.test/page").await);
+        assert!(message.contains("exceeds"), "{message}");
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("raw/000000.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["retained_bytes"], PUBLIC_BODY_LIMIT);
+        assert_eq!(metadata["complete"], false);
+        assert_eq!(
+            raw_body(&dir.path().join("raw/000000.body.gz")).len(),
+            PUBLIC_BODY_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_body_times_out_with_a_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = reply("200 OK\r\nContent-Type: text/plain", b"abcdef");
+        let (port, _, _) = page_server(full.clone(), Some(full.len() - 3)).await;
+        let mut dns = TestDns {
+            loopback: true,
+            port: Some(port),
+            timeout: Some(Duration::from_secs(1)),
+            ..TestDns::default()
+        };
+        dns.answers
+            .insert("fernlet.test".into(), vec!["127.0.0.1".parse().unwrap()]);
+        let reader = HttpRecorder::new(dir.path(), &RunConfig::default())
+            .unwrap()
+            .public_reader_for_test(dns)
+            .unwrap();
+        let started = Instant::now();
+        let error = reader
+            .get_public("https://fernlet.test/page")
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            error.to_string().contains("Response body failed"),
+            "{error}"
+        );
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("raw/000000.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["complete"], false);
+        assert_eq!(metadata["retained_bytes"], 3);
+        assert!(metadata["failure"].is_string());
+    }
+
+    #[tokio::test]
+    async fn the_production_public_reader_refuses_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = HttpRecorder::new(dir.path(), &RunConfig::default())
+            .unwrap()
+            .public_reader()
+            .unwrap();
+        let message = refusal(reader.get_public("https://localhost/page").await);
+        assert!(message.contains("DNS answer"), "{message}");
+        refusal(reader.get_public("https://127.0.0.1/page").await);
+        // Plain HTTP never leaves the recorder.
+        assert!(reader.get_public("http://localhost/page").await.is_err());
+    }
+
     #[tokio::test]
     async fn oversized_body_is_an_explicit_recorded_failure() {
         let dir = tempfile::tempdir().unwrap();

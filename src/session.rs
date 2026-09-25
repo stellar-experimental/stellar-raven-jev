@@ -109,6 +109,48 @@ pub fn settle_stopped_call(root: &Path) -> Result<()> {
     write(root, "session.json", &session)
 }
 
+/// Original pages one call may request, and one session.
+pub const ORIGINAL_READS_PER_CALL: usize = 4;
+pub const ORIGINAL_READS_PER_SESSION: usize = 12;
+
+/// Reserve up to `wanted` original page requests for this call, within the call and session caps,
+/// and return how many were granted. The reservation counts in `session.json` at once, so a call
+/// that stops keeps it charged; `release_original_reads` returns the part a call did not send.
+pub fn reserve_original_reads(root: &Path, wanted: usize) -> Result<usize> {
+    let mut session: Value = if root.join("session.json").exists() {
+        read(root, "session.json")?
+    } else {
+        // The first call writes the file before its entry, so it records its number here.
+        json!({"calls": [], "calls_started": current_call(root)?})
+    };
+    let charged = session["original_reads"].as_u64().unwrap_or(0) as usize;
+    let granted = wanted
+        .min(ORIGINAL_READS_PER_CALL)
+        .min(ORIGINAL_READS_PER_SESSION.saturating_sub(charged));
+    session["original_reads"] = json!(charged + granted);
+    write(root, "session.json", &session)?;
+    Ok(granted)
+}
+
+/// Return reserved original page requests that this call did not send.
+pub fn release_original_reads(root: &Path, unused: usize) -> Result<()> {
+    if unused == 0 {
+        return Ok(());
+    }
+    let mut session: Value = read(root, "session.json")?;
+    let charged = session["original_reads"].as_u64().unwrap_or(0) as usize;
+    session["original_reads"] = json!(charged.saturating_sub(unused));
+    write(root, "session.json", &session)
+}
+
+/// Original page requests the session has charged, including a stopped call's reservation.
+pub fn original_reads(root: &Path) -> usize {
+    read::<Value>(root, "session.json")
+        .ok()
+        .and_then(|s| s["original_reads"].as_u64())
+        .unwrap_or(0) as usize
+}
+
 /// Clear the mark of a call that ended normally and saved its usage.
 pub fn end_call(root: &Path) -> Result<()> {
     let mut session: Value = read(root, "session.json")?;
@@ -546,6 +588,35 @@ mod tests {
         begin_call(dir.path(), 0.25).unwrap();
         let usage: Usage = read(dir.path(), "usage.json").unwrap();
         assert_eq!(usage.cost_usd, 0.5);
+    }
+
+    #[test]
+    fn original_reads_are_capped_per_call_and_per_session_and_a_stopped_call_stays_charged() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first call reserves before its entry exists and keeps call number 1.
+        assert_eq!(reserve_original_reads(dir.path(), 6).unwrap(), 4);
+        assert_eq!(current_call(dir.path()).unwrap(), 1);
+        release_original_reads(dir.path(), 1).unwrap();
+        record_call(dir.path(), "search", json!({}), &Usage::default()).unwrap();
+        assert_eq!(original_reads(dir.path()), 3);
+        std::fs::write(
+            dir.path().join("usage.json"),
+            serde_json::to_vec(&Usage::default()).unwrap(),
+        )
+        .unwrap();
+        begin_call(dir.path(), 0.1).unwrap();
+        assert_eq!(current_call(dir.path()).unwrap(), 2);
+        // This call stops after its reservation; nothing releases it.
+        assert_eq!(reserve_original_reads(dir.path(), 4).unwrap(), 4);
+        begin_call(dir.path(), 0.1).unwrap();
+        assert_eq!(original_reads(dir.path()), 7);
+        assert_eq!(reserve_original_reads(dir.path(), 4).unwrap(), 4);
+        end_call(dir.path()).unwrap();
+        begin_call(dir.path(), 0.1).unwrap();
+        // Eleven are charged, so one remains for the session.
+        assert_eq!(reserve_original_reads(dir.path(), 4).unwrap(), 1);
+        assert_eq!(reserve_original_reads(dir.path(), 4).unwrap(), 0);
+        assert_eq!(original_reads(dir.path()), 12);
     }
 
     #[test]
