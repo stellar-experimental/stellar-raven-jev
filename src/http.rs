@@ -96,9 +96,14 @@ pub fn public_address(ip: std::net::IpAddr) -> bool {
                     (u32::from(hi) << 16) | u32::from(lo),
                 )));
             }
+            // Local-use NAT64 (64:ff9b:1::/48), 6to4 (2002::/16), and Teredo (2001::/32) can
+            // reach an IPv4 destination this check cannot see.
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
+                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
+                || s[0] == 0x2002
+                || (s[0] == 0x2001 && s[1] == 0)
                 || s[..6] == [0; 6]
                 || (s[0] & 0xfe00) == 0xfc00
                 || (s[0] & 0xffc0) == 0xfe80
@@ -1071,7 +1076,9 @@ impl HttpRecorder {
                 return Err(NotSent.into());
             }
             let host = parsed.host_str().unwrap_or_default().to_owned();
-            if self.gates.is_some() {
+            // Source requests and public reads count per host; Jev requests keep their own usage.
+            let accounted = self.gates.is_some() || self.public.is_some();
+            if accounted {
                 *self
                     .load
                     .sent
@@ -1080,10 +1087,7 @@ impl HttpRecorder {
                     .entry(host.clone())
                     .or_default() += 1;
             }
-            let _in_flight = self
-                .gates
-                .is_some()
-                .then(|| InFlight::start(&self.load, &host));
+            let _in_flight = accounted.then(|| InFlight::start(&self.load, &host));
             let sent_at = Instant::now();
             if let Some(sent) = gate.notify {
                 sent.notify_one();
@@ -1272,7 +1276,7 @@ impl HttpRecorder {
                 std::io::Write::flush(file)?;
             }
             record.metadata["complete"] = json!(true);
-            if self.gates.is_some() {
+            if accounted {
                 self.load
                     .latency_ms
                     .lock()
@@ -2022,7 +2026,12 @@ mod tests {
 
     #[test]
     fn only_public_unicast_addresses_pass_the_filter() {
-        for public in ["93.184.216.34", "2606:4700::1111", "::ffff:93.184.216.34"] {
+        for public in [
+            "93.184.216.34",
+            "2606:4700::1111",
+            "::ffff:93.184.216.34",
+            "64:ff9b::5db8:d822",
+        ] {
             assert!(public_address(public.parse().unwrap()), "{public}");
         }
         for refused in [
@@ -2051,6 +2060,10 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
             "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::a00:1",
+            "2002:a00:1::1",
+            "2002:5db8:d822::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
         ] {
             assert!(!public_address(refused.parse().unwrap()), "{refused}");
         }
@@ -2247,6 +2260,49 @@ mod tests {
         assert_eq!(metadata["complete"], false);
         assert_eq!(metadata["retained_bytes"], 3);
         assert!(metadata["failure"].is_string());
+    }
+
+    #[tokio::test]
+    async fn public_reads_count_in_the_run_host_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, _, _) =
+            page_server(reply("200 OK\r\nContent-Type: text/plain", b"ok"), None).await;
+        let (redirect_port, _, _) = page_server(
+            reply(
+                "302 Found\r\nLocation: /elsewhere\r\nContent-Type: text/plain",
+                b"",
+            ),
+            None,
+        )
+        .await;
+        let base = HttpRecorder::new(dir.path(), &RunConfig::default()).unwrap();
+        let dns = |port| {
+            let mut dns = TestDns {
+                loopback: true,
+                port: Some(port),
+                ..TestDns::default()
+            };
+            dns.answers
+                .insert("fernlet.test".into(), vec!["127.0.0.1".parse().unwrap()]);
+            dns
+        };
+        base.public_reader_for_test(dns(port))
+            .unwrap()
+            .get_public("https://fernlet.test/page")
+            .await
+            .unwrap();
+        base.public_reader_for_test(dns(redirect_port))
+            .unwrap()
+            .get_public("https://fernlet.test/page")
+            .await
+            .unwrap_err();
+        // The reader shares the run's counters, so the run's load shows both reads.
+        let load = base.load_summary();
+        assert_eq!(load["source_requests"]["fernlet.test"], 2);
+        let latency = &load["source_latency"]["fernlet.test"];
+        assert_eq!(latency["completed"], 1);
+        assert_eq!(latency["not_completed"], 1);
+        assert_eq!(latency["peak_in_flight"], 1);
     }
 
     #[tokio::test]

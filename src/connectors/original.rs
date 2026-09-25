@@ -144,6 +144,49 @@ pub fn plan<'a>(
     plans
 }
 
+/// What extraction took from one body.
+struct Extracted {
+    text: Option<(String, &'static str)>,
+    page_dates: Option<(Option<String>, Option<String>)>,
+    bytes: usize,
+    sha256: String,
+}
+
+/// Scoring text, page dates, size, and hash of a declared text body. A body that is not UTF-8 or
+/// holds binary data is refused, with the reason.
+fn extract(content_type: &str, bytes: Vec<u8>) -> Result<Extracted, String> {
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let Ok(body) = std::str::from_utf8(&bytes) else {
+        return Err("The body is not UTF-8 text".into());
+    };
+    if body.contains('\0') {
+        return Err("The body contains binary data".into());
+    }
+    let (text, page_dates) = match content_type {
+        "text/html" => (
+            crate::connectors::algolia::html_article_text(body),
+            Some(crate::rank::html_page_dates(body)),
+        ),
+        "text/markdown" => (
+            crate::connectors::algolia::markdown_for_scoring(body)
+                .map(|text| (text, "published_markdown_main_content")),
+            None,
+        ),
+        _ => (
+            Some(body.trim())
+                .filter(|t| !t.is_empty())
+                .map(|t| (t.to_owned(), "published_plain_text")),
+            None,
+        ),
+    };
+    Ok(Extracted {
+        text,
+        page_dates,
+        bytes: bytes.len(),
+        sha256,
+    })
+}
+
 /// Read one page through a public reader (`HttpRecorder::public_reader`) and extract its text.
 pub async fn read_original(candidate: &Candidate, http: &HttpRecorder) -> Outcome {
     let response = match http.get_public(candidate.url.as_str()).await {
@@ -172,31 +215,25 @@ pub async fn read_original(candidate: &Candidate, http: &HttpRecorder) -> Outcom
                 .to_ascii_lowercase()
         })
         .unwrap_or_default();
-    let Ok(body) = std::str::from_utf8(&response.body) else {
-        return Outcome::Refused("The body is not UTF-8 text".into());
+    // Extraction is CPU work on untrusted text; it runs off the async workers.
+    let kind = content_type.clone();
+    let extracted = match tokio::task::spawn_blocking(move || extract(&kind, response.body)).await {
+        Ok(Ok(extracted)) => extracted,
+        Ok(Err(refusal)) => return Outcome::Refused(refusal),
+        Err(error) => return Outcome::Failed(format!("Extraction stopped: {error}")),
     };
-    if body.contains('\0') {
-        return Outcome::Refused("The body contains binary data".into());
-    }
-    let extracted = match content_type.as_str() {
-        "text/html" => crate::connectors::algolia::html_article_text(body),
-        "text/markdown" => crate::connectors::algolia::markdown_for_scoring(body)
-            .map(|text| (text, "published_markdown_main_content")),
-        _ => Some(body.trim())
-            .filter(|t| !t.is_empty())
-            .map(|t| (t.to_owned(), "published_plain_text")),
-    };
-    let Some((text, scope)) = extracted else {
+    let Some((text, scope)) = extracted.text else {
         return Outcome::Failed(format!(
-            "The {content_type} body has no extractable text. Artifact: {}",
+            "The {content_type} body has no extractable text, or its structure passed the \
+             extraction limits. Artifact: {}",
             response.artifact
         ));
     };
     let mut provenance = json!({
         "content_scope": scope, "full_original": true, "fetched_url": candidate.url.as_str(),
         "parent_document_id": candidate.parent_id, "parent_source_id": candidate.parent_source_id,
-        "content_type": content_type, "raw_body_bytes": response.body.len(),
-        "body_sha256": format!("{:x}", Sha256::digest(&response.body)), "extractor": EXTRACTOR,
+        "content_type": content_type, "raw_body_bytes": extracted.bytes,
+        "body_sha256": extracted.sha256, "extractor": EXTRACTOR,
         "read_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_millis() as u64,
         "extraction_limitations": [
@@ -204,8 +241,7 @@ pub async fn read_original(candidate: &Candidate, http: &HttpRecorder) -> Outcom
             "Scoring text is an extracted representation. Scripts, external CSS, and linked resources were not loaded, so dynamic or hidden content is uncertain.",
             "A complete HTTP response does not prove complete rendered content."],
     });
-    if content_type == "text/html" {
-        let (modified, published) = crate::rank::html_page_dates(body);
+    if let Some((modified, published)) = extracted.page_dates {
         if modified.is_some() || published.is_some() {
             provenance["page_dates"] = json!({"modified": modified, "published": published});
         }
@@ -234,6 +270,21 @@ mod tests {
             text: "{}".into(),
             provenance,
             raw_artifacts: vec![],
+        }
+    }
+
+    #[test]
+    fn hostile_html_bodies_finish_extraction_quickly() {
+        for body in [
+            format!("<body>{}</body>", "<div>a".repeat(160_000)),
+            format!("<body><main>{}</main></body>", "<meta a=\"".repeat(150_000)),
+            format!("<body>{}</body>", "\"dateModified\": \"".repeat(100_000)),
+        ] {
+            let started = std::time::Instant::now();
+            let extracted = extract("text/html", body.into_bytes()).ok().unwrap();
+            let elapsed = started.elapsed();
+            assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+            assert_eq!(extracted.sha256.len(), 64);
         }
     }
 

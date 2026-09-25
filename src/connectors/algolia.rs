@@ -471,7 +471,9 @@ fn decode_entities(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let Some(end) = rest.find(';').filter(|end| *end <= 16) else {
+        // Look for the ';' in the next 16 bytes only, so a run of '&' stays linear.
+        let window = &rest.as_bytes()[..rest.len().min(17)];
+        let Some(end) = window.iter().position(|b| *b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -554,23 +556,72 @@ fn tag_attributes(tag: &str) -> HashMap<String, String> {
     }
     attrs
 }
+/// Open elements past this depth, or tags past this count, stop extraction: the page is refused.
+const HTML_MAX_DEPTH: usize = 4_096;
+const HTML_MAX_TAGS: usize = 250_000;
+/// The scopes whose text the extractor collects, in order of preference.
+const HTML_SCOPES: [&str; 3] = ["article", "main", "body"];
+
+/// The open elements, with counts kept as elements open and close, so every question the
+/// extractor asks about them takes constant time.
+#[derive(Default)]
+struct OpenElements {
+    stack: Vec<(String, bool)>,
+    hidden: usize,
+    scopes: [usize; 3],
+    names: HashMap<String, usize>,
+}
+
+impl OpenElements {
+    fn push(&mut self, name: String, hidden: bool) {
+        self.hidden += usize::from(hidden);
+        if let Some(i) = HTML_SCOPES.iter().position(|s| *s == name) {
+            self.scopes[i] += 1;
+        }
+        *self.names.entry(name.clone()).or_default() += 1;
+        self.stack.push((name, hidden));
+    }
+
+    /// Close the innermost open element named `name` and every element inside it. Each element
+    /// is removed once, so closing stays linear over the page.
+    fn close(&mut self, name: &str) {
+        if self.names.get(name).is_none_or(|n| *n == 0) {
+            return;
+        }
+        while let Some((open, hidden)) = self.stack.pop() {
+            self.hidden -= usize::from(hidden);
+            if let Some(i) = HTML_SCOPES.iter().position(|s| *s == open) {
+                self.scopes[i] -= 1;
+            }
+            if let Some(n) = self.names.get_mut(&open) {
+                *n -= 1;
+            }
+            if open == name {
+                break;
+            }
+        }
+    }
+
+    fn visible(&self) -> bool {
+        self.hidden == 0
+    }
+}
+
 pub(crate) fn html_article_text(text: &str) -> Option<(String, &'static str)> {
-    // Bounded lexical HTML extraction. No scripts, CSS, or network resources execute.
+    // Bounded lexical HTML extraction. No scripts, CSS, or network resources execute. Work is
+    // linear in the page size.
     let lower = text.to_ascii_lowercase();
-    let mut stack: Vec<(String, bool)> = Vec::new();
-    let (mut article, mut main, mut body) = (String::new(), String::new(), String::new());
+    let mut open = OpenElements::default();
+    let mut tags = 0usize;
+    let mut buffers = [String::new(), String::new(), String::new()];
     let mut at = 0;
     while at < text.len() {
         if !text[at..].starts_with('<') {
             let end = text[at..].find('<').map(|n| at + n).unwrap_or(text.len());
-            if !stack.iter().any(|(_, hidden)| *hidden) {
+            if open.visible() && open.scopes.iter().any(|n| *n > 0) {
                 let chunk = decode_entities(&text[at..end]);
-                for (scope, buffer) in [
-                    ("article", &mut article),
-                    ("main", &mut main),
-                    ("body", &mut body),
-                ] {
-                    if stack.iter().any(|(tag, _)| tag == scope) {
+                for (i, buffer) in buffers.iter_mut().enumerate() {
+                    if open.scopes[i] > 0 {
                         buffer.push_str(&chunk);
                     }
                 }
@@ -614,6 +665,10 @@ pub(crate) fn html_article_text(text: &str) -> Option<(String, &'static str)> {
         if tag.is_empty() || tag.starts_with(['!', '?']) {
             continue;
         }
+        tags += 1;
+        if tags > HTML_MAX_TAGS {
+            return None;
+        }
         if matches!(tag.as_str(), "script" | "style" | "noscript" | "template") && !closing {
             at = lower[at..]
                 .find(&format!("</{tag}"))
@@ -638,21 +693,15 @@ pub(crate) fn html_article_text(text: &str) -> Option<(String, &'static str)> {
                 | "table"
                 | "article"
         );
-        if block && !stack.iter().any(|(_, hidden)| *hidden) {
-            for (scope, buffer) in [
-                ("article", &mut article),
-                ("main", &mut main),
-                ("body", &mut body),
-            ] {
-                if stack.iter().any(|(name, _)| name == scope) {
+        if block && open.visible() {
+            for (i, buffer) in buffers.iter_mut().enumerate() {
+                if open.scopes[i] > 0 {
                     buffer.push('\n');
                 }
             }
         }
         if closing {
-            if let Some(position) = stack.iter().rposition(|(name, _)| name == &tag) {
-                stack.truncate(position);
-            }
+            open.close(&tag);
             continue;
         }
         let attrs = tag_attributes(raw);
@@ -664,10 +713,7 @@ pub(crate) fn html_article_text(text: &str) -> Option<(String, &'static str)> {
         let hidden = matches!(
             tag.as_str(),
             "nav" | "aside" | "footer" | "head" | "svg" | "button" | "form"
-        ) || (tag == "header"
-            && !stack
-                .iter()
-                .any(|(name, _)| name == "article" || name == "main"))
+        ) || (tag == "header" && open.scopes[0] + open.scopes[1] == 0)
             || attrs.contains_key("hidden")
             || attrs
                 .get("aria-hidden")
@@ -682,16 +728,12 @@ pub(crate) fn html_article_text(text: &str) -> Option<(String, &'static str)> {
             });
         // An empty <time> element is filled in by page scripts. Its machine-readable value is the
         // only copy of the date, so it becomes text.
-        if tag == "time" && !hidden && !stack.iter().any(|(_, hidden)| *hidden) {
+        if tag == "time" && !hidden && open.visible() {
             if let Some(value) = attrs.get("datetime").filter(|v| !v.trim().is_empty()) {
                 let empty = lower[at..].trim_start().starts_with("</time");
                 if empty {
-                    for (scope, buffer) in [
-                        ("article", &mut article),
-                        ("main", &mut main),
-                        ("body", &mut body),
-                    ] {
-                        if stack.iter().any(|(name, _)| name == scope) {
+                    for (i, buffer) in buffers.iter_mut().enumerate() {
+                        if open.scopes[i] > 0 {
                             buffer.push(' ');
                             buffer.push_str(value.trim());
                             buffer.push(' ');
@@ -719,9 +761,13 @@ pub(crate) fn html_article_text(text: &str) -> Option<(String, &'static str)> {
                     | "wbr"
             )
         {
-            stack.push((tag, hidden));
+            if open.stack.len() >= HTML_MAX_DEPTH {
+                return None;
+            }
+            open.push(tag, hidden);
         }
     }
+    let [article, main, body] = buffers;
     for (raw, scope) in [
         (article, "article_visible_text"),
         (main, "main_visible_text"),
@@ -1563,6 +1609,36 @@ mod tests {
         ] {
             assert!(!is_canonical_page(url), "{url}");
         }
+    }
+    #[test]
+    fn hostile_html_extracts_in_linear_time_or_is_refused() {
+        let timed = |html: String| {
+            let started = std::time::Instant::now();
+            let result = html_article_text(&html);
+            (result, started.elapsed())
+        };
+        // Deep nesting past the depth cap is refused at once.
+        let deep = format!("<body>{}</body>", "<div>a".repeat(160_000));
+        assert!(deep.len() < 2 * 1024 * 1024);
+        let (result, elapsed) = timed(deep);
+        assert!(result.is_none());
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+        // Nesting under the cap with many text runs, stray closing tags, and a run of '&'.
+        let wide = format!(
+            "<body>{}{}{}<p>{}</p></body>",
+            "<div>".repeat(4_000),
+            "a<br>".repeat(100_000),
+            "</span>".repeat(50_000),
+            "&".repeat(200_000)
+        );
+        let (result, elapsed) = timed(wide);
+        let (text, scope) = result.expect("text under the caps is kept");
+        assert_eq!(scope, "body_visible_text");
+        assert!(text.starts_with('a') && text.ends_with('&'));
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+        // Too many tags are refused.
+        let (result, _) = timed(format!("<body>{}</body>", "<br>".repeat(HTML_MAX_TAGS)));
+        assert!(result.is_none());
     }
     #[test]
     fn extraction_removes_hidden_content_and_keeps_article_heading() {

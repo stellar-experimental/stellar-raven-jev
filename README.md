@@ -110,12 +110,14 @@ A call reads the original page of such rows when the row's source routed at 0.6 
 The reader uses its own HTTP client:
 
 - It resolves the host name and connects only when every DNS address is public. It checks the connected peer again.
-- It refuses loopback, private, link-local, carrier-grade NAT, reserved, documentation, and multicast addresses. It judges IPv4-mapped IPv6 addresses as IPv4.
+- It refuses loopback, private, link-local, carrier-grade NAT, reserved, documentation, and multicast addresses. It judges IPv4-mapped and NAT64 (`64:ff9b::/96`) addresses by their IPv4 address. It refuses local-use NAT64 (`64:ff9b:1::/48`), 6to4 (`2002::/16`), and Teredo (`2001::/32`) addresses.
 - It refuses IP-literal hosts, user information, redirects, proxies, and pooled connections.
 - It sends only `Accept`, `Accept-Encoding: identity`, and `User-Agent`. It never sends source keys, cookies, or `Referer`.
 - It accepts only `text/html`, `text/markdown`, and `text/plain` without `Content-Encoding`. It keeps at most 2 MiB and stops each read after 10 seconds.
+- Extraction runs off the async workers, and its time grows linearly with the page size. It refuses a page with more than 4,096 open elements or 250,000 tags.
 
 `load.original_reads` counts the call's reads: `eligible` URLs, `reused` bodies, `capped` URLs over the limits, `attempted`, `used`, `refused`, and `failed` reads, and `session_charged`.
+Each read also counts under its host in `load.source_requests` and `load.source_latency`.
 Each refused, failed, or cut read adds a report with stage `original_read`. The row still stands, so such a report does not mark the run `degraded`.
 Fixture runs read no pages.
 
