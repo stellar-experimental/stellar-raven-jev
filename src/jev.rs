@@ -1764,7 +1764,8 @@ const PROVIDERS: [&str; 3] = ["cloudflare", "typesafe", "openrouter"];
 /// tokens per second, which scoring calls (about 3,400 tokens) reach near 4,400 per minute.
 fn default_rpm(backend: &Backend) -> f64 {
     match backend {
-        Backend::Cloudflare { .. } => 900.0,
+        // The gateway refused near 900 a minute once scoring sent one chunk per call.
+        Backend::Cloudflare { .. } => 600.0,
         Backend::TypeSafe { .. } | Backend::OpenRouter { .. } => 3_600.0,
         #[cfg(test)]
         Backend::Loopback { .. } => 60_000.0,
