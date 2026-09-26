@@ -22,6 +22,10 @@ For shared local access, link `~/.agents/skills/stellar-raven-jev` to that sourc
 Link the Claude Code and Codex skill directories to the shared path.
 OpenCode and Grok discover the shared path directly.
 New sessions read source edits through these links. Keep the source checkout available at the linked path.
+`npx skills ls -g` lists the linked skill. Local source links do not use the CLI's remote update lock.
+Source edits update the linked skill directly, as they do for the local kalepail skills.
+Claude Desktop Chat and Cowork require a separate account skill upload; the local CLI links do not install that copy.
+Account uploads remain snapshots. Upload a new skill archive after source edits.
 
 `search --bundle` (and `more --bundle`) also writes `bundle.md` in the session folder: the full text of every shown result in rank order, each followed by its companions, under a header with the rank, URL, scope, date, and text path. A contents list at the top gives the first line of each section, so `sed -n 'START,ENDp'` prints one. `bundle_path` in the output names it. The light record keeps it.
 

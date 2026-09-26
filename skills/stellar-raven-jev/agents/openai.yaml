@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stellar Raven Jev"
+  short_description: "Retrieve and assess Stellar source evidence"
+  default_prompt: "Use $stellar-raven-jev to retrieve source evidence for my Stellar question."
