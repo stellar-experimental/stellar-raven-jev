@@ -39,6 +39,8 @@ pub struct HttpRecorder {
     hedge_hosts: Arc<HostLimits>,
     /// Set on the clone that sends a hedge, so its receipt says so.
     hedge: bool,
+    /// The network check's client: the request client's settings with a connect limit.
+    probe_client: Client,
 }
 
 /// The largest body a public read keeps.
@@ -55,6 +57,16 @@ const PUBLIC_HEADERS: &[(&str, &str)] = &[
         concat!("stellar-raven-jev/", env!("CARGO_PKG_VERSION")),
     ),
 ];
+
+/// The network check's connect limit. It covers name resolution, a proxy tunnel, and TLS.
+const PROBE_CONNECT_LIMIT: Duration = Duration::from_secs(5);
+/// The network check's wait for an answer. It exceeds the connect limit, so a probe that still
+/// waits at this point has a connection: the path works, and only the answer is slow.
+const PROBE_WAIT: Duration = Duration::from_secs(6);
+
+/// One network check: the HTTP status the origin answered with, `None` when it connected but has
+/// not answered within `PROBE_WAIT`, or the cause class of the failure.
+pub type ProbeResult = Result<Option<u16>, TransportCause>;
 
 /// A public read that the transport rules refused: a host that is not a public name, a DNS answer
 /// or connected peer that is not public, a redirect, an encoded or unsupported body, or a body
@@ -232,6 +244,16 @@ fn source_client(config: &RunConfig, fresh: bool) -> reqwest::ClientBuilder {
     } else {
         builder
     }
+}
+
+/// The network check's client from a request client's builder: a fresh connection for each check,
+/// the connect limit, and a total limit past `PROBE_WAIT`. The request limit (`--timeout-secs`)
+/// does not apply, so a short one cannot turn a slow answer into a failed check.
+fn probe_client(builder: reqwest::ClientBuilder) -> Result<Client> {
+    Ok(builder
+        .connect_timeout(PROBE_CONNECT_LIMIT)
+        .timeout(PROBE_WAIT * 2)
+        .build()?)
 }
 
 /// An error and its causes on one line.
@@ -467,6 +489,141 @@ impl std::fmt::Display for NotSent {
 
 impl std::error::Error for NotSent {}
 
+/// Why a request failed before a complete response, as a fixed class. It names no URL, header,
+/// credential, or body, so failure records and output can carry it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportCause {
+    /// The host name did not resolve.
+    Dns,
+    /// The host refused the connection.
+    ConnectRefused,
+    /// The system or a proxy refused or could not open the connection. A proxy that cannot reach
+    /// the host gives this class too.
+    ConnectDenied,
+    /// No route to the network or the host.
+    Unreachable,
+    /// Another failure while connecting.
+    Connect,
+    /// The TLS handshake or the certificate check failed.
+    Tls,
+    /// The connection or the response did not finish in time.
+    Timeout,
+    /// The connection closed or reset before the response ended.
+    Closed,
+    /// Any other failure before a complete response.
+    Other,
+}
+
+impl TransportCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dns => "dns",
+            Self::ConnectRefused => "connect_refused",
+            Self::ConnectDenied => "connect_denied",
+            Self::Unreachable => "unreachable",
+            Self::Connect => "connect",
+            Self::Tls => "tls",
+            Self::Timeout => "timeout",
+            Self::Closed => "connection_closed",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Fixed messages of connector and protocol errors that have no public type, with their class.
+const LIBRARY_MESSAGES: &[(&str, TransportCause)] = &[
+    ("dns error", TransportCause::Dns),
+    ("tunnel error: unsuccessful", TransportCause::ConnectDenied),
+    (
+        "tunnel error: proxy authorization required",
+        TransportCause::ConnectDenied,
+    ),
+    (
+        "connection closed before message completed",
+        TransportCause::Closed,
+    ),
+];
+
+/// The class of a failed request, from the error's typed parts: the timeout flag, I/O error kinds,
+/// and the fixed messages in `LIBRARY_MESSAGES`. The error text itself is never kept.
+fn transport_cause(error: &reqwest::Error) -> TransportCause {
+    use std::io::ErrorKind as Kind;
+    if error.is_timeout() {
+        return TransportCause::Timeout;
+    }
+    let mut kind = None;
+    let mut layer: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = layer {
+        let text = current.to_string();
+        if let Some((_, cause)) = LIBRARY_MESSAGES.iter().find(|(m, _)| text == *m) {
+            return *cause;
+        }
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            kind = Some(io.kind());
+            // `source` of a wrapping I/O error skips the error it wraps.
+            if let Some(inner) = io.get_ref() {
+                layer = Some(inner);
+                continue;
+            }
+        }
+        layer = current.source();
+    }
+    let connect = error.is_connect();
+    match kind {
+        Some(Kind::ConnectionRefused) => TransportCause::ConnectRefused,
+        Some(Kind::PermissionDenied) => TransportCause::ConnectDenied,
+        Some(
+            Kind::NetworkUnreachable
+            | Kind::HostUnreachable
+            | Kind::NetworkDown
+            | Kind::AddrNotAvailable,
+        ) => TransportCause::Unreachable,
+        Some(Kind::NotConnected) if connect => TransportCause::Unreachable,
+        Some(Kind::TimedOut) => TransportCause::Timeout,
+        Some(Kind::InvalidData) if connect => TransportCause::Tls,
+        Some(
+            Kind::ConnectionReset
+            | Kind::ConnectionAborted
+            | Kind::BrokenPipe
+            | Kind::UnexpectedEof
+            | Kind::NotConnected,
+        ) => TransportCause::Closed,
+        _ if connect => TransportCause::Connect,
+        _ => TransportCause::Other,
+    }
+}
+
+/// A request that failed before a complete response: its class, and the transport message
+/// without the URL.
+#[derive(Debug)]
+pub struct TransportFailure {
+    pub cause: TransportCause,
+    text: String,
+}
+
+impl TransportFailure {
+    fn new(error: &reqwest::Error, text: String) -> Self {
+        Self {
+            cause: transport_cause(error),
+            text,
+        }
+    }
+}
+
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for TransportFailure {}
+
 #[derive(Clone, Debug)]
 pub struct HttpResponse {
     pub status: u16,
@@ -616,6 +773,7 @@ impl HttpRecorder {
         // Offline tests must not inherit a proxy or relax production URL rules.
         recorder.client = source_client(config, false).no_proxy().build()?;
         recorder.hedge_client = source_client(config, true).no_proxy().build()?;
+        recorder.probe_client = probe_client(source_client(config, true).no_proxy())?;
         recorder.allow_loopback = true;
         Ok(recorder)
     }
@@ -812,7 +970,42 @@ impl HttpRecorder {
             hedge_client: source_client(config, true).build()?,
             hedge_hosts: HostLimits::new(HEDGES_PER_HOST),
             hedge: false,
+            probe_client: probe_client(source_client(config, true))?,
         })
+    }
+
+    /// Offline tests only: every request goes through the proxy at `proxy`.
+    #[cfg(test)]
+    pub(crate) fn through_proxy_for_test(&self, proxy: &str) -> Result<Self> {
+        let mut clone = self.clone();
+        let proxy = reqwest::Proxy::all(proxy)?;
+        clone.client = source_client(&self.config, false)
+            .proxy(proxy.clone())
+            .build()?;
+        clone.probe_client = probe_client(source_client(&self.config, true).proxy(proxy))?;
+        Ok(clone)
+    }
+
+    /// Offline tests only: no host name resolves.
+    #[cfg(test)]
+    pub(crate) fn without_dns_for_test(&self) -> Result<Self> {
+        struct NoAnswer;
+        impl reqwest::dns::Resolve for NoAnswer {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(async { Err("no answer".into()) })
+            }
+        }
+        let mut clone = self.clone();
+        clone.client = source_client(&self.config, false)
+            .no_proxy()
+            .dns_resolver(Arc::new(NoAnswer))
+            .build()?;
+        clone.probe_client = probe_client(
+            source_client(&self.config, true)
+                .no_proxy()
+                .dns_resolver(Arc::new(NoAnswer)),
+        )?;
+        Ok(clone)
     }
 
     /// A clone that reads public pages named by source rows: only GET with fixed headers, only
@@ -1099,6 +1292,23 @@ impl HttpRecorder {
             .await
     }
 
+    /// One HEAD request to `origin` without headers or body, for a free reachability check: it
+    /// carries no credentials, so no provider can bill it. Any HTTP status means the network path
+    /// works, and so does a connection still waiting for its answer at `PROBE_WAIT`. It keeps no
+    /// raw receipt and passes no host permit or rate-limit gate.
+    pub async fn probe(&self, origin: &str) -> ProbeResult {
+        let url = Url::parse(origin).map_err(|_| TransportCause::Other)?;
+        let allowed = url.scheme() == "https" || (self.allow_loopback && url.scheme() == "http");
+        if self.config.fixture || !allowed {
+            return Err(TransportCause::Other);
+        }
+        match tokio::time::timeout(PROBE_WAIT, self.probe_client.head(url).send()).await {
+            Err(_) => Ok(None),
+            Ok(Err(error)) => Err(transport_cause(&error)),
+            Ok(Ok(response)) => Ok(Some(response.status().as_u16())),
+        }
+    }
+
     async fn request_recorded(
         &self,
         method: Method,
@@ -1280,10 +1490,10 @@ impl HttpRecorder {
             if let Some(body) = body {
                 request = request.json(&body);
             }
-            let response = request.send().await.map_err(|e| {
+            let response = request.send().await.map_err(|e| -> anyhow::Error {
                 let e = e.without_url();
                 if self.public.is_none() {
-                    return anyhow::anyhow!("HTTP request failed: {e}");
+                    return TransportFailure::new(&e, format!("HTTP request failed: {e}")).into();
                 }
                 let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&e);
                 while let Some(error) = cause {
@@ -1292,7 +1502,8 @@ impl HttpRecorder {
                     }
                     cause = error.source();
                 }
-                anyhow::anyhow!("HTTP request failed: {}", error_chain(&e))
+                TransportFailure::new(&e, format!("HTTP request failed: {}", error_chain(&e)))
+                    .into()
             })?;
             let peer = response.remote_addr();
             let status = response.status().as_u16();
@@ -1392,8 +1603,10 @@ impl HttpRecorder {
             let mut stream = response.bytes_stream();
             let mut bytes = Vec::new();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk
-                    .map_err(|e| anyhow::anyhow!("Response body failed: {}", e.without_url()))?;
+                let chunk = chunk.map_err(|e| {
+                    let e = e.without_url();
+                    TransportFailure::new(&e, format!("Response body failed: {e}"))
+                })?;
                 let available = self.config.max_body_bytes.saturating_sub(bytes.len());
                 let mut retain_count = chunk.len().min(available);
                 if let Some(limits) = &self.limits {
@@ -2126,6 +2339,142 @@ mod tests {
         };
         let (_, fast_elapsed) = tokio::join!(slow_request, fast_request);
         assert!(fast_elapsed < Duration::from_secs(1));
+    }
+
+    /// Answers every connection with `reply` after `delay`, or closes it without an answer when
+    /// `reply` is empty. Returns the address and every request it read.
+    async fn scripted(
+        reply: &'static [u8],
+        delay: Duration,
+    ) -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let requests = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let requests = requests.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0; 4096];
+                    let n = socket.read(&mut request).await.unwrap_or(0);
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&request[..n]).into_owned());
+                    tokio::time::sleep(delay).await;
+                    let _ = socket.write_all(reply).await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// The cause class of a failed POST that carries a credential, which the error never shows.
+    async fn cause_of(recorder: &HttpRecorder, url: &str) -> TransportCause {
+        let error = recorder
+            .request_body_recorded_elsewhere(
+                Method::POST,
+                url,
+                vec![("authorization".into(), "Bearer fernlet-secret".into())],
+                Some(json!({"question":"fernlet"})),
+                SendGate::default(),
+            )
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(!text.contains("fernlet-secret") && !text.contains("fernlet.test"));
+        error
+            .downcast_ref::<TransportFailure>()
+            .unwrap_or_else(|| panic!("not a transport failure: {text}"))
+            .cause
+    }
+
+    #[tokio::test]
+    async fn each_transport_failure_carries_its_cause_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            timeout_secs: 1,
+            ..RunConfig::default()
+        };
+        let recorder = HttpRecorder::loopback_for_test(dir.path(), &config).unwrap();
+        // Nothing listens on a port that was just released.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        assert_eq!(
+            cause_of(&recorder, &format!("http://{closed}/")).await,
+            TransportCause::ConnectRefused
+        );
+        let (hangs_up, _) = scripted(b"", Duration::ZERO).await;
+        assert_eq!(
+            cause_of(&recorder, &format!("http://{hangs_up}/")).await,
+            TransportCause::Closed
+        );
+        let (silent, _) = scripted(b"", Duration::from_secs(5)).await;
+        assert_eq!(
+            cause_of(&recorder, &format!("http://{silent}/")).await,
+            TransportCause::Timeout
+        );
+        // Plain text where a TLS handshake is expected.
+        let (plain, _) = scripted(b"HTTP/1.1 200 OK\r\n\r\n", Duration::ZERO).await;
+        assert_eq!(
+            cause_of(&recorder, &format!("https://{plain}/")).await,
+            TransportCause::Tls
+        );
+        let no_dns = recorder.without_dns_for_test().unwrap();
+        assert_eq!(
+            cause_of(&no_dns, "http://fernlet.test/").await,
+            TransportCause::Dns
+        );
+        // A proxy that refuses the tunnel, as a restricted network does.
+        let (proxy, _) = scripted(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+            Duration::ZERO,
+        )
+        .await;
+        let denied = recorder
+            .through_proxy_for_test(&format!("http://{proxy}"))
+            .unwrap();
+        assert_eq!(
+            cause_of(&denied, "https://fernlet.test/").await,
+            TransportCause::ConnectDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn the_probe_sends_one_bare_head_and_any_status_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = HttpRecorder::loopback_for_test(dir.path(), &RunConfig::default()).unwrap();
+        let (answers, seen) = scripted(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            recorder.probe(&format!("http://{answers}/")).await,
+            Ok(Some(404))
+        );
+        let request = seen.lock().unwrap().join("").to_ascii_lowercase();
+        assert!(request.starts_with("head / http/1.1\r\n"), "{request}");
+        assert!(!request.contains("authorization") && !request.contains("content-length"));
+        // A connection with a slow answer shows a working path.
+        let (slow, _) = scripted(b"", PROBE_WAIT * 2).await;
+        assert_eq!(recorder.probe(&format!("http://{slow}/")).await, Ok(None));
+        // A fixture recorder never sends.
+        let fixture = HttpRecorder::new(
+            dir.path(),
+            &RunConfig {
+                fixture: true,
+                ..RunConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.probe(&format!("http://{answers}/")).await,
+            Err(TransportCause::Other)
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     async fn server(reply: &'static str) -> String {

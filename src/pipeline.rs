@@ -89,6 +89,16 @@ pub trait Backend: Send + Sync {
     fn original_reader(&self, http: &HttpRecorder) -> Result<HttpRecorder> {
         http.public_reader()
     }
+    /// The free network check that runs before the first reservation. See
+    /// `JevClient::check_network`.
+    async fn check_network(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Providers that the network check took out of this run. See
+    /// `JevClient::skipped_providers`.
+    fn skipped_providers(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
 }
 
 struct LiveBackend {
@@ -136,6 +146,12 @@ impl Backend for LiveBackend {
     }
     fn usage(&self) -> Usage {
         self.jev.usage()
+    }
+    async fn check_network(&self) -> Result<()> {
+        self.jev.check_network().await
+    }
+    fn skipped_providers(&self) -> BTreeMap<String, String> {
+        self.jev.skipped_providers()
     }
 }
 
@@ -431,6 +447,7 @@ pub async fn run_question_scoped(
                 stage: "initialization".into(),
                 source_id: None,
                 message: error.to_string(),
+                cause: None,
             });
             return persist(&config, &evidence, &Usage::default(), "failed");
         }
@@ -453,8 +470,34 @@ fn failure(stage: &str, source: Option<&str>, message: impl Into<String>) -> Fai
         stage: stage.into(),
         source_id: source.map(str::to_owned),
         message: message.into(),
+        cause: None,
     }
 }
+
+/// The report for a Jev judgment of `subject` that has no answer. A refusal after Jev stopped
+/// paid work gets its own stage: the item was not assessed, which is not a failed `stage`. Any
+/// other failure keeps `stage` and carries its cause class.
+fn jev_failure(stage: &str, source: Option<&str>, subject: &str, error: &anyhow::Error) -> Failure {
+    let subject = if subject.is_empty() {
+        String::new()
+    } else {
+        format!("{subject}: ")
+    };
+    if crate::jev::not_assessed_after_stop(error) {
+        return failure(
+            NOT_ASSESSED_AFTER_STOP,
+            source,
+            format!("{subject}{stage} not assessed: {error}"),
+        );
+    }
+    Failure {
+        cause: crate::jev::failure_cause(error).map(str::to_owned),
+        ..failure(stage, source, format!("{subject}{error}"))
+    }
+}
+
+/// The report stage of an item that Jev did not assess because it had stopped paid work.
+pub(crate) const NOT_ASSESSED_AFTER_STOP: &str = "not_assessed_after_stop";
 
 async fn execute(
     question: &str,
@@ -475,6 +518,15 @@ async fn execute(
         ));
         return persist(config, &evidence, &backend.usage(), "failed");
     }
+    // No Jev call reserves anything before this free check passes. Without Jev, nothing can be
+    // routed, so a failed check ends the run here.
+    if let Err(error) = backend.check_network().await {
+        evidence
+            .failures
+            .push(jev_failure("network_check", None, "", &error));
+        evidence.load = json!({"jev_providers_skipped": backend.skipped_providers()});
+        return persist(config, &evidence, &backend.usage(), "failed");
+    }
     let mut selected = BTreeSet::new();
     let mut maxima: BTreeMap<String, f64> = BTreeMap::new();
     let mut valid_passes = 0;
@@ -491,7 +543,7 @@ async fn execute(
         Err(error) => {
             evidence
                 .failures
-                .push(failure("intent", None, error.to_string()));
+                .push(jev_failure("intent", None, "", &error));
             crate::rank::Intent {
                 kind: "timeless".into(),
                 confidence: 0.0,
@@ -508,7 +560,7 @@ async fn execute(
                     .push(json!({"pass":pass,"error":error.to_string()}));
                 evidence
                     .failures
-                    .push(failure("route", None, format!("Pass {pass}: {error}")));
+                    .push(jev_failure("route", None, &format!("Pass {pass}"), &error));
             }
             Ok(scores) => {
                 let result = validate_routes(sources, &scores);
@@ -1131,21 +1183,23 @@ pub(crate) async fn score_batch(
                 classify(evidence, config, document, score);
             }
             Err(error) => {
-                evidence.failures.push(failure(
+                evidence.failures.push(jev_failure(
                     "document_score",
                     Some(&document.source_id),
-                    format!("{}: {error}", document.id),
+                    &document.id,
+                    &error,
                 ));
                 // Each copy gets its own failure row, so per-source failure counts match a run
                 // that scored every copy separately.
                 for copy in duplicates.remove(&document.id).unwrap_or_default() {
-                    evidence.failures.push(failure(
+                    evidence.failures.push(jev_failure(
                         "document_score",
                         Some(&copy.source_id),
-                        format!(
-                            "{}: not scored; the identical document {} failed: {error}",
+                        &format!(
+                            "{}: not scored; the identical document {} failed",
                             copy.id, document.id
                         ),
+                        &error,
                     ));
                     evidence.uncertain.push(copy);
                 }
@@ -1277,6 +1331,7 @@ pub(crate) async fn finish(
         docs.sort_by(|a, b| a.id.cmp(&b.id));
     }
     evidence.load = http.load_summary();
+    evidence.load["jev_providers_skipped"] = json!(backend.skipped_providers());
     if !evidence.original_reads.is_null() {
         evidence.load["original_reads"] = evidence.original_reads.clone();
     }
@@ -1478,6 +1533,11 @@ pub async fn continue_session(
         HttpRecorder::resume(&root, &config)?.with_source_gates(std::sync::Arc::new(governor));
     let jev = JevClient::new(&config, &http.with_concurrency(config.jev_concurrency))?;
     let backend = LiveBackend { jev };
+    // Before any reservation: a failed free check leaves the session as it was.
+    if let Err(error) = backend.check_network().await {
+        crate::session::end_call(&root)?;
+        return Err(error);
+    }
     let run_started = std::time::Instant::now();
     let registry = connectors::sources();
     let chosen: Vec<&Source> = registry
@@ -1762,11 +1822,9 @@ async fn assess_currentness(
                     ids[0]
                 ),
             )),
-            Err(error) => {
-                evidence
-                    .failures
-                    .push(failure("currentness", None, format!("{}: {error}", ids[0])))
-            }
+            Err(error) => evidence
+                .failures
+                .push(jev_failure("currentness", None, &ids[0], &error)),
         }
     }
     for score in &mut evidence.scores {
@@ -1853,6 +1911,11 @@ mod tests {
         rows: Vec<String>,
         /// Test DNS for original reads.
         reader: Option<crate::http::TestDns>,
+        /// Jev stops paid work: source a's scoring fails in transport, source c's and every
+        /// currentness call are refused after the stop.
+        stop_cascade: bool,
+        /// Providers the network check took out of the run.
+        skipped: BTreeMap<String, String>,
     }
     #[async_trait]
     impl Backend for Mock {
@@ -1987,6 +2050,9 @@ mod tests {
             _: &str,
         ) -> Result<f64> {
             self.assessed.fetch_add(1, Ordering::SeqCst);
+            if self.stop_cascade {
+                return Err(stopped());
+            }
             Ok(0.9)
         }
         async fn classify_intent(&self, _: &str) -> Result<BTreeMap<String, f64>> {
@@ -1998,6 +2064,9 @@ mod tests {
         }
         fn usage(&self) -> Usage {
             Usage::default()
+        }
+        fn skipped_providers(&self) -> BTreeMap<String, String> {
+            self.skipped.clone()
         }
         fn original_reader(&self, http: &HttpRecorder) -> Result<HttpRecorder> {
             match &self.reader {
@@ -2011,6 +2080,17 @@ mod tests {
             self.scored.fetch_add(1, Ordering::SeqCst);
             if self.fail_score {
                 bail!("actual scoring failure");
+            }
+            match document.source_id.as_str() {
+                "a" if self.stop_cascade => {
+                    return Err(crate::jev::CallFailure {
+                        cause: "connect_denied".into(),
+                        message: "Jev transport failed (connect_denied)".into(),
+                    }
+                    .into())
+                }
+                "c" if self.stop_cascade => return Err(stopped()),
+                _ => {}
             }
             let probability = if self.low_sources.contains(&document.source_id) {
                 0.05
@@ -2050,7 +2130,12 @@ mod tests {
             low_sources: vec![],
             rows: vec![],
             reader: None,
+            stop_cascade: false,
+            skipped: BTreeMap::new(),
         }
+    }
+    fn stopped() -> anyhow::Error {
+        crate::jev::Stopped("Jev stopped after unresolved paid-attempt usage".into()).into()
     }
     /// A page server for `fernlet.test` that counts requests, and a mock whose source a (routed
     /// 0.9) returns `rows`; source b routes 0.3 and c 0.1.
@@ -2714,6 +2799,61 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.selected, 2);
         assert_eq!(backend.scored.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn items_refused_after_a_stop_are_not_assessed_not_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = mock();
+        backend.routes = Some(vec![0.9, 0.9, 0.9]);
+        backend.stop_cascade = true;
+        // The run also went on without one provider that failed its network check.
+        backend.skipped = BTreeMap::from([("fernlet".into(), "connection_closed".into())]);
+        let config = RunConfig {
+            fixture: true,
+            output_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let outcome = run_with_backend("question", &config, &sources(), &backend)
+            .await
+            .unwrap();
+        // b's document was selected, then its currentness call was refused after the stop.
+        assert_eq!(backend.assessed.load(Ordering::SeqCst), 1);
+        let failures: Vec<Failure> = read_json(&outcome.directory, "failures.json").unwrap();
+        let rows: Vec<(&str, Option<&str>, Option<&str>)> = failures
+            .iter()
+            .map(|f| (f.stage.as_str(), f.source_id.as_deref(), f.cause.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("document_score", Some("a"), Some("connect_denied")),
+                (NOT_ASSESSED_AFTER_STOP, Some("c"), None),
+                (NOT_ASSESSED_AFTER_STOP, None, None),
+            ]
+        );
+        assert!(failures[1]
+            .message
+            .contains("document_score not assessed: Jev stopped"));
+        assert!(failures[2]
+            .message
+            .contains("currentness not assessed: Jev stopped"));
+        // Only a scoped run records its source scope; the report reads it.
+        write_json(
+            outcome.directory.join("source-scope.json"),
+            &json!({"scope":"all"}),
+        )
+        .unwrap();
+        let report = crate::search::build_report_variant(&outcome, false, None).unwrap();
+        let load = &crate::search::compact_report(&report, 10)["load"];
+        assert_eq!(load["scoring_failures"], 1);
+        assert_eq!(load["currentness_failures"], 0);
+        assert_eq!(load["not_assessed_after_stop"], 2);
+        assert_eq!(load["jev_failure_causes"], json!({"connect_denied": 1}));
+        assert_eq!(
+            load["jev_providers_skipped"],
+            json!({"fernlet": "connection_closed"})
+        );
+        assert_eq!(load["degraded"], true);
     }
     #[tokio::test]
     async fn failed_representative_leaves_every_duplicate_uncertain_with_its_own_failure() {

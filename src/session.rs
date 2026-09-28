@@ -412,6 +412,11 @@ pub async fn check(
     }
     let http = HttpRecorder::resume(&root, &config)?;
     let jev = JevClient::new(&config, &http.with_concurrency(config.jev_concurrency))?;
+    // Before any reservation: a failed free check leaves the session as it was.
+    if let Err(error) = jev.check_network().await {
+        end_call(&root)?;
+        return Err(error);
+    }
     let docs: Vec<Document> = chosen.iter().map(|(_, d, _)| d.clone()).collect();
     let judged = jev.judge_claims(question, claims, &docs).await;
     let usage = crate::pipeline::add_usage(&prior, &jev.usage());
@@ -423,13 +428,22 @@ pub async fn check(
     write(&root, "manifest.json", &manifest)?;
     let today = crate::rank::iso_date_days(&config.today).unwrap_or_default();
     let mut failed = 0;
+    // Failed documents by cause class; a document not judged because Jev stopped paid work
+    // counts as `not_assessed_after_stop`.
+    let mut failure_causes: BTreeMap<String, usize> = BTreeMap::new();
     let mut full = Vec::new();
     let mut per_claim: Vec<Vec<Value>> = claims.iter().map(|_| Vec::new()).collect();
     for ((position, document, status), result) in chosen.iter().zip(judged) {
         let judgments = match result {
             Ok(j) => j,
-            Err(_) => {
+            Err(error) => {
                 failed += 1;
+                let class = if crate::jev::not_assessed_after_stop(&error) {
+                    crate::pipeline::NOT_ASSESSED_AFTER_STOP
+                } else {
+                    crate::jev::failure_cause(&error).unwrap_or("unclassified")
+                };
+                *failure_causes.entry(class.to_owned()).or_default() += 1;
                 continue;
             }
         };
@@ -526,6 +540,8 @@ pub async fn check(
         "session": session_view(&root, &usage),
         "claims": claims_out,
         "documents_failed": failed,
+        "failure_causes": failure_causes,
+        "jev_providers_skipped": jev.skipped_providers(),
         "check_path": check_path,
         "limitations": ["Probabilities are uncalibrated. Read a row's text_path before you cite it.",
             "Low support does not mean contradiction: the text may not address the claim."],

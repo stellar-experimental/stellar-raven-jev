@@ -59,6 +59,7 @@ fn failure(source: &Source, stage: &str, message: impl Into<String>) -> Failure 
         stage: format!("lumenloop.{stage}"),
         source_id: Some(source.id.clone()),
         message: message.into(),
+        cause: None,
     }
 }
 

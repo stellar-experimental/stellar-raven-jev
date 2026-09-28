@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
                     Err(_) => "Source check timed out. Raw responses remain available; retrieval is incomplete.".into(),
                     Ok(Ok(_)) => unreachable!(),
                 },
+                cause: None,
             }] },
         };
         std::fs::write(dir.join("result.json"), serde_json::to_vec_pretty(&result)?)?;
