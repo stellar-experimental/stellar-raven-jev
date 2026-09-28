@@ -417,7 +417,7 @@ impl JevClient {
             "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and each provider's credit purchase overhead; reservations use the highest provider price",
             "retry_policy": "each provider runs a request once (Cloudflare: cf-aig-max-attempts: 1); the client sends again only after a response that means the request was not run (429, 529, 402, 401, 403), or after a connection that failed before the request was sent, per rate_limit_policy and provider_chain_policy, at most 8 sends per attempt",
             "rate_limit_policy": "HTTP 429 or 529 releases the reservation, because the provider did not run the request, and cools that provider for every search on the host for Retry-After (1 to 90 s); the call moves to the next available provider at once; a hedge does not wait",
-            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; a connection that fails before the request is sent (name resolution, TCP, a proxy tunnel, or the TLS handshake) releases the reservation and cools the provider, and the call moves on only when another provider is usable at once; other transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
+            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; a connection that fails before the request is sent (name resolution, TCP, a proxy tunnel, or the TLS handshake) releases the reservation and cools the provider, and the call moves on only when another provider is usable at once; a request refused locally before the send point (a request limit or a URL rule) releases the reservation and fails the call, and no provider cools; other transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
             "hedge_policy": "a call unanswered jev_hedge_ms after its request is sent gets one identical hedge request when the budget has room without waiting; the first valid answer wins, so a failed attempt lets the other decide; the cancelled request is charged the winner's input tokens",
             "unresolved_usage_policy": "retain the full reservation of any sent attempt without a valid usage receipt; no automatic retry; stop new reservations after 3 consecutive unresolved attempts; a call refused after the stop reserves nothing, and its item is reported as not assessed after stop",
             "network_check_policy": format!("once, before the first reservation: {NETWORK_CHECK_SCOPE} The wait ends when one provider is reachable; a provider whose check failed by then is not used in this run; when every check fails, nothing is reserved"),
@@ -1478,7 +1478,8 @@ impl JevClient {
     }
 
     /// One paid attempt of a call. An error without a usage receipt retains the full reservation,
-    /// unless the connection failed before the request was sent. Three retained errors in a row
+    /// unless the request provably was not sent: a local refusal before the send point, or a
+    /// connection that failed before the request was written. Three retained errors in a row
     /// open the unresolved-usage circuit (`retain_unresolved`). A hedge attempt (`attempt > 0`)
     /// never waits for budget room.
     async fn attempt(&self, call: &Call<'_>, attempt: u32) -> Result<Attempted> {
@@ -1574,6 +1575,7 @@ impl JevClient {
                 "attempt":attempt,"request":body,"state":"reserved","reservation_usd":reservation as f64/NANOS_PER_USD,
                 "usage":self.usage(),"time_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()});
             self.write_audit(&audit_name, &trace)?;
+            let sending = std::sync::atomic::AtomicBool::new(false);
             let response = match self
                 .http
                 .request_body_recorded_elsewhere(
@@ -1584,6 +1586,7 @@ impl JevClient {
                     crate::http::SendGate {
                         stop: Some(&stop),
                         notify: (attempt == 0).then_some(&call.sent),
+                        sending: Some(&sending),
                     },
                 )
                 .await
@@ -1601,6 +1604,23 @@ impl JevClient {
                         bail!("The hedge was not sent");
                     }
                     continue;
+                }
+                Err(error) if !sending.load(std::sync::atomic::Ordering::SeqCst) => {
+                    // Refused or failed locally before the send point, for example at a request
+                    // limit or a URL rule. Nothing left this process. Another provider would meet
+                    // the same refusal, and this provider is not at fault, so nothing cools.
+                    self.release_unrun(reservation, attempt > 0, false);
+                    trace["state"] = json!("refused_before_send");
+                    trace["accounting"] = json!(
+                        "Reservation released; the request was refused locally and not sent."
+                    );
+                    let path = self.write_audit(&audit_name, &trace)?;
+                    pending.finished = true;
+                    return Err(CallFailure {
+                        cause: crate::http::TransportCause::Other.as_str().to_owned(),
+                        message: format!("Jev request was refused before it was sent ({error}); the reservation was released. Audit: {path}"),
+                    }
+                    .into());
                 }
                 Err(error) => {
                     let failure = error.downcast_ref::<crate::http::TransportFailure>();
@@ -4042,6 +4062,50 @@ mod tests {
             connections.load(std::sync::atomic::Ordering::SeqCst) as u32,
             calls
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_before_sending_releases_its_reservation_and_never_stops() {
+        let (url, connections) = hanging_up_server().await;
+        // A recorder in fixture mode refuses every request; a recorder without loopback
+        // permission refuses the plain-HTTP URL. Both refusals come before the send point.
+        for (fixture, refusal) in [
+            (true, "Network requests are forbidden in fixture mode"),
+            (false, "Request URL must use HTTPS"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = RunConfig {
+                output_dir: dir.path().to_path_buf(),
+                budget_usd: 1.0,
+                ..RunConfig::default()
+            };
+            let mut client = JevClient::loopback_for_test(&config, url.clone()).unwrap();
+            client.http = HttpRecorder::new(dir.path(), &RunConfig { fixture, ..config }).unwrap();
+            let calls = UNRESOLVED_STOP_AFTER + 1;
+            for _ in 0..calls {
+                let error = evaluate_one(&client).await.unwrap_err();
+                assert_eq!(failure_cause(&error), Some("other"));
+                assert!(!not_assessed_after_stop(&error));
+                let text = error.to_string();
+                assert!(
+                    text.starts_with(&format!("Jev request was refused before it was sent ({refusal}); the reservation was released.")),
+                    "{text}"
+                );
+            }
+            assert!(client.spending_stop_reason().is_none());
+            let usage = client.usage();
+            assert_eq!((usage.requests, usage.cost_usd), (0, 0.0));
+            let ledger = client.ledger.lock().unwrap();
+            assert_eq!(ledger.accounted_nanos, 0);
+            assert_eq!((ledger.in_flight, ledger.consecutive_unresolved), (0, 0));
+            assert!(!ledger.unresolved_usage);
+            drop(ledger);
+            assert_eq!(
+                traces_in_state(dir.path(), "refused_before_send").len() as u32,
+                calls
+            );
+        }
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -471,10 +471,13 @@ struct RequestLimits {
 
 /// What a request does once it holds its concurrency permit: first `stop` may cancel it (the
 /// request then fails with `NotSent`), then `notify` learns that it is about to be sent.
+/// `sending` is set just before the built request goes to the HTTP client. An error while it is
+/// still unset is a local refusal or failure, and nothing was sent.
 #[derive(Clone, Copy, Default)]
 pub struct SendGate<'a> {
     pub stop: Option<&'a (dyn Fn() -> bool + Sync)>,
     pub notify: Option<&'a tokio::sync::Notify>,
+    pub sending: Option<&'a AtomicBool>,
 }
 
 /// The request was stopped before anything was sent.
@@ -1153,8 +1156,8 @@ impl HttpRecorder {
             None,
             true,
             SendGate {
-                stop: None,
                 notify: Some(&sent),
+                ..SendGate::default()
             },
         );
         tokio::pin!(first);
@@ -1212,7 +1215,7 @@ impl HttpRecorder {
             true,
             SendGate {
                 stop: Some(&take),
-                notify: None,
+                ..SendGate::default()
             },
         );
         tokio::pin!(second);
@@ -1496,21 +1499,35 @@ impl HttpRecorder {
             if let Some(body) = body {
                 request = request.json(&body);
             }
-            let response = request.send().await.map_err(|e| -> anyhow::Error {
-                let e = e.without_url();
-                if self.public.is_none() {
-                    return TransportFailure::new(&e, format!("HTTP request failed: {e}")).into();
-                }
-                let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&e);
-                while let Some(error) = cause {
-                    if let Some(answer) = error.downcast_ref::<NonPublicAnswer>() {
-                        return Refused(format!("{answer}; nothing was sent")).into();
-                    }
-                    cause = error.source();
-                }
-                TransportFailure::new(&e, format!("HTTP request failed: {}", error_chain(&e)))
-                    .into()
+            let request = request.build().map_err(|e| {
+                anyhow::anyhow!(
+                    "HTTP request could not be built: {}",
+                    error_chain(&e.without_url())
+                )
             })?;
+            if let Some(sending) = gate.sending {
+                sending.store(true, Ordering::SeqCst);
+            }
+            let response = self
+                .client
+                .execute(request)
+                .await
+                .map_err(|e| -> anyhow::Error {
+                    let e = e.without_url();
+                    if self.public.is_none() {
+                        return TransportFailure::new(&e, format!("HTTP request failed: {e}"))
+                            .into();
+                    }
+                    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+                    while let Some(error) = cause {
+                        if let Some(answer) = error.downcast_ref::<NonPublicAnswer>() {
+                            return Refused(format!("{answer}; nothing was sent")).into();
+                        }
+                        cause = error.source();
+                    }
+                    TransportFailure::new(&e, format!("HTTP request failed: {}", error_chain(&e)))
+                        .into()
+                })?;
             let peer = response.remote_addr();
             let status = response.status().as_u16();
             record.metadata["status"] = json!(status);
