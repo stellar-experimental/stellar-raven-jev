@@ -1634,17 +1634,19 @@ impl JevClient {
                         .rate_limit_wait
                         .map_or(wait, |w| w.min(wait))
                         .min(remaining);
-                    self.ledger
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .usage
-                        .provider_wait_ms += wait.as_millis() as u64;
-                    // A client that goes offline meanwhile ends the wait at once.
+                    // A client that goes offline meanwhile ends the wait at once, so the usage
+                    // counts the time waited, not the time planned.
+                    let started = std::time::Instant::now();
                     let mut offline = self.offline.subscribe();
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {}
                         _ = offline.wait_for(Option::is_some) => {}
                     }
+                    self.ledger
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .usage
+                        .provider_wait_ms += started.elapsed().as_millis() as u64;
                     continue;
                 }
             };
@@ -4481,6 +4483,36 @@ mod tests {
         assert!(client.usage().provider_wait_ms > 0);
         assert_eq!(client.usage().requests, 0);
         assert_eq!(network_check_rounds(dir.path()), [1]);
+    }
+
+    #[tokio::test]
+    async fn a_wait_ended_by_the_offline_state_counts_only_the_time_waited() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first call fails to connect at once and starts a network check of one 1 s round,
+        // which fails. The second call starts at 300 ms, while the provider cools for 3 s, so it
+        // plans to wait the rest of the cooldown (about 2.7 s). The failed check ends that wait
+        // after about 0.7 s.
+        let dns = FlakyDns::slow_after_first(usize::MAX, Duration::from_secs(1));
+        let mut client =
+            resolving_client(dir.path(), dns, &["http://fernlet.test:9/evaluate".into()]);
+        client.rate_limit_wait = Some(Duration::from_secs(3));
+        client.recheck_window = Duration::from_millis(500);
+        let first = evaluate_one(&client);
+        let second = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let started = std::time::Instant::now();
+            (evaluate_one(&client).await, started.elapsed())
+        };
+        let (first, (second, elapsed)) = tokio::join!(first, second);
+        assert!(first.is_err() && second.is_err());
+        assert!(client.offline.borrow().is_some());
+        let waited = client.usage().provider_wait_ms;
+        assert!(waited > 0);
+        assert!(
+            waited <= elapsed.as_millis() as u64,
+            "{waited} > {elapsed:?}"
+        );
+        assert!(waited < 2_000, "{waited} ms counts the planned wait");
     }
 
     #[tokio::test]
