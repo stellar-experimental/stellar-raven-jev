@@ -333,6 +333,13 @@ pub struct JevClient {
     record: bool,
     /// The network check's outcome. It runs once, before the first reservation.
     network: tokio::sync::OnceCell<NetworkCheck>,
+    /// Set when a network check after a connect failure found no reachable provider. Every later
+    /// call fails with it at once, and nothing is reserved. Calls that wait for a provider wake.
+    offline: tokio::sync::watch::Sender<Option<CallFailure>>,
+    /// One network check after connect failures at a time, shared by the calls that wait for it.
+    recheck: tokio::sync::Mutex<()>,
+    /// Network checks run after connect failures so far.
+    rechecks: std::sync::atomic::AtomicU64,
 }
 
 impl JevClient {
@@ -405,6 +412,9 @@ impl JevClient {
             rate_limit_wait: None,
             batch: config.jev_batch,
             network: tokio::sync::OnceCell::new(),
+            offline: tokio::sync::watch::Sender::new(None),
+            recheck: tokio::sync::Mutex::new(()),
+            rechecks: std::sync::atomic::AtomicU64::new(0),
         };
         client.write_audit("accounting-policy", &json!({
             "providers": client.chain().iter().map(|b| b.name()).collect::<Vec<_>>(),
@@ -417,10 +427,10 @@ impl JevClient {
             "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and each provider's credit purchase overhead; reservations use the highest provider price",
             "retry_policy": "each provider runs a request once (Cloudflare: cf-aig-max-attempts: 1); the client sends again only after a response that means the request was not run (429, 529, 402, 401, 403), or after a connection that failed before the request was sent, per rate_limit_policy and provider_chain_policy, at most 8 sends per attempt",
             "rate_limit_policy": "HTTP 429 or 529 releases the reservation, because the provider did not run the request, and cools that provider for every search on the host for Retry-After (1 to 90 s); the call moves to the next available provider at once; a hedge does not wait",
-            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; a connection that fails before the request is sent (name resolution, TCP, a proxy tunnel, or the TLS handshake) releases the reservation and cools the provider, and the call moves on only when another provider is usable at once; a request refused locally before the send point (a request limit or a URL rule) releases the reservation and fails the call, and no provider cools; other transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
+            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; a connection that fails before the request is sent (name resolution, TCP, a proxy tunnel, or the TLS handshake) releases the reservation and cools the provider, and the call moves on only when another provider is usable at once; otherwise the call fails and the network check runs again (see network_check_policy); a request refused locally before the send point (a request limit or a URL rule) releases the reservation and fails the call, and no provider cools; other transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
             "hedge_policy": "a call unanswered jev_hedge_ms after its request is sent gets one identical hedge request when the budget has room without waiting; the first valid answer wins, so a failed attempt lets the other decide; the cancelled request is charged the winner's input tokens",
             "unresolved_usage_policy": "retain the full reservation of any sent attempt without a valid usage receipt; no automatic retry; stop new reservations after 3 consecutive unresolved attempts; a call refused after the stop reserves nothing, and its item is reported as not assessed after stop",
-            "network_check_policy": format!("once, before the first reservation: {NETWORK_CHECK_SCOPE} The wait ends when one provider is reachable; a provider whose check failed by then is not used in this run; when every check fails, nothing is reserved"),
+            "network_check_policy": format!("once, before the first reservation: {NETWORK_CHECK_SCOPE} The wait ends when one provider is reachable; a provider whose check failed by then is not used in this run; when every check fails, nothing is reserved. It runs again on the enabled providers when a connect failure leaves no provider usable, once for the calls at that moment; when every provider fails it, every later call fails at once and nothing is reserved; when one passes, nothing changes"),
             "token_guard": "UTF-8 byte limits are local guards, not a verified provider tokenizer",
             "retrieved_pricing_date": "2026-09-21"
         }))?;
@@ -997,13 +1007,74 @@ impl JevClient {
             .any(|(i, s)| i != provider && !s.disabled)
     }
 
-    /// Run the free network check once, before the first reservation: probe every provider at
-    /// once (see `crate::http::HttpRecorder::probe`) and stop waiting when one is reachable. A
-    /// provider whose probe failed by then is not used in this run; a pending one stays in use.
-    /// When every probe fails, this and every later call fail with the first provider's cause
-    /// class, and nothing is reserved.
-    pub async fn check_network(&self) -> Result<()> {
+    /// Probe `providers` at once (see `crate::http::HttpRecorder::probe`) and stop waiting when one
+    /// is reachable. Returns the finished probes in chain order, and records them with `reason`.
+    async fn probe_until_reachable(
+        &self,
+        providers: &[usize],
+        reason: &str,
+    ) -> Vec<(usize, crate::http::ProbeResult)> {
         use futures::StreamExt;
+        let chain = self.chain();
+        let mut probes: futures::stream::FuturesUnordered<_> = providers
+            .iter()
+            .map(|&provider| async move {
+                let origin = self.chain()[provider].origin().unwrap_or_default();
+                (provider, self.http.probe(&origin).await)
+            })
+            .collect();
+        let mut finished = Vec::new();
+        while let Some((provider, result)) = probes.next().await {
+            let reachable = result.is_ok();
+            finished.push((provider, result));
+            if reachable {
+                break;
+            }
+        }
+        drop(probes);
+        finished.sort_by_key(|(provider, _)| *provider);
+        let results: Vec<(String, crate::http::ProbeResult)> = finished
+            .iter()
+            .map(|(provider, result)| (chain[*provider].name().to_owned(), *result))
+            .collect();
+        // Nothing is reserved during a check, so a lost record here does not stop the client.
+        let _ = self.write_audit(
+            &format!("network-check-{}", uuid::Uuid::new_v4()),
+            &json!({"providers":probe_rows(&results),"scope":NETWORK_CHECK_SCOPE,"reason":reason,
+                "waited_for":"the first reachable provider; unlisted providers were not waited for"}),
+        );
+        finished
+    }
+
+    /// The failure of a network check that found no reachable provider. `failed` lists every
+    /// checked provider in chain order; the first one's class is the cause.
+    fn no_reachable_provider(
+        failed: &[(&'static str, crate::http::TransportCause)],
+        check: &str,
+    ) -> CallFailure {
+        let each: Vec<String> = failed
+            .iter()
+            .map(|(name, cause)| format!("{name}: {cause}"))
+            .collect();
+        CallFailure {
+            cause: failed
+                .first()
+                .map_or(crate::http::TransportCause::Other, |(_, cause)| *cause)
+                .as_str()
+                .to_owned(),
+            message: format!(
+                "{check} found no reachable provider ({}); nothing was reserved",
+                each.join(", ")
+            ),
+        }
+    }
+
+    /// Run the free network check once, before the first reservation: probe every provider at
+    /// once and stop waiting when one is reachable. A provider whose probe failed by then is not
+    /// used in this run; a pending one stays in use. When every probe fails, this and every later
+    /// call fail with the first provider's cause class, and nothing is reserved. After a failed
+    /// check following a connect failure (see `recheck_network`), every call fails the same way.
+    pub async fn check_network(&self) -> Result<()> {
         let outcome = self
             .network
             .get_or_init(|| async {
@@ -1011,34 +1082,10 @@ impl JevClient {
                     return NetworkCheck::default();
                 }
                 let chain = self.chain();
-                let mut probes: futures::stream::FuturesUnordered<_> = chain
-                    .iter()
-                    .enumerate()
-                    .map(|(provider, backend)| async move {
-                        let origin = backend.origin().unwrap_or_default();
-                        (provider, self.http.probe(&origin).await)
-                    })
-                    .collect();
-                let mut finished = Vec::new();
-                while let Some((provider, result)) = probes.next().await {
-                    let reachable = result.is_ok();
-                    finished.push((provider, result));
-                    if reachable {
-                        break;
-                    }
-                }
-                drop(probes);
-                finished.sort_by_key(|(provider, _)| *provider);
-                let results: Vec<(String, crate::http::ProbeResult)> = finished
-                    .iter()
-                    .map(|(provider, result)| (chain[*provider].name().to_owned(), *result))
-                    .collect();
-                // Nothing was reserved, so a lost record here does not stop the client.
-                let _ = self.write_audit(
-                    &format!("network-check-{}", uuid::Uuid::new_v4()),
-                    &json!({"providers":probe_rows(&results),"scope":NETWORK_CHECK_SCOPE,
-                        "waited_for":"the first reachable provider; unlisted providers were not waited for"}),
-                );
+                let every: Vec<usize> = (0..chain.len()).collect();
+                let finished = self
+                    .probe_until_reachable(&every, "before the first reservation")
+                    .await;
                 let mut skipped = Vec::new();
                 for (provider, result) in &finished {
                     if let Err(cause) = result {
@@ -1046,37 +1093,58 @@ impl JevClient {
                         skipped.push((chain[*provider].name(), *cause));
                     }
                 }
-                if skipped.len() < finished.len() {
-                    return NetworkCheck {
-                        skipped,
-                        failure: None,
-                    };
-                }
-                // Every probe failed, so every provider is listed, in chain order.
-                let each: Vec<String> = skipped
-                    .iter()
-                    .map(|(name, cause)| format!("{name}: {cause}"))
-                    .collect();
-                let failure = CallFailure {
-                    cause: skipped
-                        .first()
-                        .map_or(crate::http::TransportCause::Other, |(_, cause)| *cause)
-                        .as_str()
-                        .to_owned(),
-                    message: format!(
-                        "The Jev network check found no reachable provider ({}); nothing was reserved",
-                        each.join(", ")
-                    ),
-                };
-                NetworkCheck {
-                    skipped,
-                    failure: Some(failure),
-                }
+                // The wait ends only at a reachable provider, so when every finished probe failed,
+                // every provider is listed.
+                let failure = (skipped.len() == finished.len())
+                    .then(|| Self::no_reachable_provider(&skipped, "The Jev network check"));
+                NetworkCheck { skipped, failure }
             })
             .await;
-        match &outcome.failure {
-            Some(failure) => Err(failure.clone().into()),
-            None => Ok(()),
+        if let Some(failure) = &outcome.failure {
+            return Err(failure.clone().into());
+        }
+        if let Some(failure) = self.offline.borrow().clone() {
+            return Err(failure.into());
+        }
+        Ok(())
+    }
+
+    /// After a connect failure left no provider usable: run the free network check again on the
+    /// enabled providers. `seen` is the count of these checks when the failed request started; a
+    /// check that finished since then stands, so concurrent calls share one. When every provider
+    /// fails it, the client goes offline (see `offline`). When one passes, nothing changes.
+    async fn recheck_network(&self, seen: u64) {
+        use std::sync::atomic::Ordering;
+        let _one = self.recheck.lock().await;
+        if self.rechecks.load(Ordering::SeqCst) > seen || self.offline.borrow().is_some() {
+            return;
+        }
+        let enabled: Vec<usize> = self
+            .providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| !state.disabled)
+            .map(|(provider, _)| provider)
+            .collect();
+        let finished = self
+            .probe_until_reachable(&enabled, "a connect failure left no provider usable")
+            .await;
+        self.rechecks.fetch_add(1, Ordering::SeqCst);
+        let failed: Vec<(&'static str, crate::http::TransportCause)> = finished
+            .iter()
+            .filter_map(|(provider, result)| {
+                result
+                    .err()
+                    .map(|cause| (self.chain()[*provider].name(), cause))
+            })
+            .collect();
+        if !finished.is_empty() && failed.len() == finished.len() {
+            self.offline.send_replace(Some(Self::no_reachable_provider(
+                &failed,
+                "The Jev network check after a connect failure",
+            )));
         }
     }
 
@@ -1483,12 +1551,13 @@ impl JevClient {
     /// open the unresolved-usage circuit (`retain_unresolved`). A hedge attempt (`attempt > 0`)
     /// never waits for budget room.
     async fn attempt(&self, call: &Call<'_>, attempt: u32) -> Result<Attempted> {
-        self.check_network().await?;
         let (expected, context) = (call.expected, call.context);
         let mut wait_deadline: Option<std::time::Instant> = None;
         let mut tries = 0u32;
         let mut refusals = 0u32;
         loop {
+            // Before each reservation: a failed network check ends the call here.
+            self.check_network().await?;
             // Every refusal moves a provider to cooling or disabled, but responses can outlast
             // short cooldowns, so the number of refused sends per attempt has its own bound.
             ensure!(
@@ -1529,7 +1598,12 @@ impl JevClient {
                         .unwrap_or_else(|e| e.into_inner())
                         .usage
                         .provider_wait_ms += wait.as_millis() as u64;
-                    tokio::time::sleep(wait).await;
+                    // A client that goes offline meanwhile ends the wait at once.
+                    let mut offline = self.offline.subscribe();
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = offline.wait_for(Option::is_some) => {}
+                    }
                     continue;
                 }
             };
@@ -1542,7 +1616,8 @@ impl JevClient {
             // Decided once the request holds its permit: the provider may have been cooled,
             // disabled, or spent by another call while this one waited.
             let stop = || {
-                (attempt > 0 && call.rate_limited.load(std::sync::atomic::Ordering::SeqCst))
+                self.offline.borrow().is_some()
+                    || (attempt > 0 && call.rate_limited.load(std::sync::atomic::Ordering::SeqCst))
                     || !self.send_now(provider)
             };
             let reservation = if attempt == 0 {
@@ -1576,6 +1651,7 @@ impl JevClient {
                 "usage":self.usage(),"time_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()});
             self.write_audit(&audit_name, &trace)?;
             let sending = std::sync::atomic::AtomicBool::new(false);
+            let rechecks = self.rechecks.load(std::sync::atomic::Ordering::SeqCst);
             let response = match self
                 .http
                 .request_body_recorded_elsewhere(
@@ -1607,8 +1683,9 @@ impl JevClient {
                 }
                 Err(error) if !sending.load(std::sync::atomic::Ordering::SeqCst) => {
                     // Refused or failed locally before the send point, for example at a request
-                    // limit or a URL rule. Nothing left this process. Another provider would meet
-                    // the same refusal, and this provider is not at fault, so nothing cools.
+                    // limit or a URL rule. Nothing left this process. Provider settings that go
+                    // into headers are checked when the chain is built, so what fails here is not
+                    // the provider's fault: nothing cools, and no other provider is tried.
                     self.release_unrun(reservation, attempt > 0, false);
                     trace["state"] = json!("refused_before_send");
                     trace["accounting"] = json!(
@@ -1643,10 +1720,14 @@ impl JevClient {
                         );
                         let path = self.write_audit(&audit_name, &trace)?;
                         pending.finished = true;
-                        if attempt == 0
-                            && matches!(self.pick_provider(None)?, crate::governor::Send::Go(next) if next != provider)
-                        {
-                            continue;
+                        if attempt == 0 {
+                            if matches!(self.pick_provider(None)?, crate::governor::Send::Go(next) if next != provider)
+                            {
+                                continue;
+                            }
+                            // No provider is usable now. Check the network again: when every
+                            // provider still fails, later calls fail at once, and nothing waits.
+                            self.recheck_network(rechecks).await;
                         }
                         return Err(CallFailure {
                             cause: cause.as_str().to_owned(),
@@ -2154,13 +2235,30 @@ fn providers_from(
         .map(|name| match name.as_str() {
             "cloudflare" => cloudflare_from(&env, resolve.take().expect("one Cloudflare entry")),
             "typesafe" => Ok(Backend::TypeSafe {
-                key: env("TYPESAFE_AI_API_KEY").unwrap_or_default(),
+                key: header_setting(
+                    "TYPESAFE_AI_API_KEY",
+                    env("TYPESAFE_AI_API_KEY").unwrap_or_default(),
+                )?,
             }),
             _ => Ok(Backend::OpenRouter {
-                key: env("OPENROUTER_API_KEY").unwrap_or_default(),
+                key: header_setting(
+                    "OPENROUTER_API_KEY",
+                    env("OPENROUTER_API_KEY").unwrap_or_default(),
+                )?,
             }),
         })
         .collect()
+}
+
+/// A setting that each request sends in an HTTP header. A value that cannot be a header value, for
+/// example one with a line break, fails here by name, so it never fails a paid call at send time.
+/// The error never shows the value.
+fn header_setting(name: &str, value: String) -> Result<String> {
+    ensure!(
+        reqwest::header::HeaderValue::from_str(&value).is_ok(),
+        "{name} cannot be sent in an HTTP header: remove line breaks and other control characters"
+    );
+    Ok(value)
 }
 
 /// The provider chain's names in order, from configuration alone. Starts nothing and sends
@@ -2225,7 +2323,10 @@ fn cloudflare_from(
             env("JEV_CLOUDFLARE_AUTH_PROFILE"),
             resolve,
         )?,
-        gateway: env("JEV_GATEWAY_ID").unwrap_or_else(|| "default".into()),
+        gateway: header_setting(
+            "JEV_GATEWAY_ID",
+            env("JEV_GATEWAY_ID").unwrap_or_else(|| "default".into()),
+        )?,
     })
 }
 
@@ -2235,7 +2336,7 @@ fn cloudflare_token(
     resolve: impl FnOnce(&str) -> Result<String>,
 ) -> Result<String> {
     if let Some(token) = token {
-        return Ok(token);
+        return header_setting("CLOUDFLARE_API_TOKEN", token);
     }
     let profile = profile.context(
         "Missing CLOUDFLARE_API_TOKEN or JEV_CLOUDFLARE_AUTH_PROFILE for Cloudflare authentication",
@@ -2249,7 +2350,10 @@ fn cloudflare_token(
             && !profile.starts_with('-'),
         "JEV_CLOUDFLARE_AUTH_PROFILE has an invalid format"
     );
-    resolve(&profile)
+    header_setting(
+        "The Cloudflare token of JEV_CLOUDFLARE_AUTH_PROFILE",
+        resolve(&profile)?,
+    )
 }
 
 fn parse_wrangler_oauth(bytes: &[u8]) -> Result<String> {
@@ -3787,6 +3891,53 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_setting_that_cannot_be_a_header_fails_at_startup_by_name() {
+        let env = |pairs: Vec<(&'static str, &'static str)>| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let account = ("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef");
+        let bad = "fernlet\nsecret";
+        for (setting, pairs) in [
+            ("TYPESAFE_AI_API_KEY", vec![("TYPESAFE_AI_API_KEY", bad)]),
+            ("OPENROUTER_API_KEY", vec![("OPENROUTER_API_KEY", bad)]),
+            (
+                "CLOUDFLARE_API_TOKEN",
+                vec![account, ("CLOUDFLARE_API_TOKEN", bad)],
+            ),
+            (
+                "JEV_GATEWAY_ID",
+                vec![
+                    account,
+                    ("CLOUDFLARE_API_TOKEN", "t"),
+                    ("JEV_GATEWAY_ID", bad),
+                ],
+            ),
+        ] {
+            let text = providers_from(env(pairs), |_: &str| -> Result<String> {
+                panic!("static token needs no profile")
+            })
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_else(|| panic!("{setting} was accepted"));
+            assert!(text.starts_with(setting), "{text}");
+            assert!(!text.contains("fernlet"), "{text}");
+        }
+        // A token from a profile is checked the same way.
+        let profile = env(vec![account, ("JEV_CLOUDFLARE_AUTH_PROFILE", "fernlet")]);
+        let text = providers_from(profile, |_: &str| Ok(bad.to_owned()))
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap();
+        assert!(text.contains("JEV_CLOUDFLARE_AUTH_PROFILE"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+    }
+
+    #[test]
     fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |key: &str| {
@@ -3999,6 +4150,21 @@ mod tests {
             .collect()
     }
 
+    /// Saved network check records.
+    fn network_checks(dir: &Path) -> usize {
+        std::fs::read_dir(dir.join("jev"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("network-check-")
+            })
+            .count()
+    }
+
     #[tokio::test]
     async fn a_connection_that_fails_before_sending_releases_its_reservation_and_never_stops() {
         let refused_dir = tempfile::tempdir().unwrap();
@@ -4025,17 +4191,24 @@ mod tests {
             (denied, denied_dir.path(), "connect_denied"),
         ] {
             client.rate_limit_wait = Some(Duration::from_millis(20));
-            // More failed connections than the stop allows: none of them counts toward it.
-            for _ in 0..calls {
+            // The first call fails to connect. The network check that follows fails too, so the
+            // later calls fail at once with its cause, and none of them counts toward the stop.
+            let error = evaluate_one(&client).await.unwrap_err();
+            assert_eq!(failure_cause(&error), Some(cause));
+            let text = format!("{error:#}");
+            assert!(
+                text.starts_with(&format!("Jev could not connect ({cause}); the request was not sent, and its reservation was released.")),
+                "{text}"
+            );
+            assert!(!text.contains("offline-placeholder") && !text.contains("fernlet.test"));
+            for _ in 1..calls {
                 let error = evaluate_one(&client).await.unwrap_err();
                 assert_eq!(failure_cause(&error), Some(cause));
                 assert!(!not_assessed_after_stop(&error));
-                let text = format!("{error:#}");
-                assert!(
-                    text.starts_with(&format!("Jev could not connect ({cause}); the request was not sent, and its reservation was released.")),
-                    "{text}"
+                assert_eq!(
+                    error.to_string(),
+                    format!("The Jev network check after a connect failure found no reachable provider (loopback: {cause}); nothing was reserved")
                 );
-                assert!(!text.contains("offline-placeholder") && !text.contains("fernlet.test"));
             }
             assert!(client.spending_stop_reason().is_none());
             let usage = client.usage();
@@ -4046,22 +4219,258 @@ mod tests {
             assert!(!ledger.unresolved_usage && ledger.last_unresolved_cause.is_none());
             drop(ledger);
             let traces = traces_in_state(dir, "connect_failed");
-            assert_eq!(traces.len() as u32, calls);
-            for trace in &traces {
-                assert_eq!(trace["transport_cause"], cause);
-                assert!(trace["accounting"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("Reservation released"));
-                let text = trace.to_string();
-                assert!(!text.contains("offline-placeholder") && !text.contains("fernlet.test"));
-            }
+            assert_eq!(traces.len(), 1);
+            assert_eq!(traces[0]["transport_cause"], cause);
+            assert!(traces[0]["accounting"]
+                .as_str()
+                .unwrap()
+                .starts_with("Reservation released"));
+            let text = traces[0].to_string();
+            assert!(!text.contains("offline-placeholder") && !text.contains("fernlet.test"));
             assert!(traces_in_state(dir, "transport_error_or_incomplete_body").is_empty());
+            assert_eq!(network_checks(dir), 1);
         }
-        assert_eq!(
-            connections.load(std::sync::atomic::Ordering::SeqCst) as u32,
-            calls
+        // One tunnel for the paid attempt and one for the network check.
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Name resolution for offline tests: the first `failures` lookups fail, as in a network
+    /// outage, and later ones answer with the loopback address. Every lookup after the first
+    /// takes `later_delay`. It counts lookups.
+    struct FlakyDns {
+        failures: std::sync::atomic::AtomicUsize,
+        lookups: std::sync::atomic::AtomicUsize,
+        later_delay: Duration,
+    }
+
+    impl FlakyDns {
+        fn failing(failures: usize) -> Arc<Self> {
+            Self::slow_after_first(failures, Duration::ZERO)
+        }
+        fn slow_after_first(failures: usize, later_delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                failures: failures.into(),
+                lookups: 0.into(),
+                later_delay,
+            })
+        }
+    }
+
+    impl reqwest::dns::Resolve for FlakyDns {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            use std::sync::atomic::Ordering::SeqCst;
+            let delay = if self.lookups.fetch_add(1, SeqCst) == 0 {
+                Duration::ZERO
+            } else {
+                self.later_delay
+            };
+            let failed = self
+                .failures
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                if failed {
+                    return Err("no answer".into());
+                }
+                let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+                Ok(Box::new(std::iter::once(loopback)) as reqwest::dns::Addrs)
+            })
+        }
+    }
+
+    /// A client for providers at `urls` whose names resolve through `dns`.
+    fn resolving_client(dir: &Path, dns: Arc<FlakyDns>, urls: &[String]) -> JevClient {
+        let mut client = JevClient::loopback_for_test(
+            &RunConfig {
+                output_dir: dir.to_path_buf(),
+                budget_usd: 1.0,
+                timeout_secs: 5,
+                ..RunConfig::default()
+            },
+            urls[0].clone(),
+        )
+        .unwrap();
+        client.http = client.http.with_resolver_for_test(dns).unwrap();
+        client.fallbacks = urls[1..]
+            .iter()
+            .map(|url| Backend::Loopback {
+                url: url.clone(),
+                token: "offline-placeholder".into(),
+            })
+            .collect();
+        client.providers = Mutex::new(vec![ProviderState::default(); urls.len()]);
+        client
+    }
+
+    /// A Jev server that answers every connection with a valid response, and counts connections.
+    async fn answering_server() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut input = [0; 16384];
+                    let _ = socket.read(&mut input).await;
+                    let body = response().to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (port, count)
+    }
+
+    #[tokio::test]
+    async fn a_sustained_connect_outage_fails_later_calls_at_once_and_for_free() {
+        use futures::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dns = FlakyDns::failing(usize::MAX);
+        let mut client = resolving_client(
+            dir.path(),
+            dns.clone(),
+            &[
+                "http://fernlet.test:9/evaluate".into(),
+                "http://birch.fernlet.test:9/evaluate".into(),
+            ],
         );
+        // A cooldown far longer than the test may take: no call may wait it out.
+        client.rate_limit_wait = Some(Duration::from_secs(30));
+        let concurrency = 8;
+        let started = std::time::Instant::now();
+        let errors: Vec<anyhow::Error> = futures::stream::iter(0..concurrency * 5)
+            .map(|_| evaluate_one(&client))
+            .buffer_unordered(concurrency)
+            .map(|result| result.unwrap_err())
+            .collect()
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let offline = "The Jev network check after a connect failure found no reachable provider (loopback: dns, loopback: dns); nothing was reserved";
+        for error in &errors {
+            assert_eq!(failure_cause(error), Some("dns"));
+            assert!(!not_assessed_after_stop(error));
+        }
+        // Only calls of the first wave can end with their own connect failure.
+        let own = errors.iter().filter(|e| e.to_string() != offline).count();
+        assert!((1..=concurrency).contains(&own), "{own}");
+        // One shared network check, and nothing spent or kept.
+        assert_eq!(network_checks(dir.path()), 1);
+        assert!(client.spending_stop_reason().is_none());
+        let usage = client.usage();
+        assert_eq!((usage.requests, usage.cost_usd), (0, 0.0));
+        let ledger = client.ledger.lock().unwrap();
+        assert_eq!(ledger.accounted_nanos, 0);
+        assert_eq!((ledger.in_flight, ledger.consecutive_unresolved), (0, 0));
+        drop(ledger);
+        // Lookups: at most one per provider for each call of the first wave, and the check's.
+        let lookups = dns.lookups.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(lookups <= concurrency * 2 + 2, "{lookups}");
+    }
+
+    #[tokio::test]
+    async fn a_call_waiting_for_a_cooling_provider_ends_when_the_network_check_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first call fails to connect at once. The network check's lookup then takes 1 s
+        // and fails, so the second call starts while the provider cools and the check runs.
+        let dns = FlakyDns::slow_after_first(usize::MAX, Duration::from_secs(1));
+        let mut client =
+            resolving_client(dir.path(), dns, &["http://fernlet.test:9/evaluate".into()]);
+        client.rate_limit_wait = Some(Duration::from_secs(30));
+        let first = evaluate_one(&client);
+        let second = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let started = std::time::Instant::now();
+            (evaluate_one(&client).await, started.elapsed())
+        };
+        let (first, (second, waited)) = tokio::join!(first, second);
+        assert!(first
+            .unwrap_err()
+            .to_string()
+            .starts_with("Jev could not connect (dns);"));
+        // The second call waited only until the check failed (about 0.7 s), not for the cooldown
+        // or for one capped wait of it (5 s).
+        assert!(waited < Duration::from_secs(3), "{waited:?}");
+        assert_eq!(
+            second.unwrap_err().to_string(),
+            "The Jev network check after a connect failure found no reachable provider (loopback: dns); nothing was reserved"
+        );
+        assert!(client.usage().provider_wait_ms > 0);
+        assert_eq!(client.usage().requests, 0);
+    }
+
+    #[tokio::test]
+    async fn calls_succeed_again_when_the_network_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (port, connections) = answering_server().await;
+        // Only the first lookup fails: the network is back when the check runs.
+        let dns = FlakyDns::failing(1);
+        let mut client = resolving_client(
+            dir.path(),
+            dns,
+            &[format!("http://fernlet.test:{port}/evaluate")],
+        );
+        client.rate_limit_wait = Some(Duration::from_millis(50));
+        let error = ask(&client).await.unwrap_err();
+        assert_eq!(failure_cause(&error), Some("dns"));
+        assert!(error
+            .to_string()
+            .starts_with("Jev could not connect (dns);"));
+        // The check passed, so later calls wait out the short cooldown and succeed.
+        for _ in 0..3 {
+            assert_eq!(ask(&client).await.unwrap().0.len(), 2);
+        }
+        assert!(client.offline.borrow().is_none());
+        assert_eq!(network_checks(dir.path()), 1);
+        // The check and the three answered calls.
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert!(client.spending_stop_reason().is_none());
+        assert_eq!(client.usage().requests, 3);
+        let ledger = client.ledger.lock().unwrap();
+        assert_eq!(
+            ledger.accounted_nanos,
+            3 * client.backend.cost_nanos(100).unwrap()
+        );
+        assert_eq!((ledger.in_flight, ledger.consecutive_unresolved), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_hedge_that_cannot_connect_releases_its_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first provider answers after 400 ms. The hedge starts at 100 ms and goes to the
+        // second provider, which refuses the connection.
+        let (url, server) = scripted_server(vec![(400, "200 OK", response().to_string())]).await;
+        let mut client = two_provider_client(dir.path(), url, refusing_url());
+        client.hedge_after = Some(Duration::from_millis(100));
+        let (answers, _) = ask(&client).await.unwrap();
+        assert_eq!(answers.len(), 2);
+        server.await.unwrap();
+        let usage = client.usage();
+        assert_eq!((usage.requests, usage.hedged_requests), (1, 0));
+        let ledger = client.ledger.lock().unwrap();
+        assert_eq!(
+            ledger.accounted_nanos,
+            client.backend.cost_nanos(100).unwrap(),
+            "only the answered request costs"
+        );
+        assert_eq!((ledger.in_flight, ledger.consecutive_unresolved), (0, 0));
+        drop(ledger);
+        let failed = traces_in_state(dir.path(), "connect_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["attempt"], 1);
+        assert_eq!(failed[0]["transport_cause"], "connect_refused");
+        assert!(client.spending_stop_reason().is_none());
     }
 
     #[tokio::test]

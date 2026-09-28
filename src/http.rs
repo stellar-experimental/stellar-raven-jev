@@ -610,7 +610,8 @@ pub struct TransportFailure {
     /// The connection failed before the request was written, so the host received no request
     /// bytes. `reqwest` marks only failures of the connect phase this way: name resolution, the
     /// TCP connection, a proxy tunnel, and the TLS handshake. The class does not decide this; a
-    /// timeout or a closed connection can also come before the request.
+    /// closed connection can also come before the request. A connection still not open at the
+    /// request time limit is not marked, because that limit is not a connect-phase error.
     pub unsent: bool,
     text: String,
 }
@@ -1004,15 +1005,24 @@ impl HttpRecorder {
                 Box::pin(async { Err("no answer".into()) })
             }
         }
+        self.with_resolver_for_test(Arc::new(NoAnswer))
+    }
+
+    /// Offline tests only: requests and network checks resolve names through `resolver`.
+    #[cfg(test)]
+    pub(crate) fn with_resolver_for_test<R: reqwest::dns::Resolve + 'static>(
+        &self,
+        resolver: Arc<R>,
+    ) -> Result<Self> {
         let mut clone = self.clone();
         clone.client = source_client(&self.config, false)
             .no_proxy()
-            .dns_resolver(Arc::new(NoAnswer))
+            .dns_resolver(resolver.clone())
             .build()?;
         clone.probe_client = probe_client(
             source_client(&self.config, true)
                 .no_proxy()
-                .dns_resolver(Arc::new(NoAnswer)),
+                .dns_resolver(resolver),
         )?;
         Ok(clone)
     }
