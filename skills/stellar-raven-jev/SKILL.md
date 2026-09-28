@@ -20,6 +20,7 @@ stellar-raven-jev doctor
 ```
 
 `doctor` checks local settings without network requests. It does not validate remote authentication.
+`doctor --network` also sends one free request to each Jev provider. A pass does not guarantee that paid calls succeed.
 If the binary or required settings are missing, report the missing prerequisite.
 Use an existing absolute `JEV_ENV_FILE` or `--env-file` outside the configured project.
 Keep credential values out of output.
@@ -56,6 +57,8 @@ Exit 2 indicates partial results. Inspect the reports and `load` before using th
 Exit 3 indicates `busy`. Inspect its reported usage; routing can spend money before source admission fails.
 Respect `retry_after_ms` and the task's time and spending limits before retrying.
 For other errors, inspect the error before another call. Repeated calls do not repair missing settings.
+A `network_check` report, or a `load.jev_failure_causes` class such as `dns` or `connect_denied`, shows missing network access.
+Report the missing access. Repeated calls do not repair it.
 
 ## Saved sessions and evaluation
 

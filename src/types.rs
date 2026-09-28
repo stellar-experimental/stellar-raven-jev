@@ -26,6 +26,11 @@ pub struct Failure {
     pub stage: String,
     pub source_id: Option<String>,
     pub message: String,
+    /// For a failed Jev call, a class that names no URL, header, credential, or body: a transport
+    /// class (`dns`, `connect_refused`, `connect_denied`, `unreachable`, `connect`, `tls`,
+    /// `timeout`, `connection_closed`, `other`), `http_NNN`, or `invalid_response`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

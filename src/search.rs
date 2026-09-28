@@ -230,6 +230,7 @@ const LOSS_STAGES: &[&str] = &[
     "document_limit",
     "document_score",
     "currentness",
+    crate::pipeline::NOT_ASSESSED_AFTER_STOP,
     "original_lost",
 ];
 
@@ -247,6 +248,10 @@ fn load_summary(failures: &[Failure], usage: &crate::types::Usage, counters: &Va
         .count();
     let fallback = count("search_limit");
     let refused = counter("source_rate_limited_requests");
+    let mut causes: BTreeMap<&str, usize> = BTreeMap::new();
+    for cause in failures.iter().filter_map(|f| f.cause.as_deref()) {
+        *causes.entry(cause).or_default() += 1;
+    }
     json!({
         "degraded": lost + fallback > 0 || refused > 0,
         "lost_evidence_reports": lost,
@@ -267,6 +272,8 @@ fn load_summary(failures: &[Failure], usage: &crate::types::Usage, counters: &Va
         "original_reads": counters["original_reads"],
         "scoring_failures": count("document_score"),
         "currentness_failures": count("currentness"),
+        "not_assessed_after_stop": count(crate::pipeline::NOT_ASSESSED_AFTER_STOP),
+        "jev_failure_causes": causes,
         "jev_rate_limited_requests": usage.rate_limited_requests,
         "jev_wait_ms": usage.provider_wait_ms,
     })
@@ -281,6 +288,7 @@ mod load_tests {
             stage: stage.into(),
             source_id: Some("s".into()),
             message: "m".into(),
+            cause: None,
         }
     }
 
@@ -314,6 +322,7 @@ mod load_tests {
             "document_limit",
             "original_lost",
             "currentness",
+            "not_assessed_after_stop",
             "host_state",
         ] {
             let load = load_summary(&[report(loss)], &usage, &Value::Null);

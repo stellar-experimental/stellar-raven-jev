@@ -382,3 +382,85 @@ fn a_bundle_holds_the_full_text_of_each_shown_result_in_rank_order() {
     // The light record keeps the bundle with the session.
     assert!(std::path::Path::new(compact["bundle_path"].as_str().unwrap()).is_file());
 }
+
+/// A local proxy that refuses every tunnel, as a restricted network does. Returns its URL.
+fn denying_proxy() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = [0; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+            );
+        }
+    });
+    url
+}
+
+/// The CLI with one live provider and a placeholder key, whose every request meets `proxy`. No
+/// request leaves this host.
+fn behind(proxy: &str) -> Command {
+    let mut command = cli();
+    for name in [
+        "NO_PROXY",
+        "no_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        command.env_remove(name);
+    }
+    command
+        .env("HTTPS_PROXY", proxy)
+        .env("https_proxy", proxy)
+        .env("JEV_PROVIDERS", "openrouter")
+        .env("OPENROUTER_API_KEY", "offline-placeholder");
+    command
+}
+
+#[test]
+fn without_network_a_search_stops_before_any_reservation_and_names_the_cause() {
+    let temp = tempfile::tempdir().unwrap();
+    let proxy = denying_proxy();
+    let output = behind(&proxy)
+        .current_dir(temp.path())
+        .args(["--budget-usd", "0.01", "--output-dir"])
+        .arg(temp.path())
+        .args(["search", "How do fernlets settle?"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let compact: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(compact["status"], "failed");
+    assert_eq!(compact["usage"]["requests"], 0);
+    assert_eq!(compact["usage"]["cost_usd"], 0.0);
+    assert_eq!(
+        compact["report_stage_counts"],
+        serde_json::json!({"network_check": 1})
+    );
+    assert_eq!(
+        compact["load"]["jev_failure_causes"],
+        serde_json::json!({"connect_denied": 1})
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("offline-placeholder") && !text.contains("openrouter.ai"));
+
+    let doctor = behind(&proxy)
+        .current_dir(temp.path())
+        .args(["doctor", "--network"])
+        .output()
+        .unwrap();
+    assert_eq!(doctor.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(report["network_checked"], true);
+    assert_eq!(report["network_check"]["any_provider_answered"], false);
+    assert_eq!(
+        report["network_check"]["providers"],
+        serde_json::json!([{"provider":"openrouter","reachable":false,"cause":"connect_denied"}])
+    );
+}

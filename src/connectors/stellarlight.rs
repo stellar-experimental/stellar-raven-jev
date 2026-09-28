@@ -125,6 +125,7 @@ fn failure(result: &mut FetchResult, source: &Source, stage: &str, message: impl
         stage: stage.into(),
         source_id: Some(source.id.clone()),
         message: message.into(),
+        cause: None,
     });
 }
 

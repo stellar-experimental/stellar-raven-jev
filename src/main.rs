@@ -48,14 +48,18 @@ Output (compact JSON):
   currentness        The question's time intent and the newest dated evidence among the results.
   not_shown          Counts you did not see; full_report_path holds every result.
   load               What capacity limits did: degraded is true when a source was cut, refused,
-                     or fell back to coarser matching. The results are usable but thinner.";
+                     or fell back to coarser matching. The results are usable but thinner.
+                     jev_failure_causes counts failed Jev calls by cause class (dns or
+                     connect_denied: no network access). not_assessed_after_stop counts items
+                     that Jev did not judge because it had stopped paid work.";
 
 const CHECK_FIELDS: &str = "\
 Output: per claim, max_supports, max_contradicts, and max_qualifies (0-1; null when no document
 was judged), and lists of documents at 0.5 or above with text_path. Qualify or search again when
 max_supports is under 0.5. Read a contradicting row before you act on it: drop or qualify the
 claim only when the row is about the same subject and scope. Each claim is judged in its own
-Jev calls, so more claims cost more.";
+Jev calls, so more claims cost more. documents_failed counts documents without a judgment;
+failure_causes gives their cause classes.";
 
 const MORE_FIELDS: &str = "\
 Pools list what a session has not spent: sources routed but not fetched, and fetched documents
@@ -256,7 +260,13 @@ enum Command {
         limit: usize,
     },
     /// Check local settings and authentication presence without network requests.
-    Doctor,
+    Doctor {
+        /// Also check the network: send one HEAD request without credentials or body to each
+        /// configured Jev provider. No model runs, so it costs nothing. A pass cannot promise that
+        /// later paid requests succeed.
+        #[arg(long)]
+        network: bool,
+    },
     /// Remove run folders in the output directory with no activity for a number of days. Host
     /// state and sessions a call is using are never removed. No network requests.
     Prune {
@@ -560,6 +570,36 @@ fn profile_doctor_check(
     })))
 }
 
+/// `doctor --network`: the free network check against each configured provider's origin. It
+/// resolves and sends no credentials.
+async fn doctor_network_check(
+    config: &RunConfig,
+    directory: &std::path::Path,
+    env: impl Fn(&str) -> Option<String>,
+) -> serde_json::Value {
+    use stellar_raven_jev::jev;
+    let order = match jev::provider_order(&env) {
+        Ok(order) => order,
+        Err(error) => return json!({"any_provider_answered":false,"error":error.to_string()}),
+    };
+    let origins: Vec<(String, String)> = order
+        .iter()
+        .filter_map(|name| Some((name.clone(), jev::provider_origin(name).ok()?)))
+        .collect();
+    let mut unrecorded = config.clone();
+    unrecorded.full_record = false;
+    let http = match HttpRecorder::new(directory, &unrecorded) {
+        Ok(http) => http,
+        Err(error) => return json!({"any_provider_answered":false,"error":error.to_string()}),
+    };
+    let results = jev::probe_providers(&http, &origins).await;
+    json!({
+        "providers": jev::probe_rows(&results),
+        "any_provider_answered": results.iter().any(|(_, result)| result.is_ok()),
+        "scope": jev::NETWORK_CHECK_SCOPE,
+    })
+}
+
 fn doctor_jev_inspection(
     config: &RunConfig,
     directory: PathBuf,
@@ -772,20 +812,30 @@ async fn main() -> Result<()> {
                 stellar_raven_jev::maintenance::usage(&cli.output_dir, days)?
             );
         }
-        Command::Doctor => {
+        Command::Doctor { network } => {
             let directory =
                 std::env::temp_dir().join(format!("raven-doctor-{}", uuid::Uuid::new_v4()));
+            let env = |key: &str| {
+                std::env::var(key)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            };
             let result = doctor_jev_inspection(
                 &config,
                 directory.clone(),
-                |key| {
-                    std::env::var(key)
-                        .ok()
-                        .filter(|value| !value.trim().is_empty())
-                },
+                env,
                 wrangler_on_path,
                 |config, http| JevClient::new(config, http).map(|_| ()),
             );
+            // Fixture mode is offline, so it has no network to check.
+            let network_check = if network && !config.fixture {
+                Some(doctor_network_check(&config, &directory, env).await)
+            } else {
+                None
+            };
+            let network_ready = network_check
+                .as_ref()
+                .is_none_or(|check| check["any_provider_answered"] == true);
             let _ = std::fs::remove_dir_all(&directory);
             let source_credentials = source_credentials(|key| {
                 std::env::var(key).is_ok_and(|value| !value.trim().is_empty())
@@ -801,7 +851,8 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "mode":if config.fixture {"offline-fixture"} else {"live-jev"},
-                    "network_checked":false,"authentication_validated_remotely":false,
+                    "network_checked":network_check.is_some(),"network_check":network_check,
+                    "authentication_validated_remotely":false,
                     "oauth_refresh_performed":false,
                     "jev_providers":stellar_raven_jev::jev::provider_order(&|key: &str| {
                         std::env::var(key).ok().filter(|value| !value.trim().is_empty())
@@ -816,10 +867,10 @@ async fn main() -> Result<()> {
                     "source_count":connectors::sources().len(),"budget_usd":config.budget_usd,
                     "live_run_budget_ready":config.budget_usd > 0.0 && config.budget_usd <= 100.0,
                     "budget_readiness_scope":"Positive allocation within the shared ceiling. Jev checks each request reservation before spending.",
-                    "note":"This check makes no network or paid requests. Configuration checks do not require a spending allocation."
+                    "note":"This check makes no paid requests, and no network requests without --network. Configuration checks do not require a spending allocation."
                 }))?
             );
-            if !configuration_ready {
+            if !configuration_ready || !network_ready {
                 std::process::exit(1);
             }
         }
