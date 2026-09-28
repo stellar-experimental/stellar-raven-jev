@@ -2084,8 +2084,8 @@ mod tests {
             match document.source_id.as_str() {
                 "a" if self.stop_cascade => {
                     return Err(crate::jev::CallFailure {
-                        cause: "connect_denied".into(),
-                        message: "Jev transport failed (connect_denied)".into(),
+                        cause: "connection_closed".into(),
+                        message: "Jev transport failed (connection_closed)".into(),
                     }
                     .into())
                 }
@@ -2807,7 +2807,7 @@ mod tests {
         backend.routes = Some(vec![0.9, 0.9, 0.9]);
         backend.stop_cascade = true;
         // The run also went on without one provider that failed its network check.
-        backend.skipped = BTreeMap::from([("fernlet".into(), "connection_closed".into())]);
+        backend.skipped = BTreeMap::from([("fernlet".into(), "connect_denied".into())]);
         let config = RunConfig {
             fixture: true,
             output_dir: dir.path().into(),
@@ -2826,7 +2826,7 @@ mod tests {
         assert_eq!(
             rows,
             [
-                ("document_score", Some("a"), Some("connect_denied")),
+                ("document_score", Some("a"), Some("connection_closed")),
                 (NOT_ASSESSED_AFTER_STOP, Some("c"), None),
                 (NOT_ASSESSED_AFTER_STOP, None, None),
             ]
@@ -2848,10 +2848,10 @@ mod tests {
         assert_eq!(load["scoring_failures"], 1);
         assert_eq!(load["currentness_failures"], 0);
         assert_eq!(load["not_assessed_after_stop"], 2);
-        assert_eq!(load["jev_failure_causes"], json!({"connect_denied": 1}));
+        assert_eq!(load["jev_failure_causes"], json!({"connection_closed": 1}));
         assert_eq!(
             load["jev_providers_skipped"],
-            json!({"fernlet": "connection_closed"})
+            json!({"fernlet": "connect_denied"})
         );
         assert_eq!(load["degraded"], true);
     }

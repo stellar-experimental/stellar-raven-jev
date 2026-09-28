@@ -156,7 +156,7 @@ struct NetworkCheck {
 }
 
 /// What a passing network check shows, and what it cannot.
-pub const NETWORK_CHECK_SCOPE: &str = "One HEAD request without credentials or body to each Jev provider origin; no model runs, so no provider can bill it. A provider is reachable when it answers with any HTTP status, or when it connects within 5 seconds and has not answered after 6. A pass shows only that the path works now: later paid requests can still fail and keep their reservations.";
+pub const NETWORK_CHECK_SCOPE: &str = "One HEAD request without credentials or body to each Jev provider origin; no model runs, so no provider can bill it. A provider is reachable when it answers with any HTTP status, or when it connects within 5 seconds and has not answered after 6. A pass shows only that the path works now: a later paid request can still fail, and one that fails after it was sent keeps its reservation.";
 
 /// The free network check for every named origin at once, for `doctor`.
 pub async fn probe_providers(
@@ -415,11 +415,11 @@ impl JevClient {
             "credit_purchase_multipliers": {"cloudflare": 1.05, "openrouter": 1.055, "typesafe": 1.0},
             "reservation_input_tokens_per_request": MAX_INPUT_TOKENS,
             "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and each provider's credit purchase overhead; reservations use the highest provider price",
-            "retry_policy": "each provider runs a request once (Cloudflare: cf-aig-max-attempts: 1); the client sends again only after a response that means the request was not run (429, 529, 402, 401, 403), per rate_limit_policy and provider_chain_policy, at most 8 sends per attempt",
+            "retry_policy": "each provider runs a request once (Cloudflare: cf-aig-max-attempts: 1); the client sends again only after a response that means the request was not run (429, 529, 402, 401, 403), or after a connection that failed before the request was sent, per rate_limit_policy and provider_chain_policy, at most 8 sends per attempt",
             "rate_limit_policy": "HTTP 429 or 529 releases the reservation, because the provider did not run the request, and cools that provider for every search on the host for Retry-After (1 to 90 s); the call moves to the next available provider at once; a hedge does not wait",
-            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
+            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; a connection that fails before the request is sent (name resolution, TCP, a proxy tunnel, or the TLS handshake) releases the reservation and cools the provider, and the call moves on only when another provider is usable at once; other transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
             "hedge_policy": "a call unanswered jev_hedge_ms after its request is sent gets one identical hedge request when the budget has room without waiting; the first valid answer wins, so a failed attempt lets the other decide; the cancelled request is charged the winner's input tokens",
-            "unresolved_usage_policy": "retain the full reservation of any attempt without a valid usage receipt; no automatic retry; stop new reservations after 3 consecutive unresolved attempts; a call refused after the stop reserves nothing, and its item is reported as not assessed after stop",
+            "unresolved_usage_policy": "retain the full reservation of any sent attempt without a valid usage receipt; no automatic retry; stop new reservations after 3 consecutive unresolved attempts; a call refused after the stop reserves nothing, and its item is reported as not assessed after stop",
             "network_check_policy": format!("once, before the first reservation: {NETWORK_CHECK_SCOPE} The wait ends when one provider is reachable; a provider whose check failed by then is not used in this run; when every check fails, nothing is reserved"),
             "token_guard": "UTF-8 byte limits are local guards, not a verified provider tokenizer",
             "retrieved_pricing_date": "2026-09-21"
@@ -1477,9 +1477,10 @@ impl JevClient {
         winner.map(|a| (a.answers, a.path))
     }
 
-    /// One paid attempt of a call. An error without a usage receipt retains the full reservation.
-    /// Three such errors in a row open the unresolved-usage circuit (`retain_unresolved`). A hedge
-    /// attempt (`attempt > 0`) never waits for budget room.
+    /// One paid attempt of a call. An error without a usage receipt retains the full reservation,
+    /// unless the connection failed before the request was sent. Three retained errors in a row
+    /// open the unresolved-usage circuit (`retain_unresolved`). A hedge attempt (`attempt > 0`)
+    /// never waits for budget room.
     async fn attempt(&self, call: &Call<'_>, attempt: u32) -> Result<Attempted> {
         self.check_network().await?;
         let (expected, context) = (call.expected, call.context);
@@ -1602,13 +1603,40 @@ impl JevClient {
                     continue;
                 }
                 Err(error) => {
-                    let cause = error
-                        .downcast_ref::<crate::http::TransportFailure>()
-                        .map_or(crate::http::TransportCause::Other, |f| f.cause);
+                    let failure = error.downcast_ref::<crate::http::TransportFailure>();
+                    let cause = failure.map_or(crate::http::TransportCause::Other, |f| f.cause);
+                    trace["transport_cause"] = json!(cause.as_str());
+                    if failure.is_some_and(|f| f.unsent) {
+                        // The connection failed before the request was written, so the provider
+                        // cannot bill it. The provider cools, and the first attempt moves on
+                        // only when another provider is usable now; it does not wait.
+                        self.release_unrun(reservation, attempt > 0, false);
+                        refusals += 1;
+                        self.cool_provider(
+                            provider,
+                            self.rate_limit_wait
+                                .unwrap_or(Duration::from_secs(RATE_LIMIT_DEFAULT_WAIT_SECS)),
+                        )?;
+                        trace["state"] = json!("connect_failed");
+                        trace["accounting"] = json!(
+                            "Reservation released; the connection failed before the request was sent."
+                        );
+                        let path = self.write_audit(&audit_name, &trace)?;
+                        pending.finished = true;
+                        if attempt == 0
+                            && matches!(self.pick_provider(None)?, crate::governor::Send::Go(next) if next != provider)
+                        {
+                            continue;
+                        }
+                        return Err(CallFailure {
+                            cause: cause.as_str().to_owned(),
+                            message: format!("Jev could not connect ({cause}); the request was not sent, and its reservation was released. Audit: {path}"),
+                        }
+                        .into());
+                    }
                     let opened = self.retain_unresolved(cause.as_str());
                     trace["unresolved_usage_circuit_open"] = json!(opened);
                     trace["state"] = json!("transport_error_or_incomplete_body");
-                    trace["transport_cause"] = json!(cause.as_str());
                     trace["accounting"] =
                         json!("Full reservation retained; provider completion is unknown.");
                     let path = self.write_audit(&audit_name, &trace)?;
@@ -1616,7 +1644,7 @@ impl JevClient {
                     pending.finished = true;
                     return Err(CallFailure {
                         cause: cause.as_str().to_owned(),
-                        message: format!("Jev transport failed ({cause}); the reservation remains charged. Audit: {path}"),
+                        message: format!("Jev transport failed ({cause}) after the request may have been sent; the reservation remains charged. Audit: {path}"),
                     }
                     .into());
                 }
@@ -3913,44 +3941,174 @@ mod tests {
         client
     }
 
+    /// A Jev server that reads each request and closes the connection without an answer, and
+    /// counts connections.
+    async fn hanging_up_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/evaluate", listener.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut input = [0; 16384];
+                    let _ = socket.read(&mut input).await;
+                });
+            }
+        });
+        (url, count)
+    }
+
+    /// A loopback URL where nothing listens: the port was just released.
+    fn refusing_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/evaluate", listener.local_addr().unwrap())
+    }
+
+    /// The saved Jev traces of attempts that ended in `state`.
+    fn traces_in_state(dir: &Path, state: &str) -> Vec<Value> {
+        std::fs::read_dir(dir.join("jev"))
+            .unwrap()
+            .map(|entry| {
+                serde_json::from_slice::<Value>(&std::fs::read(entry.unwrap().path()).unwrap())
+                    .unwrap()
+            })
+            .filter(|trace| trace["state"] == state)
+            .collect()
+    }
+
     #[tokio::test]
-    async fn a_denied_connection_names_its_cause_and_the_stop_that_follows() {
+    async fn a_connection_that_fails_before_sending_releases_its_reservation_and_never_stops() {
+        let refused_dir = tempfile::tempdir().unwrap();
+        let refused = JevClient::loopback_for_test(
+            &RunConfig {
+                output_dir: refused_dir.path().to_path_buf(),
+                budget_usd: 1.0,
+                timeout_secs: 5,
+                ..RunConfig::default()
+            },
+            refusing_url(),
+        )
+        .unwrap();
+        let denied_dir = tempfile::tempdir().unwrap();
+        let (proxy, connections) = denying_proxy().await;
+        let denied = proxied_client(
+            denied_dir.path(),
+            &proxy,
+            &["https://fernlet.test/evaluate"],
+        );
+        let calls = UNRESOLVED_STOP_AFTER + 1;
+        for (mut client, dir, cause) in [
+            (refused, refused_dir.path(), "connect_refused"),
+            (denied, denied_dir.path(), "connect_denied"),
+        ] {
+            client.rate_limit_wait = Some(Duration::from_millis(20));
+            // More failed connections than the stop allows: none of them counts toward it.
+            for _ in 0..calls {
+                let error = evaluate_one(&client).await.unwrap_err();
+                assert_eq!(failure_cause(&error), Some(cause));
+                assert!(!not_assessed_after_stop(&error));
+                let text = format!("{error:#}");
+                assert!(
+                    text.starts_with(&format!("Jev could not connect ({cause}); the request was not sent, and its reservation was released.")),
+                    "{text}"
+                );
+                assert!(!text.contains("offline-placeholder") && !text.contains("fernlet.test"));
+            }
+            assert!(client.spending_stop_reason().is_none());
+            let usage = client.usage();
+            assert_eq!((usage.requests, usage.cost_usd), (0, 0.0));
+            let ledger = client.ledger.lock().unwrap();
+            assert_eq!(ledger.accounted_nanos, 0);
+            assert_eq!((ledger.in_flight, ledger.consecutive_unresolved), (0, 0));
+            assert!(!ledger.unresolved_usage && ledger.last_unresolved_cause.is_none());
+            drop(ledger);
+            let traces = traces_in_state(dir, "connect_failed");
+            assert_eq!(traces.len() as u32, calls);
+            for trace in &traces {
+                assert_eq!(trace["transport_cause"], cause);
+                assert!(trace["accounting"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Reservation released"));
+                let text = trace.to_string();
+                assert!(!text.contains("offline-placeholder") && !text.contains("fernlet.test"));
+            }
+            assert!(traces_in_state(dir, "transport_error_or_incomplete_body").is_empty());
+        }
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst) as u32,
+            calls
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_moves_the_call_to_the_next_provider_for_free() {
         let dir = tempfile::tempdir().unwrap();
-        let (proxy, _) = denying_proxy().await;
-        let client = proxied_client(dir.path(), &proxy, &["https://fernlet.test/evaluate"]);
+        let (url, server) = scripted_server(vec![(0, "200 OK", response().to_string())]).await;
+        let client = two_provider_client(dir.path(), refusing_url(), url);
+        let (answers, _) = ask(&client).await.unwrap();
+        assert_eq!(answers.len(), 2);
+        server.await.unwrap();
+        assert!(client.spending_stop_reason().is_none());
+        assert_eq!(client.usage().requests, 1);
+        let ledger = client.ledger.lock().unwrap();
+        assert_eq!(
+            ledger.accounted_nanos,
+            client.backend.cost_nanos(100).unwrap(),
+            "only the answered request costs"
+        );
+        assert_eq!((ledger.in_flight, ledger.consecutive_unresolved), (0, 0));
+        drop(ledger);
+        let failed = traces_in_state(dir.path(), "connect_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["transport_cause"], "connect_refused");
+        assert_eq!(traces_in_state(dir.path(), "complete").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_the_request_was_sent_keeps_its_reservation_and_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = hanging_up_server().await;
+        let (second, second_connections) = hanging_up_server().await;
+        let client = two_provider_client(dir.path(), first, second);
         let reservation = client.backend.reservation().unwrap();
         for _ in 0..UNRESOLVED_STOP_AFTER {
             let error = evaluate_one(&client).await.unwrap_err();
-            assert_eq!(failure_cause(&error), Some("connect_denied"));
+            assert_eq!(failure_cause(&error), Some("connection_closed"));
             assert!(!not_assessed_after_stop(&error));
             let text = format!("{error:#}");
             assert!(
-                text.starts_with("Jev transport failed (connect_denied);"),
+                text.starts_with("Jev transport failed (connection_closed) after the request may have been sent; the reservation remains charged."),
                 "{text}"
             );
-            assert!(!text.contains("offline-placeholder") && !text.contains("fernlet.test"));
         }
-        // Each denied attempt keeps its reservation. The next call reserves nothing, and its item
+        // Each sent attempt keeps its reservation. The next call reserves nothing, and its item
         // is not assessed.
         let refused = evaluate_one(&client).await.unwrap_err();
         assert!(not_assessed_after_stop(&refused));
-        assert!(refused.to_string().contains("(last cause: connect_denied)"));
+        assert!(refused
+            .to_string()
+            .contains("(last cause: connection_closed)"));
         let stop = u64::from(UNRESOLVED_STOP_AFTER);
         assert_eq!(client.usage().requests, stop);
         assert_eq!(
             client.ledger.lock().unwrap().accounted_nanos,
             reservation * stop
         );
-        let traces: Vec<String> = std::fs::read_dir(dir.path().join("jev"))
-            .unwrap()
-            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
-            .filter(|trace| trace.contains("transport_error_or_incomplete_body"))
-            .collect();
+        // The provider may have run the request, so no other provider receives it.
+        assert_eq!(
+            second_connections.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let traces = traces_in_state(dir.path(), "transport_error_or_incomplete_body");
         assert_eq!(traces.len() as u64, stop);
-        for trace in traces {
-            assert!(trace.contains(r#""transport_cause":"connect_denied""#));
-            assert!(!trace.contains("offline-placeholder") && !trace.contains("fernlet.test"));
+        for trace in &traces {
+            assert_eq!(trace["transport_cause"], "connection_closed");
         }
+        assert!(traces_in_state(dir.path(), "connect_failed").is_empty());
     }
 
     #[tokio::test]

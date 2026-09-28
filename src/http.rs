@@ -599,11 +599,16 @@ fn transport_cause(error: &reqwest::Error) -> TransportCause {
     }
 }
 
-/// A request that failed before a complete response: its class, and the transport message
-/// without the URL.
+/// A request that failed before a complete response: its class, whether it was sent, and the
+/// transport message without the URL.
 #[derive(Debug)]
 pub struct TransportFailure {
     pub cause: TransportCause,
+    /// The connection failed before the request was written, so the host received no request
+    /// bytes. `reqwest` marks only failures of the connect phase this way: name resolution, the
+    /// TCP connection, a proxy tunnel, and the TLS handshake. The class does not decide this; a
+    /// timeout or a closed connection can also come before the request.
+    pub unsent: bool,
     text: String,
 }
 
@@ -611,6 +616,7 @@ impl TransportFailure {
     fn new(error: &reqwest::Error, text: String) -> Self {
         Self {
             cause: transport_cause(error),
+            unsent: error.is_connect(),
             text,
         }
     }
@@ -2369,8 +2375,9 @@ mod tests {
         (addr, seen)
     }
 
-    /// The cause class of a failed POST that carries a credential, which the error never shows.
-    async fn cause_of(recorder: &HttpRecorder, url: &str) -> TransportCause {
+    /// The cause class of a failed POST that carries a credential, which the error never shows,
+    /// and whether the request was unsent.
+    async fn cause_of(recorder: &HttpRecorder, url: &str) -> (TransportCause, bool) {
         let error = recorder
             .request_body_recorded_elsewhere(
                 Method::POST,
@@ -2383,14 +2390,14 @@ mod tests {
             .unwrap_err();
         let text = format!("{error:#}");
         assert!(!text.contains("fernlet-secret") && !text.contains("fernlet.test"));
-        error
+        let failure = error
             .downcast_ref::<TransportFailure>()
-            .unwrap_or_else(|| panic!("not a transport failure: {text}"))
-            .cause
+            .unwrap_or_else(|| panic!("not a transport failure: {text}"));
+        (failure.cause, failure.unsent)
     }
 
     #[tokio::test]
-    async fn each_transport_failure_carries_its_cause_class() {
+    async fn each_transport_failure_names_its_class_and_whether_it_was_sent() {
         let dir = tempfile::tempdir().unwrap();
         let config = RunConfig {
             timeout_secs: 1,
@@ -2404,31 +2411,34 @@ mod tests {
             .unwrap();
         assert_eq!(
             cause_of(&recorder, &format!("http://{closed}/")).await,
-            TransportCause::ConnectRefused
+            (TransportCause::ConnectRefused, true)
         );
-        let (hangs_up, _) = scripted(b"", Duration::ZERO).await;
+        // The server reads the request, then closes or stays silent: the request was sent.
+        let (hangs_up, seen) = scripted(b"", Duration::ZERO).await;
         assert_eq!(
             cause_of(&recorder, &format!("http://{hangs_up}/")).await,
-            TransportCause::Closed
+            (TransportCause::Closed, false)
         );
+        assert!(seen.lock().unwrap()[0].starts_with("POST / HTTP/1.1"));
         let (silent, _) = scripted(b"", Duration::from_secs(5)).await;
         assert_eq!(
             cause_of(&recorder, &format!("http://{silent}/")).await,
-            TransportCause::Timeout
+            (TransportCause::Timeout, false)
         );
         // Plain text where a TLS handshake is expected.
-        let (plain, _) = scripted(b"HTTP/1.1 200 OK\r\n\r\n", Duration::ZERO).await;
+        let (plain, seen) = scripted(b"HTTP/1.1 200 OK\r\n\r\n", Duration::ZERO).await;
         assert_eq!(
             cause_of(&recorder, &format!("https://{plain}/")).await,
-            TransportCause::Tls
+            (TransportCause::Tls, true)
         );
+        assert!(!seen.lock().unwrap().concat().contains("POST"));
         let no_dns = recorder.without_dns_for_test().unwrap();
         assert_eq!(
             cause_of(&no_dns, "http://fernlet.test/").await,
-            TransportCause::Dns
+            (TransportCause::Dns, true)
         );
         // A proxy that refuses the tunnel, as a restricted network does.
-        let (proxy, _) = scripted(
+        let (proxy, seen) = scripted(
             b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
             Duration::ZERO,
         )
@@ -2438,8 +2448,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             cause_of(&denied, "https://fernlet.test/").await,
-            TransportCause::ConnectDenied
+            (TransportCause::ConnectDenied, true)
         );
+        let tunnel = seen.lock().unwrap().concat();
+        assert!(
+            tunnel.starts_with("CONNECT fernlet.test:443 HTTP/1.1"),
+            "{tunnel}"
+        );
+        assert!(!tunnel.contains("POST") && !tunnel.contains("fernlet-secret"));
     }
 
     #[tokio::test]
