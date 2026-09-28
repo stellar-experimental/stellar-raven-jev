@@ -94,6 +94,11 @@ pub trait Backend: Send + Sync {
     async fn check_network(&self) -> Result<()> {
         Ok(())
     }
+    /// Providers that the network check took out of this run. See
+    /// `JevClient::skipped_providers`.
+    fn skipped_providers(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
 }
 
 struct LiveBackend {
@@ -144,6 +149,9 @@ impl Backend for LiveBackend {
     }
     async fn check_network(&self) -> Result<()> {
         self.jev.check_network().await
+    }
+    fn skipped_providers(&self) -> BTreeMap<String, String> {
+        self.jev.skipped_providers()
     }
 }
 
@@ -516,6 +524,7 @@ async fn execute(
         evidence
             .failures
             .push(jev_failure("network_check", None, "", &error));
+        evidence.load = json!({"jev_providers_skipped": backend.skipped_providers()});
         return persist(config, &evidence, &backend.usage(), "failed");
     }
     let mut selected = BTreeSet::new();
@@ -1322,6 +1331,7 @@ pub(crate) async fn finish(
         docs.sort_by(|a, b| a.id.cmp(&b.id));
     }
     evidence.load = http.load_summary();
+    evidence.load["jev_providers_skipped"] = json!(backend.skipped_providers());
     if !evidence.original_reads.is_null() {
         evidence.load["original_reads"] = evidence.original_reads.clone();
     }
@@ -1904,6 +1914,8 @@ mod tests {
         /// Jev stops paid work: source a's scoring fails in transport, source c's and every
         /// currentness call are refused after the stop.
         stop_cascade: bool,
+        /// Providers the network check took out of the run.
+        skipped: BTreeMap<String, String>,
     }
     #[async_trait]
     impl Backend for Mock {
@@ -2053,6 +2065,9 @@ mod tests {
         fn usage(&self) -> Usage {
             Usage::default()
         }
+        fn skipped_providers(&self) -> BTreeMap<String, String> {
+            self.skipped.clone()
+        }
         fn original_reader(&self, http: &HttpRecorder) -> Result<HttpRecorder> {
             match &self.reader {
                 Some(dns) => http.public_reader_for_test(dns.clone()),
@@ -2116,6 +2131,7 @@ mod tests {
             rows: vec![],
             reader: None,
             stop_cascade: false,
+            skipped: BTreeMap::new(),
         }
     }
     fn stopped() -> anyhow::Error {
@@ -2790,6 +2806,8 @@ mod tests {
         let mut backend = mock();
         backend.routes = Some(vec![0.9, 0.9, 0.9]);
         backend.stop_cascade = true;
+        // The run also went on without one provider that failed its network check.
+        backend.skipped = BTreeMap::from([("fernlet".into(), "connection_closed".into())]);
         let config = RunConfig {
             fixture: true,
             output_dir: dir.path().into(),
@@ -2831,6 +2849,10 @@ mod tests {
         assert_eq!(load["currentness_failures"], 0);
         assert_eq!(load["not_assessed_after_stop"], 2);
         assert_eq!(load["jev_failure_causes"], json!({"connect_denied": 1}));
+        assert_eq!(
+            load["jev_providers_skipped"],
+            json!({"fernlet": "connection_closed"})
+        );
         assert_eq!(load["degraded"], true);
     }
     #[tokio::test]

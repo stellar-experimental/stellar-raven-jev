@@ -57,8 +57,9 @@ Exit 2 indicates partial results. Inspect the reports and `load` before using th
 Exit 3 indicates `busy`. Inspect its reported usage; routing can spend money before source admission fails.
 Respect `retry_after_ms` and the task's time and spending limits before retrying.
 For other errors, inspect the error before another call. Repeated calls do not repair missing settings.
-A `network_check` report, or a `load.jev_failure_causes` class such as `dns` or `connect_denied`, shows missing network access.
-Report the missing access. Repeated calls do not repair it.
+A `network_check` report, or a `load.jev_failure_causes` class such as `dns` or `connect_denied`, usually shows missing network access.
+`connect_denied` can also mean that a proxy could not reach the provider.
+Report the network problem. Repeated calls do not repair it.
 
 ## Saved sessions and evaluation
 

@@ -49,9 +49,11 @@ Output (compact JSON):
   not_shown          Counts you did not see; full_report_path holds every result.
   load               What capacity limits did: degraded is true when a source was cut, refused,
                      or fell back to coarser matching. The results are usable but thinner.
-                     jev_failure_causes counts failed Jev calls by cause class (dns or
-                     connect_denied: no network access). not_assessed_after_stop counts items
-                     that Jev did not judge because it had stopped paid work.";
+                     jev_failure_causes counts the reports of failed Jev calls by cause class
+                     (dns or connect_denied: usually no network access). jev_providers_skipped
+                     names the providers that failed the network check, with the class.
+                     not_assessed_after_stop counts items that Jev did not judge because it had
+                     stopped paid work.";
 
 const CHECK_FIELDS: &str = "\
 Output: per claim, max_supports, max_contradicts, and max_qualifies (0-1; null when no document
@@ -59,7 +61,8 @@ was judged), and lists of documents at 0.5 or above with text_path. Qualify or s
 max_supports is under 0.5. Read a contradicting row before you act on it: drop or qualify the
 claim only when the row is about the same subject and scope. Each claim is judged in its own
 Jev calls, so more claims cost more. documents_failed counts documents without a judgment;
-failure_causes gives their cause classes.";
+failure_causes gives their cause classes. jev_providers_skipped names the providers that failed
+the network check.";
 
 const MORE_FIELDS: &str = "\
 Pools list what a session has not spent: sources routed but not fetched, and fetched documents

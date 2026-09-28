@@ -447,6 +447,10 @@ fn without_network_a_search_stops_before_any_reservation_and_names_the_cause() {
         compact["load"]["jev_failure_causes"],
         serde_json::json!({"connect_denied": 1})
     );
+    assert_eq!(
+        compact["load"]["jev_providers_skipped"],
+        serde_json::json!({"openrouter": "connect_denied"})
+    );
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(!text.contains("offline-placeholder") && !text.contains("openrouter.ai"));
 

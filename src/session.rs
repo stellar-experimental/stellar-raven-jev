@@ -541,6 +541,7 @@ pub async fn check(
         "claims": claims_out,
         "documents_failed": failed,
         "failure_causes": failure_causes,
+        "jev_providers_skipped": jev.skipped_providers(),
         "check_path": check_path,
         "limitations": ["Probabilities are uncalibrated. Read a row's text_path before you cite it.",
             "Low support does not mean contradiction: the text may not address the claim."],

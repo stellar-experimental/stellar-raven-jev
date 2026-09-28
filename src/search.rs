@@ -274,6 +274,11 @@ fn load_summary(failures: &[Failure], usage: &crate::types::Usage, counters: &Va
         "currentness_failures": count("currentness"),
         "not_assessed_after_stop": count(crate::pipeline::NOT_ASSESSED_AFTER_STOP),
         "jev_failure_causes": causes,
+        "jev_providers_skipped": if counters["jev_providers_skipped"].is_object() {
+            counters["jev_providers_skipped"].clone()
+        } else {
+            json!({})
+        },
         "jev_rate_limited_requests": usage.rate_limited_requests,
         "jev_wait_ms": usage.provider_wait_ms,
     })

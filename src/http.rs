@@ -246,10 +246,14 @@ fn source_client(config: &RunConfig, fresh: bool) -> reqwest::ClientBuilder {
     }
 }
 
-/// The network check's client from a request client's builder: a fresh connection for each check
-/// and the connect limit.
+/// The network check's client from a request client's builder: a fresh connection for each check,
+/// the connect limit, and a total limit past `PROBE_WAIT`. The request limit (`--timeout-secs`)
+/// does not apply, so a short one cannot turn a slow answer into a failed check.
 fn probe_client(builder: reqwest::ClientBuilder) -> Result<Client> {
-    Ok(builder.connect_timeout(PROBE_CONNECT_LIMIT).build()?)
+    Ok(builder
+        .connect_timeout(PROBE_CONNECT_LIMIT)
+        .timeout(PROBE_WAIT * 2)
+        .build()?)
 }
 
 /// An error and its causes on one line.
@@ -493,7 +497,8 @@ pub enum TransportCause {
     Dns,
     /// The host refused the connection.
     ConnectRefused,
-    /// The system or a proxy did not permit the connection.
+    /// The system or a proxy refused or could not open the connection. A proxy that cannot reach
+    /// the host gives this class too.
     ConnectDenied,
     /// No route to the network or the host.
     Unreachable,
