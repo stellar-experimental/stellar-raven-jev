@@ -1,4 +1,5 @@
 //! Public Scout reads. Skill bodies are evidence, never executable instructions.
+use crate::http::TransportCause;
 use crate::types::*;
 use anyhow::{anyhow, Result};
 use reqwest::{Method, Url};
@@ -172,22 +173,31 @@ async fn read(
         .http
         .request(Method::GET, url, auth_headers(), None)
         .await;
-    // Scout answers transient overload with a server error. One retry, after the Retry-After it
-    // sends, recovers most of them. A second failure is reported, and so is a first one whose
-    // retry would wait too long or end past the fetch deadline.
+    // Scout answers transient overload with a server error, and a connection can fail before any
+    // response. Every Scout read is a GET, so one retry is safe: after the Retry-After Scout
+    // sends, or after a short delay. A timeout is not retried, because it has already spent its
+    // time. A second failure is reported, and so is a first one whose retry would wait too long
+    // or end past the fetch deadline.
     let mut not_retried = None;
-    if let Ok(first) = &response {
-        if matches!(first.status, 500 | 502 | 503 | 504) {
-            match retry_delay(&first.headers).and_then(|delay| within(ctx.deadline, delay)) {
-                Ok(delay) => {
-                    tokio::time::sleep(delay).await;
-                    response = ctx
-                        .http
-                        .request(Method::GET, url, auth_headers(), None)
-                        .await;
-                }
-                Err(reason) => not_retried = Some(reason),
+    let delay = match &response {
+        Ok(first) if matches!(first.status, 500 | 502 | 503 | 504) => {
+            Some(retry_delay(&first.headers))
+        }
+        Err(error) if transport_cause(error).is_some_and(|c| c != TransportCause::Timeout) => {
+            Some(retry_delay(&Default::default()))
+        }
+        _ => None,
+    };
+    if let Some(delay) = delay {
+        match delay.and_then(|delay| within(ctx.deadline, delay)) {
+            Ok(delay) => {
+                tokio::time::sleep(delay).await;
+                response = ctx
+                    .http
+                    .request(Method::GET, url, auth_headers(), None)
+                    .await;
             }
+            Err(reason) => not_retried = Some(reason),
         }
     }
     match response {
@@ -225,15 +235,28 @@ async fn read(
             }
         }
         Err(error) => {
+            let cause = transport_cause(&error)
+                .map(|cause| format!(" ({cause})"))
+                .unwrap_or_default();
+            let not_retried = not_retried
+                .map(|reason| format!(" It was not retried: {reason}."))
+                .unwrap_or_default();
             failure(
                 result,
                 source,
                 "http",
-                format!("Scout read failed: {error}"),
+                format!("Scout read failed{cause}: {error}.{not_retried}"),
             );
             None
         }
     }
+}
+
+/// The transport failure class of a request error, when the request failed before a response.
+fn transport_cause(error: &anyhow::Error) -> Option<TransportCause> {
+    error
+        .downcast_ref::<crate::http::TransportFailure>()
+        .map(|failure| failure.cause)
 }
 
 /// Scout's request ID, server timing, and match mode, as a suffix for a report about the
@@ -1102,6 +1125,39 @@ mod tests {
             message.contains("x-vercel-id: iad1::abc-1; server-timing: total;dur=12"),
             "{message}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_closes_before_a_response_is_retried_once() {
+        // The first two connections close with no response; the third answers.
+        let addr = replying(vec![
+            b"",
+            b"",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = loopback_context(dir.path());
+        let source = &sources()[0];
+        let url = format!("http://{addr}/api/x");
+        let mut result = FetchResult::default();
+        // Two closed connections: the retry also fails, and the cause class is reported.
+        assert!(read(&ctx, source, &mut result, &url).await.is_none());
+        let message = &result.failures[0].message;
+        assert!(
+            message.starts_with("Scout read failed (connection_closed)"),
+            "{message}"
+        );
+        // One closed connection: the retry succeeds.
+        let addr = replying(vec![
+            b"",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
+        ])
+        .await;
+        let mut result = FetchResult::default();
+        let url = format!("http://{addr}/api/x");
+        assert!(read(&ctx, source, &mut result, &url).await.is_some());
+        assert!(result.failures.is_empty());
     }
 
     #[tokio::test]
