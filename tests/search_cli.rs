@@ -1,16 +1,33 @@
 use serde_json::Value;
 use std::process::Command;
 
-fn cli() -> Command {
+struct TestCommand {
+    command: Command,
+    _environment: tempfile::NamedTempFile,
+}
+
+impl std::ops::Deref for TestCommand {
+    type Target = Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl std::ops::DerefMut for TestCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+fn cli() -> TestCommand {
+    let environment = tempfile::NamedTempFile::new().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_stellar-raven-jev"));
-    // Strip host defaults so tests see the CLI defaults.
-    command
-        .env_remove("JEV_ENV_FILE")
-        .env_remove("JEV_BUDGET_USD")
-        .env_remove("JEV_OUTPUT_DIR")
-        .env_remove("JEV_MAX_SEARCHES")
-        .env_remove("JEV_PROVIDER_RPM");
-    command
+    command.env_clear().env("JEV_ENV_FILE", environment.path());
+    TestCommand {
+        command,
+        _environment: environment,
+    }
 }
 
 #[test]
@@ -60,11 +77,14 @@ fn failed_initialization_still_returns_a_json_report_and_failure_exit() {
     let temp = tempfile::tempdir().unwrap();
     let output = cli()
         .current_dir(temp.path())
-        // No Cloudflare settings: Jev cannot start, and the run fails at initialization.
-        .env_remove("CLOUDFLARE_ACCOUNT_ID")
-        .env_remove("CLOUDFLARE_API_TOKEN")
-        .env_remove("JEV_CLOUDFLARE_AUTH_PROFILE")
-        .args(["search", "Stellar RPC", "--resources", "agentic", "--json"])
+        // A missing budget stops initialization before credential resolution.
+        .args([
+            "search",
+            "Quillon receipt records",
+            "--resources",
+            "agentic",
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -73,6 +93,10 @@ fn failed_initialization_still_returns_a_json_report_and_failure_exit() {
     assert_eq!(report["counts"]["selected"], 0);
     assert_eq!(report["usage"]["requests"], 0);
     assert_eq!(report["reports"][0]["stage"], "initialization");
+    assert!(report["reports"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("budget"));
     assert_eq!(
         report["source_scope"]["excluded_source_ids"]
             .as_array()
@@ -90,7 +114,7 @@ fn agentic_search_filters_before_routing_and_delivers_exact_text() {
         .arg(temp.path())
         .args([
             "search",
-            "Find Stellar SDK documentation",
+            "Find Fernlet toolkit documentation",
             "--resources",
             "agentic",
             "--json",
@@ -160,7 +184,7 @@ fn default_search_prints_compact_json_and_keeps_a_light_record() {
     let output = cli()
         .args(["--fixture", "--output-dir"])
         .arg(temp.path())
-        .args(["search", "Stellar RPC events", "--limit", "1"])
+        .args(["search", "Quillon receipt events", "--limit", "1"])
         .output()
         .unwrap();
     assert!(matches!(output.status.code(), Some(0 | 2)));
@@ -216,7 +240,12 @@ fn default_search_prints_compact_json_and_keeps_a_light_record() {
     assert_eq!(manifest["record"], "light");
     assert_eq!(manifest["config"]["full_record"], false);
     // A light record keeps the session, so it can be replayed.
-    let replay = cli().arg("report").arg(root).output().unwrap();
+    let replay = cli()
+        .arg("--fixture")
+        .arg("report")
+        .arg(root)
+        .output()
+        .unwrap();
     assert!(matches!(replay.status.code(), Some(0 | 2)));
     assert!(root.join("search-replay.json").is_file());
 }
@@ -233,7 +262,7 @@ fn configured_file_works_outside_project_and_missing_file_fails_without_run() {
         .args([
             "--fixture",
             "search",
-            "SDK docs",
+            "Fernlet toolkit docs",
             "--resources",
             "agentic",
             "--json",
@@ -250,7 +279,7 @@ fn configured_file_works_outside_project_and_missing_file_fails_without_run() {
         .current_dir(temp.path())
         .arg("--env-file")
         .arg(temp.path().join("absent.env"))
-        .args(["--fixture", "search", "SDK docs"])
+        .args(["--fixture", "search", "Fernlet toolkit docs"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -402,7 +431,7 @@ fn denying_proxy() -> String {
 
 /// The CLI with one live provider and a placeholder key, whose every request meets `proxy`. No
 /// request leaves this host.
-fn behind(proxy: &str) -> Command {
+fn behind(proxy: &str) -> TestCommand {
     let mut command = cli();
     for name in [
         "NO_PROXY",

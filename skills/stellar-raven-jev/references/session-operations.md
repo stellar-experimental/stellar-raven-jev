@@ -1,4 +1,4 @@
-# Saved sessions and evaluation
+# Saved sessions
 
 Read the relevant command's `--help` before use. Take session and pool identifiers from the output.
 Keep the same output directory when continuing a session.
@@ -38,11 +38,9 @@ Source exclusions and retrieval failures limit coverage. Selected-document count
 
 ## Preserve and replay evidence
 
-Use `search --full-record` when evaluation or replay needs raw responses, scoring traces, and rejected documents.
-Use `report RUN_DIR --variant NAME` to rebuild a saved full record without retrieval or scoring.
+Use `search --full-record` when an audit or replay needs raw responses and scoring traces.
+Use `report RUN_DIR --variant NAME` to rebuild a saved run's report without retrieval or scoring.
 The new report does not add evidence or refresh old facts.
 
-Keep evaluation runs in a separate output directory. Set `--retain-days 0` when automatic pruning must preserve those runs.
+Keep runs that a later review needs in a separate output directory. Set `--retain-days 0` when automatic pruning must preserve those runs.
 Inspect `prune --dry-run` before an authorized cleanup. Do not remove evidence that an active review needs.
-Use held-out questions to assess retrieval changes. Separate retrieval coverage, document relevance, and answer support.
-Keep incomplete readings and unjudged documents separate from negative judgments.

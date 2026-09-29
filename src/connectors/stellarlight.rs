@@ -82,14 +82,13 @@ const LISTINGS: &[Listing] = &[
     Listing { id: "stablecoins", path: "/api/stablecoins", key: "stablecoins", description: "Tracked stablecoins, fiat pegs, USD market capitalization, and dated usage", paged: false, query: false, limit: 100, roster: &["ticker", "name", "company", "peg", "basis", "assetType", "issuer", "issuerDomain", "supply", "marketCapUSD", "updatedAt", "verified", "note"], every_row: &[], row_dates: &[("/updatedAt", "observed")] },
 ];
 
-/// Requests in flight that Stellar Light advises one client host to stay at or under. Above it,
-/// Scout's slowest responses approach the fetch deadline.
+/// The tool keeps each Scout host at or under 32 requests in flight and 600 research requests per minute.
 pub const HOST_CONCURRENCY: usize = 32;
 
-/// Research requests per minute that Stellar Light advises one client host to stay at or under.
+/// The tool limits research requests to 600 per minute for each Scout host.
 pub const RESEARCH_PER_MINUTE: u64 = 600;
 
-/// Scout's stated request windows: the research scope, `RESEARCH_PER_MINUTE` per 60 seconds.
+/// Client request windows for Scout research: `RESEARCH_PER_MINUTE` per 60 seconds.
 pub fn stated_windows() -> Vec<(String, u64, std::time::Duration)> {
     host()
         .map(|host| {
@@ -277,8 +276,7 @@ fn trace(headers: &std::collections::BTreeMap<String, String>) -> String {
     }
 }
 
-/// A partner key (`STELLAR_LIGHT_API_KEY`) raises Scout's request limits; without one, requests
-/// are anonymous and get the public limits.
+/// Optional Stellar Scout partner key, sent as a bearer token.
 fn auth_headers() -> Vec<(String, String)> {
     std::env::var("STELLAR_LIGHT_API_KEY")
         .ok()

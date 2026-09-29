@@ -3,6 +3,11 @@ name = "stellar-raven-jev"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+description = "Retrieve and assess Stellar ecosystem source evidence for agents"
+repository = "https://github.com/stellar-experimental/stellar-raven-jev"
+readme = "README.md"
+rust-version = "1.93"
+publish = false
 
 [dependencies]
 anyhow = "1"

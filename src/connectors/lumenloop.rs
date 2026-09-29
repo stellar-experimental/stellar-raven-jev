@@ -25,19 +25,17 @@ const COLLECTIONS: &[(&str, &str, &str)] = &[
     ("scf", "SCF applications", "Stellar Community Fund applications, award metadata, and stored application bodies where available."),
 ];
 
+/// Read tools by collection: `jobs` uses `list_documents`; `directory` uses `search_directory` and
+/// `get_project`; `scf` uses `find_similar_scf_submissions`, `get_scf_submissions`, and
+/// `get_project`; `av_passages` uses `find_av_passages` and `get_document`; the others use
+/// `search_content_semantic` and `get_document`.
 pub fn sources() -> Vec<Source> {
     COLLECTIONS
         .iter()
         .map(|(kind, name, description)| Source {
             id: format!("lumenloop.{kind}"),
             name: format!("LumenLoop {name}"),
-            description: format!("{description} Covered tools: {}. Other LumenLoop read tools are deferred; see docs/research/lumenloop.md.", match *kind {
-                "jobs" => "list_documents (active keyword search and pagination)",
-                "directory" => "search_directory, get_project",
-                "scf" => "find_similar_scf_submissions, get_scf_submissions, get_project",
-                "av_passages" => "find_av_passages, get_document",
-                _ => "search_content_semantic, get_document",
-            }),
+            description: (*description).into(),
             family: "lumenloop".into(),
         })
         .collect()
@@ -45,8 +43,8 @@ pub fn sources() -> Vec<Source> {
 
 /// Detail reads add text only where discovery returns partial records.
 /// `search_content_semantic` with `response_format: detailed` already returns the complete stored
-/// summary for these collections: 300 of 300 detail reads across eight live runs on 2026-09-21
-/// returned identical title, URL, and text. Skipping them avoids the provider's per-minute quota.
+/// summary for these collections, so detail reads would repeat it and use the provider's
+/// per-minute quota.
 fn needs_detail(kind: &str) -> bool {
     !matches!(
         kind,
