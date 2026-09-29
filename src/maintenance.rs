@@ -57,6 +57,16 @@ fn folder_bytes(dir: &Path) -> u64 {
     total
 }
 
+/// The entries of `output_dir`, or none when it does not exist because no search has run yet.
+fn output_entries(output_dir: &Path) -> Result<Vec<fs::DirEntry>> {
+    match fs::read_dir(output_dir) {
+        Ok(entries) => Ok(entries.flatten().collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error)
+            .with_context(|| format!("Cannot read the output directory {}", output_dir.display())),
+    }
+}
+
 /// The session's lock when no call holds it; `None` while a call is running in the session.
 fn idle_session(dir: &Path) -> Result<Option<Option<File>>> {
     let path = dir.join("session.lock");
@@ -76,9 +86,7 @@ fn idle_session(dir: &Path) -> Result<Option<Option<File>>> {
 pub fn prune(output_dir: &Path, older_than: Duration, dry_run: bool) -> Result<Value> {
     let now = SystemTime::now();
     let (mut removed, mut kept, mut busy, mut bytes) = (0u64, 0u64, 0u64, 0u64);
-    let entries = fs::read_dir(output_dir)
-        .with_context(|| format!("Cannot read the output directory {}", output_dir.display()))?;
-    for entry in entries.flatten() {
+    for entry in output_entries(output_dir)? {
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         if !is_run_folder(&name) || !path.is_dir() {
@@ -161,9 +169,7 @@ pub fn usage(output_dir: &Path, days: u64) -> Result<Value> {
     let mut fallbacks = 0u64;
     let mut statuses: BTreeMap<String, u64> = BTreeMap::new();
     let mut sources: BTreeMap<String, u64> = BTreeMap::new();
-    let entries = fs::read_dir(output_dir)
-        .with_context(|| format!("Cannot read the output directory {}", output_dir.display()))?;
-    for entry in entries.flatten() {
+    for entry in output_entries(output_dir)? {
         let path = entry.path();
         if !is_run_folder(&entry.file_name().to_string_lossy()) || !path.is_dir() {
             continue;
@@ -308,5 +314,15 @@ mod tests {
         let all = usage(root.path(), 0).unwrap();
         assert_eq!(all["sessions"], 2);
         assert_eq!(all["jev_cost_usd"], 0.04);
+    }
+
+    #[test]
+    fn a_missing_output_directory_counts_as_no_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("never-created");
+        assert_eq!(usage(&missing, 0).unwrap()["sessions"], 0);
+        let pruned = prune(&missing, Duration::from_secs(1), true).unwrap();
+        assert_eq!(pruned["removed"], 0);
+        assert!(!missing.exists());
     }
 }

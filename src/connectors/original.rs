@@ -164,11 +164,11 @@ fn extract(content_type: &str, bytes: Vec<u8>) -> Result<Extracted, String> {
     }
     let (text, page_dates) = match content_type {
         "text/html" => (
-            crate::connectors::algolia::html_article_text(body),
+            crate::extract::html_article_text(body),
             Some(crate::rank::html_page_dates(body)),
         ),
         "text/markdown" => (
-            crate::connectors::algolia::markdown_for_scoring(body)
+            crate::extract::markdown_for_scoring(body)
                 .map(|text| (text, "published_markdown_main_content")),
             None,
         ),

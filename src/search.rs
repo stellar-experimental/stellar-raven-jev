@@ -899,6 +899,16 @@ mod tests {
             std::cmp::Ordering::Less,
             "the complete article sorts before catalog metadata"
         );
+        let earlier_article = document("a", "article_visible_text");
+        assert_eq!(
+            uncertain_order(&scores, &earlier_article, &article),
+            std::cmp::Ordering::Less,
+            "equal completeness sorts by identifier"
+        );
+        assert_eq!(
+            uncertain_order(&scores, &article, &earlier_article),
+            std::cmp::Ordering::Greater
+        );
     }
     #[test]
     fn compact_projection_keeps_best_url_drops_uncertain_and_counts_reports() {

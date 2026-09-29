@@ -643,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_processes_never_spend_more_than_the_budget() {
+    fn concurrent_threads_never_spend_more_than_the_budget() {
         let dir = tempfile::tempdir().unwrap();
         let provider = budget("a", 60.0);
         let spent: usize = std::thread::scope(|scope| {
@@ -665,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn processes_sharing_a_folder_share_cooldowns_gates_and_slots() {
+    fn instances_sharing_a_folder_share_cooldowns_gates_and_slots() {
         let dir = tempfile::tempdir().unwrap();
         let first = Governor::at(dir.path()).unwrap();
         let second = Governor::at(dir.path()).unwrap();

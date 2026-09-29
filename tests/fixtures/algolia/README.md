@@ -1,10 +1,12 @@
-# Algolia extraction fixtures
+# Extraction fixtures
 
-These public State Archival snapshots reproduce the original extraction failures.
-They preserve navigation, metadata, and fenced code from the saved responses.
-Tests read these tracked files without network access.
+These original fixtures describe a fictional Quillon paper archive.
+They contain no source snapshots or real protocol facts.
+The tests in `src/extract.rs` read both files without network access.
 
-Source: https://developers.stellar.org/docs/learn/fundamentals/contract-development/storage/state-archival
+- `article.html` contains an article, noisy navigation, metadata, scripts, styles, hidden content, and code.
+  Its navigation exceeds 30,000 characters. The test requires extracted text below that bound.
+- `article.md` contains metadata, navigation, scripts, body text, and a fenced import.
+  Tests require metadata removal and preservation of the import and body text.
 
-- `state-archival.html`: SHA-256 `1b91b0c77ccdfca1fbcc3f9bf38170fdc1e98be4a861a8604513cdd5210c762f`.
-- `state-archival.md`: SHA-256 `bc119f9a0cbe3027ef7902f1fa1a57cc4a3a4dbc2ed486a8d2a8a5eaedfea39b`.
+Both formats test separate extraction paths.

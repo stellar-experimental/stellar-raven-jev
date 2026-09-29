@@ -1,6 +1,8 @@
 ---
 name: stellar-raven-jev
 description: Retrieve and assess Stellar ecosystem source evidence with the stellar-raven-jev CLI. Use for cited Stellar lookups, saved Jev sessions, or requests to use Jev. Implementation work without source retrieval does not need this skill.
+license: Apache-2.0
+compatibility: Requires the stellar-raven-jev CLI on PATH, source credentials, and at least one Jev provider.
 ---
 
 # stellar-raven-jev
@@ -19,15 +21,20 @@ stellar-raven-jev search --help
 stellar-raven-jev doctor
 ```
 
-`doctor` checks local settings without network requests. It does not validate remote authentication.
-`doctor --network` also sends one free request to each Jev provider. A pass does not guarantee that paid calls succeed.
-If the binary or required settings are missing, report the missing prerequisite.
-Use an existing absolute `JEV_ENV_FILE` or `--env-file` outside the configured project.
-Keep credential values out of output.
+If the binary is missing, report it. The user can install it with
+`cargo install --git https://github.com/stellar-experimental/stellar-raven-jev --locked`.
 
-`search`, `check`, and `more` can spend money. Use the current authorization and configured allocation.
+Settings come from environment variables, a `.env` file in the working directory or a parent,
+or an absolute `JEV_ENV_FILE` or `--env-file`.
+`doctor` checks local settings without network requests. It does not validate remote authentication.
+Before a live call, check that `local_configuration_ready` and `live_run_budget_ready` are true.
+`doctor --network` also sends one free request to each Jev provider. A pass does not guarantee that paid calls succeed.
+If a required setting is missing, report the missing prerequisite. Keep credential values out of output.
+
+`search`, `check`, and `more` can spend money. Live calls need a positive `JEV_BUDGET_USD` or `--budget-usd`.
+Use the current authorization and configured allocation.
 Do not increase the allocation or change credentials to resolve a failed call.
-The `--budget-usd` value is not a total limit across follow-up calls and new sessions.
+The `--budget-usd` value applies to one call. It is not a total limit across follow-up calls and new sessions.
 Keep the combined spend within the authorized total. Stop when evidence covers the question or that limit is reached.
 
 ## Workflow
@@ -52,15 +59,16 @@ Use compact output for ordinary lookups. Use `--json` when uncertain results or 
 
 ## Handle incomplete calls
 
-Exit 2 indicates partial results. Inspect the reports and `load` before using them or planning another call.
+Exit 1 indicates a failed call. Read the error before another call. Repeated calls do not repair missing settings.
+Exit 2 indicates partial results. Inspect `report_stage_counts` and `load` before using them or planning another call.
+Use `--json` for the full reports.
 `load.degraded` indicates reduced evidence, even when usable results remain.
 Exit 3 indicates `busy`. Inspect its reported usage; routing can spend money before source admission fails.
 Respect `retry_after_ms` and the task's time and spending limits before retrying.
-For other errors, inspect the error before another call. Repeated calls do not repair missing settings.
 A `network_check` report, or a `load.jev_failure_causes` class such as `dns` or `connect_denied`, usually shows missing network access.
 `connect_denied` can also mean that a proxy could not reach the provider.
 Report the network problem. Repeated calls do not repair it.
 
-## Saved sessions and evaluation
+## Saved sessions
 
 Read [references/session-operations.md](references/session-operations.md) for claim checks, pending pools, replay, usage, or evidence retention.

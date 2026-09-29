@@ -1,33 +1,6 @@
-# Credentials
 .env
 .env.*
 !.env.example
-
-# Build
 /target/
-
-# Run evidence, local experiments, and evaluation artifacts stay out of the repository.
 /runs/
-/evidence/
-/experiments/
-/research-repos/
-/eval/
-/scripts/
-/.agents/
-
-# Session reports and reviews stay local.
-/docs/
-
-*.log
 .DS_Store
-__pycache__/
-*.pyc
-
-# Evaluation harnesses, findings, and session notes stay local.
-/eval-*/
-/EVIDENCE-EXPERIMENT.md
-/NEXT-EVAL-*.md
-/PASSAGE-REQUIREMENTS-NOTES.md
-/REVIEW-*.md
-/examples/repack_evidence.py
-/examples/test_repack_evidence.py
