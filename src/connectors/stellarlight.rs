@@ -173,8 +173,8 @@ async fn read(
         .http
         .request(Method::GET, url, auth_headers(), None)
         .await;
-    // Scout answers transient overload with a server error, and a connection can fail before any
-    // response. Every Scout read is a GET, so one retry is safe: after the Retry-After Scout
+    // Scout answers transient overload with a server error, and a connection can fail before a
+    // complete response. Every Scout read is a GET, so one retry is safe: after the Retry-After Scout
     // sends, or after a short delay. A timeout is not retried, because it has already spent its
     // time. A second failure is reported, and so is a first one whose retry would wait too long
     // or end past the fetch deadline.
@@ -245,14 +245,18 @@ async fn read(
                 result,
                 source,
                 "http",
-                format!("Scout read failed{cause}: {error}.{not_retried}"),
+                format!(
+                    "Scout read failed{cause}: {}.{not_retried}",
+                    error.to_string().trim_end_matches('.')
+                ),
             );
             None
         }
     }
 }
 
-/// The transport failure class of a request error, when the request failed before a response.
+/// The transport failure class of a request error, when the request failed before a complete
+/// response.
 fn transport_cause(error: &anyhow::Error) -> Option<TransportCause> {
     error
         .downcast_ref::<crate::http::TransportFailure>()
@@ -1158,6 +1162,50 @@ mod tests {
         let url = format!("http://{addr}/api/x");
         assert!(read(&ctx, source, &mut result, &url).await.is_some());
         assert!(result.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_timeout_and_a_rate_limit_refusal_are_not_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A server that accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let ctx = FetchContext {
+            http: crate::http::HttpRecorder::loopback_for_test(dir.path(), &config).unwrap(),
+            config,
+            deadline: None,
+        };
+        let mut result = FetchResult::default();
+        let url = format!("http://{addr}/api/x");
+        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let message = &result.failures[0].message;
+        assert!(
+            message.starts_with("Scout read failed (timeout)"),
+            "{message}"
+        );
+        assert!(!message.contains(".."), "{message}");
+        // A refusal by a rate-limit gate is not a transport failure.
+        let refused = anyhow::Error::new(crate::http::SourceRateLimited {
+            scope: "fernlet.test/api".into(),
+            wait: std::time::Duration::from_secs(5),
+        });
+        assert_eq!(transport_cause(&refused), None);
     }
 
     #[tokio::test]
