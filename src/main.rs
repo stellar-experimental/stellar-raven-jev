@@ -48,8 +48,11 @@ Output (compact JSON):
                      (published, modified, or observed); null when none.
   still_current      For a time-dependent question: Jev's judgment that the result likely still
                      holds today, given its date.
-  authority_tier     1 official Stellar, 2 other Stellar-run and GitHub, 3 other, 4 summaries,
-                     generated records, and social posts.
+  authority_tier     Source authority by exact host (www. ignored), not truth. 1:
+                     developers.stellar.org, stellar.org, and github.com/stellar/. 2:
+                     skills.stellar.org, communityfund.stellar.org, and other github.com. 3: other
+                     hosts. 4: x.com, twitter.com, youtube.com, youtu.be, medium.com, and every
+                     ai_summary or synthetic_record, whatever the host.
   companions         Up to two other selected documents at the same URL, longest first.
   currentness        The question's time intent and the newest dated evidence among the results.
   not_shown          Counts you did not see; full_report_path holds every result.
@@ -67,12 +70,12 @@ Output (compact JSON):
 
 const CHECK_FIELDS: &str = "\
 Output: per claim, max_supports, max_contradicts, and max_qualifies (0-1; null when no document
-was judged), and lists of documents at 0.5 or above with text_path. Qualify or search again when
-max_supports is under 0.5. Read a contradicting row before you act on it: drop or qualify the
-claim only when the row is about the same subject and scope. Each claim is judged in its own
-Jev calls, so more claims cost more. documents_failed counts documents without a judgment;
-failure_causes gives their cause classes. jev_providers_skipped names the providers that failed
-the network check.";
+was judged), and lists of documents at 0.5 or above with text_path, strongest first, at most
+--limit rows per list. Qualify or search again when max_supports is under 0.5. Read a
+contradicting row before you act on it: drop or qualify the claim only when the row is about the
+same subject and scope. Each claim is judged in its own Jev calls, so more claims cost more.
+documents_failed counts documents without a judgment; failure_causes gives their cause classes.
+jev_providers_skipped names the providers that failed the network check.";
 
 const MORE_FIELDS: &str = "\
 Pools list what a session has not spent: sources routed but not fetched, and fetched documents

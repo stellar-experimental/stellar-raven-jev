@@ -61,8 +61,8 @@ impl Backend {
             Self::OpenRouter { .. } => "openrouter",
         }
     }
-    /// $0.042 per million input tokens, in nanodollars, plus each provider's credit purchase fee:
-    /// 5% for Cloudflare, 5.5% for OpenRouter, none when TypeSafe bills directly.
+    /// Accounted costs use nanodollars per 10 input tokens.
+    /// TypeSafe uses 420, OpenRouter uses 444, and other backends use 441.
     fn cost_nanos(&self, tokens: u64) -> Result<u64> {
         let per_ten_tokens: u128 = match self {
             Self::TypeSafe { .. } => 420,
@@ -450,7 +450,7 @@ impl JevClient {
             "shared_ceiling_usd": SHARED_CEILING_USD,
             "shared_budget_owner": "lead; this client enforces its run allocation only",
             "input_usd_per_million": 0.042, "output_usd_per_million": 0.0,
-            "credit_purchase_multipliers": {"cloudflare": 1.05, "openrouter": 1.055, "typesafe": 1.0},
+            "credit_purchase_multipliers": {"cloudflare": 1.05, "openrouter": 444.0 / 420.0, "typesafe": 1.0},
             "reservation_input_tokens_per_request": MAX_INPUT_TOKENS,
             "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and each provider's credit purchase overhead; reservations use the highest provider price",
             "retry_policy": "each provider runs a request once (Cloudflare: cf-aig-max-attempts: 1); the client sends again only after a response that means the request was not run (429, 529, 402, 401, 403), or after a connection that failed before the request was sent, per rate_limit_policy and provider_chain_policy, at most 8 sends per attempt",

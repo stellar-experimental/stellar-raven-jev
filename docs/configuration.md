@@ -14,7 +14,7 @@ The CLI loads one env file before it reads its options:
 
 An explicit env file path must be absolute. Variables that the shell sets take precedence over the file.
 An empty value in the file keeps the default.
-Every flag works before or after the command.
+Global flags work before or after the command. Command flags, such as `search --limit`, follow the command.
 
 Some values cannot go in an HTTP header, for example a key with a line break.
 Such a key, token, or gateway ID fails at startup. The error names the setting.
@@ -38,7 +38,7 @@ Jev runs through one or more providers. Each configured provider joins a chain i
 |---|---|---|---|
 | `cloudflare` | `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_AUTH_PROFILE`; optional `JEV_GATEWAY_ID` (default `default`) | Workers AI `typesafe/jev` | $0.0441 ($0.042 plus a 5% credit fee) |
 | `typesafe` | `TYPESAFE_AI_API_KEY` | `https://api.typesafe.ai/v1/systemone`, `jev-latest` | $0.042 |
-| `openrouter` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1/systemone`, `~typesafe/jev-latest` | $0.0444 ($0.042 plus a 5.5% credit fee) |
+| `openrouter` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1/systemone`, `~typesafe/jev-latest` | $0.0444 |
 
 - `JEV_PROVIDERS` (comma-separated) sets another order or a subset. It must name only configured providers.
 - All three serve the same model with the same request shape. Output tokens are free.

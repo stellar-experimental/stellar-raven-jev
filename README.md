@@ -102,7 +102,7 @@ A session can spend at most 3 times `--budget-usd` across all its calls.
 ```sh
 stellar-raven-jev sources [--resources agentic]    # list the sources
 stellar-raven-jev doctor [--network]               # check settings; --network sends one free request to each Jev provider
-stellar-raven-jev report RUN_DIR --variant NAME    # rebuild a saved run's report; no retrieval or scoring
+stellar-raven-jev report RUN_DIR [--variant NAME]  # rebuild a saved run's report (NAME defaults to replay); no retrieval or scoring
 stellar-raven-jev prune [--older-than-days N] [--dry-run]   # remove idle run folders
 stellar-raven-jev usage [--days N]                 # totals across recent sessions
 ```

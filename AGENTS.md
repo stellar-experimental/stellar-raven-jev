@@ -24,8 +24,9 @@ This tool answers any question about the Stellar ecosystem. It must stay general
 
 - Do not add code, flags, output fields, prompts, or tests that exist for one question or one
   narrow question type.
-- Do not branch on question wording, named entities, or topics (for example "protocol",
-  "USDT", "who is", "stablecoin") to change routing, retrieval, scoring, ranking, or output.
+- Do not branch on question wording, named entities, or topics to change routing, retrieval,
+  scoring, ranking, or output. Examples of such triggers are "protocol", "USDT", "who is", and
+  "stablecoin".
 - Do not store facts that answer questions: version numbers, dates, names, roles, asset codes,
   or issuers. They go stale, and they hide retrieval failures.
 - Keyword lists, synonym tables, and regular expressions that encode evaluation vocabulary are

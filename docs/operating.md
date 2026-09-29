@@ -62,9 +62,12 @@ No code path depends on the topic of a question. See [AGENTS.md](../AGENTS.md).
 | `authority_tier` | Documents |
 |---|---|
 | 1 | `developers.stellar.org`, `stellar.org`, and repositories under `github.com/stellar/` |
-| 2 | Other Stellar-run sites and other GitHub repositories |
+| 2 | `skills.stellar.org`, `communityfund.stellar.org`, and other `github.com` repositories |
 | 3 | Other sites |
-| 4 | Summaries, generated records, and social or video posts |
+| 4 | `ai_summary` and `synthetic_record` documents on any host, and every page on `x.com`, `twitter.com`, `youtube.com`, `youtu.be`, and `medium.com` |
+
+The `content_scope` check comes first. The host check then applies to the page URL.
+A page on a tier 4 host is tier 4 even when it holds ordinary text.
 
 ### Content scope
 
@@ -145,8 +148,9 @@ Does the text support the claim? Does it contradict the claim? Does it add a con
 - Each claim is judged in its own Jev calls, because claims that share a call change each other's judgments.
 - `--scope selected` (default) reads selected and uncertain documents. `scored` reads every scored document.
   `all` also reads the unscored documents.
-- For each claim, the output gives `max_supports`, `max_contradicts`, and `max_qualifies`, and it lists the
-  documents at 0.5 or above, strongest first. It gives no verdict.
+- For each claim, the output gives `max_supports`, `max_contradicts`, and `max_qualifies`.
+  It lists the documents at 0.5 or above, strongest first. It gives no verdict.
+- Each printed list keeps at most `--limit` rows (default 5). `checks/` holds the judgment of every document.
 - `documents_failed` and `failure_causes` count the documents without a judgment.
 - Every judgment is saved under `checks/`.
 
@@ -269,11 +273,13 @@ Source hedging is off by default. `--source-hedge-ms N` turns it on with a delay
 Each search makes a run folder under the output folder, named `<unix seconds>-<uuid>`.
 
 - After a `search` or `more` prints its result, run folders with no activity for `--retain-days` days
-  (default 7) are removed. This happens at most once a day per output folder. `0` turns it off.
+  (default 7) are removed. This happens at most once a day per output folder.
+  `--retain-days 0` turns this automatic removal off.
 - A folder's activity is its latest file change, so a session that `more` or `check` continued stays.
 - Pruning never removes a session that a call holds or the host folder `.host/`.
   It also never removes a name that is not a run folder.
-- `prune` does the same on demand. `--older-than-days N` sets the age. `--dry-run` removes nothing.
+- `prune` removes idle run folders on demand. `--older-than-days N` sets the age, and the default is `--retain-days`.
+  The age must be at least 1, so with `--retain-days 0`, give `--older-than-days`. `--dry-run` removes nothing.
 - Keep evaluation runs in their own output folder, so that pruning does not remove evidence that you still need.
 
 `usage --days N` (default 7, `0` for all) sums the sessions that were active in the last N days.
@@ -291,12 +297,13 @@ By default a run folder keeps what the output points to and what later calls nee
   `documents.json`, `deferred.json`, `scores.json`, `classification.json`, `omitted.json`, `failures.json`,
   `intent.json`, `usage.json`, `load.json`, `retrieved.json`, and `session.json`.
 - `checks/` after a `check`, and `bundle.md` after `--bundle`.
-- `search-NAME.json` and `search-documents-NAME/` after `report --variant NAME`.
+- `search-NAME.json` and `search-documents-NAME/` after `report`. NAME is the `--variant` value (default `replay`).
 
 `--bundle` writes `bundle.md`: the full text of each shown result in rank order, each followed by its
 companions. A contents list at the top gives the first line of each section. `bundle_path` names the file.
 
-`report RUN_DIR --variant NAME` rebuilds the report from the saved state, without retrieval or scoring.
+`report RUN_DIR [--variant NAME]` rebuilds the report from the saved state, without retrieval or scoring.
+NAME defaults to `replay`.
 The original `search.json` does not change, so you can compare ranking changes on saved evidence at no cost.
 
 With `--full-record`, a run also keeps the complete audit record:
