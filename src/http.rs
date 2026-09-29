@@ -14,6 +14,15 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+/// Lowercase hex SHA-256 of `data`.
+pub fn sha256_hex(data: impl AsRef<[u8]>) -> String {
+    hex(&Sha256::digest(data))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[derive(Clone)]
 pub struct HttpRecorder {
     client: Client,
@@ -765,7 +774,7 @@ impl RawRecord {
             std::fs::rename(&temporary, self.root.join(&compressed))?;
             self.metadata["body_artifact"] = json!(compressed);
             self.metadata["body_encoding"] = json!("gzip");
-            self.metadata["body_sha256"] = json!(format!("{:x}", Sha256::digest(&bytes)));
+            self.metadata["body_sha256"] = json!(sha256_hex(&bytes));
             write_metadata(
                 &self.root.join(format!("{}.json", self.prefix)),
                 &self.metadata,
@@ -1294,7 +1303,7 @@ impl HttpRecorder {
             digest.update(value.as_bytes());
             digest.update([0]);
         }
-        let key = format!("{url}\n{:x}", digest.finalize());
+        let key = format!("{url}\n{}", hex(&digest.finalize()));
         let cell = self
             .shared
             .lock()
@@ -1423,8 +1432,7 @@ impl HttpRecorder {
                     body.as_ref().map(safe_body).unwrap_or(Value::Null);
             } else if let Some(body) = &body {
                 let bytes = serde_json::to_vec(body)?;
-                record.metadata["request_body_sha256"] =
-                    json!(format!("{:x}", Sha256::digest(&bytes)));
+                record.metadata["request_body_sha256"] = json!(sha256_hex(&bytes));
                 record.metadata["request_body_bytes"] = json!(bytes.len());
                 record.metadata["request_body_recorded_in"] = json!("caller audit record");
             }

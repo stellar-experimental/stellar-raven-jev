@@ -7,7 +7,6 @@ use crate::{
 };
 use reqwest::Url;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The source ID of pages the reader appends.
@@ -75,7 +74,7 @@ pub fn normalize(url: &str) -> Option<Url> {
 
 /// The document ID of a read page, before the pipeline namespaces it with `original::`.
 pub fn document_id(url: &Url) -> String {
-    format!("{:x}", Sha256::digest(url.as_str().as_bytes()))[..16].to_owned()
+    crate::http::sha256_hex(url.as_str().as_bytes())[..16].to_owned()
 }
 
 /// A document that holds the complete body its URL returned.
@@ -155,7 +154,7 @@ struct Extracted {
 /// Scoring text, page dates, size, and hash of a declared text body. A body that is not UTF-8 or
 /// holds binary data is refused, with the reason.
 fn extract(content_type: &str, bytes: Vec<u8>) -> Result<Extracted, String> {
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let sha256 = crate::http::sha256_hex(&bytes);
     let Ok(body) = std::str::from_utf8(&bytes) else {
         return Err("The body is not UTF-8 text".into());
     };
