@@ -1072,6 +1072,7 @@ mod tests {
         let ctx = FetchContext {
             http: http.clone(),
             config: config.clone(),
+            deadline: None,
         };
         for source in sources() {
             let result = fetch(&ctx, &source, "Stellar").await.unwrap();
@@ -1084,9 +1085,17 @@ mod tests {
             0
         );
         config.max_documents = 0;
-        let result = fetch(&FetchContext { http, config }, &sources()[0], "Stellar")
-            .await
-            .unwrap();
+        let result = fetch(
+            &FetchContext {
+                http,
+                config,
+                deadline: None,
+            },
+            &sources()[0],
+            "Stellar",
+        )
+        .await
+        .unwrap();
         assert!(result.documents.is_empty());
         assert_eq!(result.failures.len(), 1);
     }

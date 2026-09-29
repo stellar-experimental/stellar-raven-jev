@@ -617,7 +617,7 @@ async fn execute(
     // questions instead of starting fetches that its sources cannot finish in time.
     let Some(hold) = http
         .hold_hosts(
-            &connectors::host_caps(fetch_now.iter().copied(), &config.source_slots),
+            &connectors::host_caps(fetch_now.iter().copied(), config),
             HOST_SLOT_WAIT,
         )
         .await?
@@ -703,6 +703,8 @@ pub(crate) async fn fetch_sources(
     evidence: &mut Evidence,
 ) -> Result<Vec<Document>> {
     let selected: BTreeSet<String> = chosen.iter().map(|s| s.id.clone()).collect();
+    let fetch_deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(config.fetch_deadline_secs);
     let jobs = stream::iter(chosen.iter().copied())
         .map(|source| {
             let mut source_config = config.clone();
@@ -710,6 +712,7 @@ pub(crate) async fn fetch_sources(
             let ctx = FetchContext {
                 http: http.clone(),
                 config: source_config,
+                deadline: Some(fetch_deadline),
             };
             async move {
                 (
@@ -725,8 +728,6 @@ pub(crate) async fn fetch_sources(
     let mut jobs = Box::pin(jobs);
     let mut fetched = Vec::new();
     let mut finished = BTreeSet::new();
-    let fetch_deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(config.fetch_deadline_secs);
     loop {
         let (source_id, result) = match tokio::time::timeout_at(fetch_deadline, jobs.next()).await {
             Ok(Some(next)) => next,
@@ -1544,7 +1545,7 @@ pub async fn continue_session(
         .iter()
         .filter(|source| unfetched.contains(&source.id) && requested.contains(&source.id))
         .collect();
-    let caps = connectors::host_caps(chosen.iter().copied(), &config.source_slots);
+    let caps = connectors::host_caps(chosen.iter().copied(), &config);
     let hold = http.hold_hosts(&caps, HOST_SLOT_WAIT).await?;
     let window_wait = match (&hold, chosen.is_empty()) {
         (None, _) => Some(std::time::Duration::from_millis(HOST_SLOT_RETRY_MS)),
@@ -2323,6 +2324,7 @@ mod tests {
                 &FetchContext {
                     http: http.clone(),
                     config: config.clone(),
+                    deadline: None,
                 },
                 &sources()[0],
                 "q",

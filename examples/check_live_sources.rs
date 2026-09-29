@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
         let ctx = FetchContext {
             http: HttpRecorder::new(&dir, &config)?,
             config,
+            deadline: None,
         };
         let result = match tokio::time::timeout(
             std::time::Duration::from_secs(90), connectors::fetch(&ctx, source, question),

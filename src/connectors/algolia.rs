@@ -1683,7 +1683,11 @@ mod tests {
         };
         let dir = std::env::temp_dir().join(format!("algolia-fixture-{}", uuid::Uuid::new_v4()));
         let http = crate::http::HttpRecorder::new(&dir, &config).unwrap();
-        let ctx = FetchContext { http, config };
+        let ctx = FetchContext {
+            http,
+            config,
+            deadline: None,
+        };
         for source in sources() {
             let a = fetch(&ctx, &source, "question").await.unwrap();
             let b = fetch(&ctx, &source, "question").await.unwrap();

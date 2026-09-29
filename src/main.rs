@@ -160,8 +160,10 @@ struct Cli {
     host_dir: Option<PathBuf>,
     /// Most questions that may fetch from a source host at once on this host, as
     /// `HOST=N[,HOST=N]` (for example `stellarlight.xyz=3`). A question waits up to about a
-    /// minute for a slot on every capped host it fetches from, then reports `busy`. Hosts not
-    /// named are not capped. Also accepts JEV_SOURCE_SLOTS.
+    /// minute for a slot on every capped host it fetches from, then reports `busy`. A host whose
+    /// source states an in-flight request limit is capped by default at that limit divided by the
+    /// requests one question may have in flight there. A named host replaces its default (a large
+    /// N lifts it), and other hosts are not capped. Also accepts JEV_SOURCE_SLOTS.
     #[arg(long, global = true, env = "JEV_SOURCE_SLOTS", value_parser = parse_source_slots)]
     source_slots: Option<std::collections::BTreeMap<String, usize>>,
     /// Run folders with no activity for this many days are removed, at most once a day, after a

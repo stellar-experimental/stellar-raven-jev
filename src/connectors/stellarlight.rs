@@ -81,6 +81,10 @@ const LISTINGS: &[Listing] = &[
     Listing { id: "stablecoins", path: "/api/stablecoins", key: "stablecoins", description: "Tracked stablecoins, fiat pegs, USD market capitalization, and dated usage", paged: false, query: false, limit: 100, roster: &["ticker", "name", "company", "peg", "basis", "assetType", "issuer", "issuerDomain", "supply", "marketCapUSD", "updatedAt", "verified", "note"], every_row: &[], row_dates: &[("/updatedAt", "observed")] },
 ];
 
+/// Requests in flight that Stellar Light advises one client host to stay at or under. Above it,
+/// Scout's slowest responses approach the fetch deadline.
+pub const HOST_CONCURRENCY: usize = 32;
+
 /// The host every Stellar Scout request goes to.
 pub fn host() -> Option<String> {
     Some(Url::parse(BASE).ok()?.host_str()?.to_owned())
@@ -146,43 +150,56 @@ async fn read(
     source: &Source,
     result: &mut FetchResult,
     url: &str,
-) -> Option<(Value, String)> {
+) -> Option<(Value, String, String)> {
     let mut response = ctx
         .http
         .request(Method::GET, url, auth_headers(), None)
         .await;
-    // Scout answers transient overload with a server error. One late retry recovers most of them;
-    // a second failure is reported.
-    if matches!(&response, Ok(r) if matches!(r.status, 500 | 502 | 503 | 504)) {
-        tokio::time::sleep(retry_delay()).await;
-        response = ctx
-            .http
-            .request(Method::GET, url, auth_headers(), None)
-            .await;
+    // Scout answers transient overload with a server error. One retry, after the Retry-After it
+    // sends, recovers most of them. A second failure is reported, and so is a first one whose
+    // retry would wait too long or end past the fetch deadline.
+    let mut not_retried = None;
+    if let Ok(first) = &response {
+        if matches!(first.status, 500 | 502 | 503 | 504) {
+            match retry_delay(&first.headers).and_then(|delay| within(ctx.deadline, delay)) {
+                Ok(delay) => {
+                    tokio::time::sleep(delay).await;
+                    response = ctx
+                        .http
+                        .request(Method::GET, url, auth_headers(), None)
+                        .await;
+                }
+                Err(reason) => not_retried = Some(reason),
+            }
+        }
     }
     match response {
         Ok(response) => {
+            let trace = trace(&response.headers);
             if !(200..300).contains(&response.status) {
+                let not_retried = not_retried
+                    .map(|reason| format!(" and was not retried: {reason}"))
+                    .unwrap_or_default();
                 failure(
                     result,
                     source,
                     "http",
                     format!(
-                        "Scout returned HTTP {}. Artifact: {}",
+                        "Scout returned HTTP {}{not_retried}. Artifact: {}{trace}",
                         response.status, response.artifact
                     ),
                 );
                 return None;
             }
             match response.json() {
-                Ok(value) => Some((value, response.artifact)),
+                Ok(value) => Some((value, response.artifact, trace)),
                 Err(_) => {
                     failure(
                         result,
                         source,
                         "parse",
                         format!(
-                            "Scout returned invalid JSON. Artifact: {}",
+                            "Scout returned invalid JSON. Artifact: {}{trace}",
                             response.artifact
                         ),
                     );
@@ -202,6 +219,20 @@ async fn read(
     }
 }
 
+/// Scout's request ID, server timing, and match mode, as a suffix for a report about the
+/// response, so Scout's operators can find the request. Empty when Scout sent none of them.
+fn trace(headers: &std::collections::BTreeMap<String, String>) -> String {
+    let parts: Vec<String> = ["x-vercel-id", "server-timing", "x-scout-match-mode"]
+        .iter()
+        .filter_map(|key| headers.get(*key).map(|value| format!("{key}: {value}")))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(". Trace: {}", parts.join("; "))
+    }
+}
+
 /// A partner key (`STELLAR_LIGHT_API_KEY`) raises Scout's request limits; without one, requests
 /// are anonymous and get the public limits.
 fn auth_headers() -> Vec<(String, String)> {
@@ -213,10 +244,46 @@ fn auth_headers() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// 250 to 750 ms, spread so that concurrent readers do not retry together.
-fn retry_delay() -> std::time::Duration {
-    let spread = uuid::Uuid::new_v4().as_u128() % 500;
-    std::time::Duration::from_millis(250 + spread as u64)
+/// The longest Retry-After the one retry waits out. A longer one would spend most of the fetch
+/// deadline, so the failure is reported instead.
+const RETRY_AFTER_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
+/// Time left for the retried request itself after its wait, before the fetch deadline.
+const RETRY_ROOM: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// When to retry a server error: after the Retry-After Scout sends, or after 250 ms without one,
+/// plus up to 500 ms of spread so that concurrent readers do not retry together. A Retry-After
+/// above [`RETRY_AFTER_LIMIT`] is the reason not to retry.
+fn retry_delay(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<std::time::Duration, String> {
+    let spread = std::time::Duration::from_millis((uuid::Uuid::new_v4().as_u128() % 500) as u64);
+    match crate::http::retry_after(headers) {
+        Some(asked) if asked > RETRY_AFTER_LIMIT => Err(format!(
+            "its Retry-After of {} s is above the {} s retry limit",
+            asked.as_secs_f64(),
+            RETRY_AFTER_LIMIT.as_secs()
+        )),
+        Some(asked) => Ok(asked + spread),
+        None => Ok(std::time::Duration::from_millis(250) + spread),
+    }
+}
+
+/// `delay` when a retry after it still leaves [`RETRY_ROOM`] before the fetch deadline. A
+/// connector still running at the deadline loses every document, so it reports the failure and
+/// keeps what it has instead.
+fn within(
+    deadline: Option<tokio::time::Instant>,
+    delay: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    match deadline {
+        Some(deadline) if tokio::time::Instant::now() + delay + RETRY_ROOM > deadline => {
+            Err(format!(
+                "a retry after {} ms would end past the fetch deadline",
+                delay.as_millis()
+            ))
+        }
+        _ => Ok(delay),
+    }
 }
 
 fn string_field<'a>(row: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -521,7 +588,8 @@ fn matched_count(meta: &Value) -> Option<u64> {
         .or_else(|| meta.pointer("/counts/total").and_then(Value::as_u64))
 }
 
-fn notices(source: &Source, meta: &Value, result: &mut FetchResult) {
+/// `trace` is the response's [`trace`] suffix; it is added to the ranking-fallback report.
+fn notices(source: &Source, meta: &Value, trace: &str, result: &mut FetchResult) {
     for key in ["warnings", "sourceAdvisory", "exactMiss", "degraded"] {
         if let Some(value) = meta.get(key).filter(|v| !v.is_null()) {
             failure(result, source, "upstream", format!("Scout {key}: {value}"));
@@ -536,7 +604,7 @@ fn notices(source: &Source, meta: &Value, result: &mut FetchResult) {
             result,
             source,
             "search_limit",
-            format!("Scout ranking is degraded: {label}"),
+            format!("Scout ranking is degraded: {label}{trace}"),
         );
     }
 }
@@ -648,7 +716,7 @@ async fn hydrate(
         return Ok(());
     };
     let url = request_url(&format!("{path}{slug}"), &[])?;
-    let Some((value, artifact)) = read(ctx, source, result, &url).await else {
+    let Some((value, artifact, _)) = read(ctx, source, result, &url).await else {
         return Ok(());
     };
     doc.raw_artifacts.push(artifact.clone());
@@ -785,11 +853,11 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
             params.push(("offset", offset.to_string()));
         }
         let url = request_url(entry.path, &params)?;
-        let Some((value, artifact)) = read(ctx, source, &mut result, &url).await else {
+        let Some((value, artifact, trace)) = read(ctx, source, &mut result, &url).await else {
             break;
         };
         let meta = &value["meta"];
-        notices(source, meta, &mut result);
+        notices(source, meta, &trace, &mut result);
         let Some(rows) = value[entry.key].as_array() else {
             failure(
                 &mut result,
@@ -948,22 +1016,26 @@ mod tests {
         notices(
             source,
             &json!({"matchMode":"vector","matchModeLabel":"vector-similarity ranking"}),
+            "",
             &mut result,
         );
         assert!(result.failures.is_empty());
         notices(
             source,
             &json!({"matchMode":"keyword","matchModeLabel":"vector search unavailable — coarse keyword match over title and content"}),
+            ". Trace: x-vercel-id: iad1::abc-1",
             &mut result,
         );
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.failures[0].stage, "search_limit");
+        assert!(result.failures[0]
+            .message
+            .ends_with(". Trace: x-vercel-id: iad1::abc-1"));
     }
 
-    #[tokio::test]
-    async fn a_server_error_is_retried_once_and_a_second_one_is_reported() {
+    /// A loopback server that sends `replies` in order, then the last one forever.
+    async fn replying(replies: Vec<&'static [u8]>) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        // Replies in order: 500, 200, then 502 forever.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -971,32 +1043,140 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = vec![0; 4096];
                 let _ = socket.read(&mut request).await;
-                let reply: &[u8] = match n {
-                    0 => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
-                    1 => b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
-                    _ => b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
-                };
+                let reply = replies[n.min(replies.len() - 1)];
                 let _ = socket.write_all(reply).await;
             }
         });
-        let dir = tempfile::tempdir().unwrap();
+        addr
+    }
+
+    fn loopback_context(dir: &std::path::Path) -> FetchContext {
         let config = RunConfig::default();
-        let ctx = FetchContext {
-            http: crate::http::HttpRecorder::loopback_for_test(dir.path(), &config).unwrap(),
+        FetchContext {
+            http: crate::http::HttpRecorder::loopback_for_test(dir, &config).unwrap(),
             config,
-        };
+            deadline: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_retried_once_and_a_second_one_is_reported() {
+        let addr = replying(vec![
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
+            b"HTTP/1.1 502 Bad Gateway\r\nX-Vercel-Id: iad1::abc-1\r\nServer-Timing: total;dur=12\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = loopback_context(dir.path());
         let source = &sources()[0];
         let url = format!("http://{addr}/api/x");
         let mut result = FetchResult::default();
-        let (value, _) = read(&ctx, source, &mut result, &url)
+        let (value, _, _) = read(&ctx, source, &mut result, &url)
             .await
             .expect("the retry succeeds");
         assert_eq!(value["rows"], json!([]));
         assert!(result.failures.is_empty());
         assert!(read(&ctx, source, &mut result, &url).await.is_none());
         assert_eq!(result.failures.len(), 1);
-        assert!(result.failures[0].message.contains("HTTP 502"));
+        let message = &result.failures[0].message;
+        assert!(message.contains("HTTP 502"), "{message}");
+        assert!(
+            message.contains("x-vercel-id: iad1::abc-1; server-timing: total;dur=12"),
+            "{message}"
+        );
     }
+
+    #[tokio::test]
+    async fn the_retry_waits_for_retry_after_and_a_long_one_is_reported_without_a_retry() {
+        let addr = replying(vec![
+            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
+            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = loopback_context(dir.path());
+        let source = &sources()[0];
+        let url = format!("http://{addr}/api/x");
+        let mut result = FetchResult::default();
+        let started = std::time::Instant::now();
+        assert!(read(&ctx, source, &mut result, &url).await.is_some());
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        // A 30 s Retry-After is past the limit: reported at once, and the next reply is unused.
+        let started = std::time::Instant::now();
+        assert!(read(&ctx, source, &mut result, &url).await.is_none());
+        assert!(started.elapsed() < RETRY_AFTER_LIMIT);
+        assert_eq!(result.failures.len(), 1);
+        let message = &result.failures[0].message;
+        assert!(
+            message.contains("Retry-After of 30 s is above"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn retry_delay_follows_retry_after_seconds_and_dates() {
+        let headers = |value: &str| {
+            std::collections::BTreeMap::from([("retry-after".to_owned(), value.to_owned())])
+        };
+        let ms = std::time::Duration::from_millis;
+        let short = retry_delay(&Default::default()).unwrap();
+        assert!(short >= ms(250) && short < ms(750));
+        let two = retry_delay(&headers("2")).unwrap();
+        assert!(two >= ms(2_000) && two < ms(2_500));
+        assert!(retry_delay(&headers("4")).is_ok());
+        let long = retry_delay(&headers("5")).unwrap_err();
+        assert!(long.contains("Retry-After of 5 s"), "{long}");
+        // An HTTP-date in the past means now; a far one is above the limit.
+        let past = retry_delay(&headers("Sun, 06 Nov 1994 08:49:37 GMT")).unwrap();
+        assert!(past < ms(500));
+        assert!(retry_delay(&headers("Fri, 31 Dec 2100 23:59:59 GMT")).is_err());
+        // A value that is neither falls back to the short delay.
+        assert!(retry_delay(&headers("soon")).unwrap() < ms(750));
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_would_end_past_the_deadline_is_not_sent() {
+        let now = tokio::time::Instant::now();
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(within(None, second * 3), Ok(second * 3));
+        assert_eq!(within(Some(now + second * 10), second * 2), Ok(second * 2));
+        let late = within(Some(now + second * 2), second * 2).unwrap_err();
+        assert!(late.contains("past the fetch deadline"), "{late}");
+
+        let addr = replying(vec![
+            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = loopback_context(dir.path());
+        ctx.deadline = Some(tokio::time::Instant::now() + second * 2);
+        let mut result = FetchResult::default();
+        let url = format!("http://{addr}/api/x");
+        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
+        let message = &result.failures[0].message;
+        assert!(
+            message.contains("HTTP 503 and was not retried"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_trace_names_only_the_headers_scout_sent() {
+        assert_eq!(trace(&Default::default()), "");
+        let headers = std::collections::BTreeMap::from([
+            ("x-scout-match-mode".to_owned(), "keyword".to_owned()),
+            ("x-vercel-id".to_owned(), "iad1::abc-1".to_owned()),
+        ]);
+        assert_eq!(
+            trace(&headers),
+            ". Trace: x-vercel-id: iad1::abc-1; x-scout-match-mode: keyword"
+        );
+    }
+
     #[test]
     fn roster_document_keeps_every_registry_row_and_dated_metadata() {
         let source = sources()
@@ -1183,6 +1363,7 @@ mod tests {
         let ctx = FetchContext {
             http: crate::http::HttpRecorder::new(dir.path(), &config).unwrap(),
             config,
+            deadline: None,
         };
         let source = sources()
             .into_iter()
@@ -1372,6 +1553,7 @@ mod tests {
         let ctx = FetchContext {
             http: crate::http::HttpRecorder::new(dir.path(), &config).unwrap(),
             config,
+            deadline: None,
         };
         let catalog = sources();
         let unique: HashSet<_> = catalog.iter().map(|s| &s.id).collect();
@@ -1401,6 +1583,7 @@ mod tests {
         let ctx = FetchContext {
             http: crate::http::HttpRecorder::new(dir.path(), &config).unwrap(),
             config,
+            deadline: None,
         };
         let result = fetch(&ctx, &sources()[0], "wallet").await.unwrap();
         assert!(result.documents.is_empty());

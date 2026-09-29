@@ -77,11 +77,38 @@ pub fn search_host(source: &Source) -> Option<String> {
     }
 }
 
+/// The in-flight request limit that a source's operator states for one client host, by host.
+fn stated_host_limits() -> Vec<(String, usize)> {
+    stellarlight::host()
+        .map(|host| (host, stellarlight::HOST_CONCURRENCY))
+        .into_iter()
+        .collect()
+}
+
+/// Fetch slots per host: for each host with a stated limit, that limit divided by the requests
+/// one question may have in flight on a host (its per-host concurrency, plus hedge permits when
+/// hedging is on), and at least 1. Explicit `source_slots` replace these per host and add others.
+pub fn source_slots(config: &RunConfig) -> std::collections::BTreeMap<String, usize> {
+    let hedges = if config.source_hedge_ms > 0 {
+        crate::http::HEDGES_PER_HOST
+    } else {
+        0
+    };
+    let per_question = (config.concurrency + hedges).max(1);
+    let mut slots: std::collections::BTreeMap<String, usize> = stated_host_limits()
+        .into_iter()
+        .map(|(host, limit)| (host, (limit / per_question).max(1)))
+        .collect();
+    slots.extend(config.source_slots.clone());
+    slots
+}
+
 /// The capped hosts that fetching `sources` uses, with their slot counts, in a stable order.
 pub fn host_caps<'a>(
     sources: impl IntoIterator<Item = &'a Source>,
-    slots: &std::collections::BTreeMap<String, usize>,
+    config: &RunConfig,
 ) -> Vec<(String, usize)> {
+    let slots = source_slots(config);
     let hosts: std::collections::BTreeSet<String> =
         sources.into_iter().filter_map(search_host).collect();
     hosts
@@ -96,5 +123,33 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
         "stellarlight" => stellarlight::fetch(ctx, source, question).await,
         "algolia" => algolia::fetch(ctx, source, question).await,
         family => bail!("Unknown connector family: {family}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stated_limits_give_default_slots_and_explicit_slots_replace_or_add() {
+        let scout = stellarlight::host().unwrap();
+        let limit = stellarlight::HOST_CONCURRENCY;
+        let mut config = RunConfig::default();
+        assert_eq!(source_slots(&config)[&scout], limit / config.concurrency);
+        config.concurrency = limit * 2;
+        assert_eq!(source_slots(&config)[&scout], 1);
+        config.concurrency = 8;
+        config.source_hedge_ms = 4_000;
+        assert_eq!(
+            source_slots(&config)[&scout],
+            limit / (8 + crate::http::HEDGES_PER_HOST)
+        );
+        config.source_slots = std::collections::BTreeMap::from([
+            (scout.clone(), 1_000),
+            ("fernlet.test".to_owned(), 3),
+        ]);
+        let slots = source_slots(&config);
+        assert_eq!(slots[&scout], 1_000);
+        assert_eq!(slots["fernlet.test"], 3);
     }
 }

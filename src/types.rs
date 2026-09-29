@@ -168,4 +168,7 @@ impl Default for RunConfig {
 pub struct FetchContext {
     pub http: crate::http::HttpRecorder,
     pub config: RunConfig,
+    /// When the fetch stage drops unfinished connectors. A connector does not start a wait that
+    /// would end past it.
+    pub deadline: Option<tokio::time::Instant>,
 }

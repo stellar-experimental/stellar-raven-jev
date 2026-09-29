@@ -314,7 +314,7 @@ const WINDOW_MAX_RESET: Duration = Duration::from_secs(86_400);
 /// Hedges one run may send, and hedges in flight per host. Hedges never take the permits of the
 /// requests they duplicate.
 const HEDGES_PER_RUN: u64 = 16;
-const HEDGES_PER_HOST: usize = 2;
+pub(crate) const HEDGES_PER_HOST: usize = 2;
 /// How long a question waits for room in a source's advertised window before it sends without a
 /// booking: one full window of a one-minute source.
 const BOOKING_WAIT_LIMIT: Duration = Duration::from_secs(65);
@@ -416,6 +416,27 @@ fn http_date_seconds(text: &str) -> Option<i64> {
         .then_some(days * 86_400 + h * 3_600 + m * 60 + s)
 }
 
+/// The Retry-After in a response: seconds, or an HTTP-date (a past date is zero). It is capped at
+/// the longest gate closure before conversion, so no header can overflow a duration.
+pub(crate) fn retry_after(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Option<Duration> {
+    let value = headers.get("retry-after")?.trim();
+    let seconds = value
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            Some((http_date_seconds(value)? as f64 - now.as_secs_f64()).max(0.0))
+        })?;
+    Some(Duration::from_secs_f64(
+        seconds.min(GATE_MAX_CLOSE.as_secs_f64()),
+    ))
+}
+
 /// The rate-limit signals in a source response. Retry-After is seconds or an HTTP-date. A reset
 /// above 10^9 is a Unix time in seconds; a smaller one is seconds from now. Other values are
 /// ignored, and every duration is capped before conversion, so no header can overflow one.
@@ -433,13 +454,9 @@ fn source_signals(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let retry_after = number("retry-after").or_else(|| {
-        let at = http_date_seconds(headers.get("retry-after")?.trim())?;
-        Some((at as f64 - now.as_secs_f64()).max(0.0))
-    });
     crate::governor::SourceSignals {
         status,
-        retry_after: retry_after.map(|s| capped(s, GATE_MAX_CLOSE)),
+        retry_after: retry_after(headers),
         limit: number("x-ratelimit-limit")
             .filter(|v| *v <= u32::MAX as f64)
             .map(|v| v as u64),
@@ -1560,6 +1577,9 @@ impl HttpRecorder {
                             | "x-ratelimit-remaining"
                             | "x-ratelimit-reset"
                             | "cf-ray"
+                            | "server-timing"
+                            | "x-vercel-id"
+                            | "x-scout-match-mode"
                     )
                 })
                 .map(|(key, value)| {
@@ -2689,7 +2709,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut recorder = HttpRecorder::new(dir.path(), &RunConfig::default()).unwrap();
         recorder.allow_loopback = true;
-        let url = server("HTTP/1.1 429 Too Many Requests\r\nRetry-After-Ms: 250\r\nRetry-After: 2\r\nSet-Cookie: private=value\r\nX-Unknown-Secret: private\r\nContent-Length: 4\r\n\r\nwait").await;
+        let url = server("HTTP/1.1 429 Too Many Requests\r\nRetry-After-Ms: 250\r\nRetry-After: 2\r\nServer-Timing: total;dur=5\r\nX-Vercel-Id: iad1::abc-1\r\nSet-Cookie: private=value\r\nX-Unknown-Secret: private\r\nContent-Length: 4\r\n\r\nwait").await;
         let response = recorder
             .request(Method::GET, &url, vec![], None)
             .await
@@ -2702,6 +2722,14 @@ mod tests {
         assert_eq!(
             response.headers.get("retry-after").map(String::as_str),
             Some("2")
+        );
+        assert_eq!(
+            response.headers.get("server-timing").map(String::as_str),
+            Some("total;dur=5")
+        );
+        assert_eq!(
+            response.headers.get("x-vercel-id").map(String::as_str),
+            Some("iad1::abc-1")
         );
         assert!(!response.headers.contains_key("set-cookie"));
         assert!(!response.headers.contains_key("x-unknown-secret"));
