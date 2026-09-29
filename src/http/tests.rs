@@ -936,10 +936,7 @@ async fn a_cancelled_request_still_finalizes_its_partial_body_and_metadata() {
     assert!(metadata["failure"].as_str().unwrap().contains("cancelled"));
     let body = raw_body(&directory.path().join("raw/000000.body.gz"));
     assert_eq!(body, b"abc");
-    assert_eq!(
-        metadata["body_sha256"],
-        format!("{:x}", Sha256::digest(&body))
-    );
+    assert_eq!(metadata["body_sha256"], sha256_hex(&body));
     assert!(!streamed.exists(), "the uncompressed copy is removed");
     server.abort();
 }
@@ -1486,4 +1483,13 @@ async fn oversized_body_is_an_explicit_recorded_failure() {
             .unwrap();
     assert_eq!(metadata["complete"], false);
     assert_eq!(raw_body(&dir.path().join("raw/000000.body.gz")), b"abc");
+}
+
+#[test]
+fn sha256_hex_is_lowercase_hex_of_the_digest() {
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(sha256_hex(b"").len(), 64);
 }

@@ -2249,7 +2249,6 @@ fn provider_budget(
     backend: &Backend,
     overrides: &BTreeMap<String, f64>,
 ) -> crate::governor::ProviderBudget {
-    use sha2::{Digest, Sha256};
     let identity = match backend {
         Backend::Cloudflare {
             account, gateway, ..
@@ -2260,7 +2259,7 @@ fn provider_budget(
         Backend::Fixture => String::new(),
     };
     let name = backend.name();
-    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    let digest = crate::http::sha256_hex(identity.as_bytes());
     crate::governor::ProviderBudget {
         key: format!("{name}:{}", &digest[..12]),
         per_minute: overrides

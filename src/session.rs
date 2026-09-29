@@ -323,8 +323,7 @@ fn text_file(root: &Path, position: Option<usize>, document: &Document) -> Resul
     let path = match position {
         Some(p) => dir.join(format!("{p:04}.txt")),
         None => {
-            use sha2::{Digest, Sha256};
-            let digest = format!("{:x}", Sha256::digest(document.id.as_bytes()));
+            let digest = crate::http::sha256_hex(document.id.as_bytes());
             dir.join(format!("unscored-{}.txt", &digest[..12]))
         }
     };

@@ -1670,8 +1670,7 @@ pub(crate) fn add_usage(a: &Usage, b: &Usage) -> Usage {
 }
 
 fn text_digest(text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(text.as_bytes()))
+    crate::http::sha256_hex(text.as_bytes())
 }
 
 /// Selected documents judged for currentness, highest relevance first. Lower-ranked documents keep
