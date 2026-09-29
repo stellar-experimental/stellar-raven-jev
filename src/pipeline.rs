@@ -407,10 +407,7 @@ pub async fn run_question_scoped(
     scope: connectors::SourceScope,
 ) -> Result<RunOutcome> {
     let (config, http) = prepare(question, config)?;
-    let governor = match &config.host_dir {
-        Some(dir) => crate::governor::Governor::at(dir)?,
-        None => crate::governor::Governor::local(),
-    };
+    let governor = source_governor(&config)?;
     let http = http.with_source_gates(std::sync::Arc::new(governor));
     let registry = connectors::sources();
     let sources: Vec<_> = registry
@@ -687,6 +684,16 @@ async fn execute(
     .await
 }
 
+/// The governor for source requests: host-wide when `host_dir` is set, with every stated source
+/// window counted.
+fn source_governor(config: &RunConfig) -> Result<crate::governor::Governor> {
+    let governor = match &config.host_dir {
+        Some(dir) => crate::governor::Governor::at(dir)?,
+        None => crate::governor::Governor::local(),
+    };
+    Ok(governor.with_stated_windows(&connectors::stated_windows()))
+}
+
 /// How long a question waits for fetch slots on capped source hosts before it reports busy.
 const HOST_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(65);
 /// The retry hint for a question refused for want of a host fetch slot.
@@ -799,6 +806,8 @@ struct OriginalPlan {
     eligible: usize,
     reused: usize,
     capped: usize,
+    /// Eligible URLs not read because their host has a fetch-slot cap.
+    slot_host_skipped: usize,
 }
 
 /// Choose this call's original page reads: eligible rows of sources routed at `ORIGINAL_ROUTE` or
@@ -819,13 +828,25 @@ fn plan_originals(
     let mut ordered: Vec<&Document> = rows.iter().filter(|d| route(d) >= ORIGINAL_ROUTE).collect();
     // A stable sort keeps each source's row order.
     ordered.sort_by(|a, b| route(b).total_cmp(&route(a)));
-    let plans = connectors::original::plan(
+    // A host with a fetch-slot cap is read only while a question holds its slot, in the fetch
+    // stage. Original reads come after the slot is released, so they skip those hosts.
+    let capped = connectors::source_slots(config);
+    let (plans, skipped): (Vec<_>, Vec<_>) = connectors::original::plan(
         ordered,
         evidence.documents.iter().chain(&evidence.deferred),
         sources,
-    );
+    )
+    .into_iter()
+    .partition(|entry| match entry {
+        connectors::original::Plan::Read(candidate) => candidate
+            .url
+            .host_str()
+            .is_none_or(|host| !capped.contains_key(host)),
+        connectors::original::Plan::Reused { .. } => true,
+    });
     let mut plan = OriginalPlan {
         eligible: plans.len(),
+        slot_host_skipped: skipped.len(),
         ..Default::default()
     };
     for entry in plans {
@@ -993,6 +1014,7 @@ async fn add_originals(
         .collect();
     evidence.original_reads = json!({
         "eligible": plan.eligible, "reused": plan.reused, "capped": plan.capped,
+        "slot_host_skipped": plan.slot_host_skipped,
         "attempted": started, "used": pages.len(), "refused": refused, "failed": failed,
         "session_charged": crate::session::original_reads(&config.output_dir),
     });
@@ -1526,10 +1548,7 @@ pub async fn continue_session(
     ensure!(!requested.is_empty(), "The session has no open pools");
     // Mark this call as spending up to its budget until it saves its usage.
     crate::session::begin_call(&root, config.budget_usd)?;
-    let governor = match &config.host_dir {
-        Some(dir) => crate::governor::Governor::at(dir)?,
-        None => crate::governor::Governor::local(),
-    };
+    let governor = source_governor(&config)?;
     let http =
         HttpRecorder::resume(&root, &config)?.with_source_gates(std::sync::Arc::new(governor));
     let jev = JevClient::new(&config, &http.with_concurrency(config.jev_concurrency))?;
@@ -2299,6 +2318,38 @@ mod tests {
         let load: serde_json::Value = read_json(&outcome.directory, "load.json").unwrap();
         assert!(load["original_reads"].is_null());
         assert!(!outcome.directory.join("session.json").exists());
+    }
+    #[tokio::test]
+    async fn a_host_with_a_fetch_slot_cap_is_not_read_as_an_original() {
+        let (backend, _) =
+            reading_mock(&["https://capped.test/page", "https://fernlet.test/page"]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            output_dir: dir.path().into(),
+            source_slots: BTreeMap::from([("capped.test".to_owned(), 1)]),
+            ..Default::default()
+        };
+        let (config, http) = prepare("question", &config).unwrap();
+        let mut evidence = Evidence::default();
+        let rows = backend
+            .fetch(
+                &FetchContext {
+                    http,
+                    config: config.clone(),
+                    deadline: None,
+                },
+                &sources()[0],
+                "q",
+            )
+            .await
+            .unwrap()
+            .documents;
+        let rows = admit(&config, &mut evidence, rows);
+        let routes = BTreeMap::from([("a".to_owned(), 0.9)]);
+        let plan = plan_originals(&config, &evidence, &rows, &routes, &sources()).unwrap();
+        let hosts: Vec<_> = plan.reads.iter().map(|c| c.url.host_str()).collect();
+        assert_eq!(hosts, [Some("fernlet.test")]);
+        assert_eq!((plan.eligible, plan.slot_host_skipped), (1, 1));
     }
     #[tokio::test]
     async fn a_page_the_session_holds_is_reused_without_a_request() {

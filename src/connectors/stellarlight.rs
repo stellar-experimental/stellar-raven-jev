@@ -85,6 +85,23 @@ const LISTINGS: &[Listing] = &[
 /// Scout's slowest responses approach the fetch deadline.
 pub const HOST_CONCURRENCY: usize = 32;
 
+/// Research requests per minute that Stellar Light advises one client host to stay at or under.
+pub const RESEARCH_PER_MINUTE: u64 = 600;
+
+/// Scout's stated request windows: the research scope, `RESEARCH_PER_MINUTE` per 60 seconds.
+pub fn stated_windows() -> Vec<(String, u64, std::time::Duration)> {
+    host()
+        .map(|host| {
+            (
+                format!("{host}/api/research"),
+                RESEARCH_PER_MINUTE,
+                std::time::Duration::from_secs(60),
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
 /// The host every Stellar Scout request goes to.
 pub fn host() -> Option<String> {
     Some(Url::parse(BASE).ok()?.host_str()?.to_owned())

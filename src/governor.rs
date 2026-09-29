@@ -125,6 +125,10 @@ pub enum Booking {
 pub struct Governor {
     dir: Option<PathBuf>,
     memory: Mutex<State>,
+    /// Request windows that a source's operator states, as scope to (limit, length in ms). A
+    /// stated window is counted from the first request, and an advertised window of the same
+    /// scope never allows more than the stated limit.
+    stated: BTreeMap<String, (u64, u64)>,
 }
 
 /// A held admission slot. Dropping it, or the process exiting, frees the slot.
@@ -146,6 +150,7 @@ impl Governor {
         Self {
             dir: None,
             memory: Mutex::default(),
+            stated: BTreeMap::new(),
         }
     }
 
@@ -165,7 +170,34 @@ impl Governor {
         Ok(Self {
             dir: Some(dir),
             memory: Mutex::default(),
+            stated: BTreeMap::new(),
         })
+    }
+
+    /// Count these stated windows (scope, limit, length) as well as the advertised ones.
+    pub fn with_stated_windows(mut self, windows: &[(String, u64, Duration)]) -> Self {
+        for (scope, limit, length) in windows {
+            if *limit > 0 && !length.is_zero() {
+                self.stated
+                    .insert(scope.clone(), (*limit, length.as_millis() as u64));
+            }
+        }
+        self
+    }
+
+    /// Make every stated window exist, and hold each window at or under its stated limit.
+    fn apply_stated(&self, state: &mut State, now: u64) {
+        for (scope, (limit, period_ms)) in &self.stated {
+            let window = state.windows.entry(scope.clone()).or_insert(Window {
+                limit: *limit,
+                reset_ms: now + period_ms,
+                used: 0,
+                period_ms: *period_ms,
+                epoch: 0,
+                paced_until_ms: 0,
+            });
+            window.limit = window.limit.min(*limit);
+        }
     }
 
     /// Read, change, and replace the state under an exclusive lock. The state is replaced by a
@@ -288,6 +320,7 @@ impl Governor {
         booked_epoch: Option<u64>,
     ) -> Result<Option<Duration>> {
         self.update(|state, now| {
+            self.apply_stated(state, now);
             state.gates.retain(|_, until| *until > now);
             if let Some(until) = state.gates.get(scope) {
                 return Some(Duration::from_millis(until - now));
@@ -312,6 +345,7 @@ impl Governor {
     /// window opens. A scope that a refusal closed has no room until it opens again.
     pub fn book_windows(&self, demands: &[(String, u64)]) -> Result<Booking> {
         self.update(|state, now| {
+            self.apply_stated(state, now);
             let mut wait = Duration::ZERO;
             state.gates.retain(|_, until| *until > now);
             for (scope, count) in demands {
@@ -362,43 +396,46 @@ impl Governor {
         default_close: Duration,
     ) -> Result<()> {
         self.update(|state, now| {
-            if signals.status == 429 {
-                let wait = signals.retry_after.unwrap_or(default_close);
-                let until = now.saturating_add(wait.as_millis() as u64);
-                let entry = state.gates.entry(scope.to_owned()).or_insert(0);
-                *entry = (*entry).max(until);
-            }
-            let (Some(limit), Some(reset_ms)) = (signals.limit, signals.reset_ms) else {
-                return;
-            };
-            if reset_ms <= now || limit == 0 {
-                return;
-            }
-            let reported = limit.saturating_sub(signals.remaining.unwrap_or(limit));
-            let window = state.windows.entry(scope.to_owned()).or_insert(Window {
-                limit,
-                reset_ms,
-                used: 0,
-                period_ms: DEFAULT_WINDOW_MS,
-                epoch: 0,
-                paced_until_ms: 0,
-            });
-            window.roll(now);
-            if reset_ms + WINDOW_RESET_TOLERANCE_MS < window.reset_ms {
-                return;
-            }
-            // A reset past the current window's end names a later window. Replies can report
-            // different resets; extending the current window with them would keep it from ever
-            // ending, and this host's own sends would pile up across real windows. The host
-            // clock rolls to the later window by the learned period.
-            if reset_ms > window.reset_ms + WINDOW_RESET_TOLERANCE_MS {
+            'observe: {
+                if signals.status == 429 {
+                    let wait = signals.retry_after.unwrap_or(default_close);
+                    let until = now.saturating_add(wait.as_millis() as u64);
+                    let entry = state.gates.entry(scope.to_owned()).or_insert(0);
+                    *entry = (*entry).max(until);
+                }
+                let (Some(limit), Some(reset_ms)) = (signals.limit, signals.reset_ms) else {
+                    break 'observe;
+                };
+                if reset_ms <= now || limit == 0 {
+                    break 'observe;
+                }
+                let reported = limit.saturating_sub(signals.remaining.unwrap_or(limit));
+                let window = state.windows.entry(scope.to_owned()).or_insert(Window {
+                    limit,
+                    reset_ms,
+                    used: 0,
+                    period_ms: DEFAULT_WINDOW_MS,
+                    epoch: 0,
+                    paced_until_ms: 0,
+                });
+                window.roll(now);
+                if reset_ms + WINDOW_RESET_TOLERANCE_MS < window.reset_ms {
+                    break 'observe;
+                }
+                // A reset past the current window's end names a later window. Replies can report
+                // different resets; extending the current window with them would keep it from ever
+                // ending, and this host's own sends would pile up across real windows. The host
+                // clock rolls to the later window by the learned period.
+                if reset_ms > window.reset_ms + WINDOW_RESET_TOLERANCE_MS {
+                    window.limit = limit;
+                    break 'observe;
+                }
+                window.reset_ms = window.reset_ms.max(reset_ms);
+                window.period_ms = window.period_ms.max(reset_ms - now);
                 window.limit = limit;
-                return;
+                window.used = window.used.max(reported);
             }
-            window.reset_ms = window.reset_ms.max(reset_ms);
-            window.period_ms = window.period_ms.max(reset_ms - now);
-            window.limit = limit;
-            window.used = window.used.max(reported);
+            self.apply_stated(state, now);
         })
     }
 
@@ -699,6 +736,95 @@ mod tests {
             .observe_source(scope, &window(3, 3, now + 1_000), Duration::from_secs(10))
             .unwrap();
         assert!(ticket(None).is_some());
+    }
+
+    #[test]
+    fn a_stated_window_counts_from_the_first_request_and_caps_an_advertised_one() {
+        let scope = "example.org/search";
+        let governor = Governor::local().with_stated_windows(&[(
+            scope.to_owned(),
+            2,
+            Duration::from_secs(60),
+        )]);
+        let ticket = |booked| governor.source_ticket(scope, booked).unwrap();
+        // No response yet: the stated window already counts.
+        assert!(ticket(None).is_none());
+        assert!(ticket(None).is_none());
+        assert!(ticket(None).unwrap() > Duration::from_secs(50));
+        // The used-up stated window has no room for a booking until the next window.
+        assert!(matches!(
+            governor.book_windows(&[(scope.to_owned(), 5)]).unwrap(),
+            Booking::Wait(_)
+        ));
+        // An advertised window with a higher limit does not raise the stated one.
+        let other = "example.org/other";
+        let governor = Governor::local().with_stated_windows(&[(
+            other.to_owned(),
+            2,
+            Duration::from_secs(60),
+        )]);
+        governor
+            .observe_source(
+                other,
+                &window(1_200, 1_200, now_ms() + 60_000),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let ticket = |booked| governor.source_ticket(other, booked).unwrap();
+        assert!(ticket(None).is_none());
+        assert!(ticket(None).is_none());
+        assert!(ticket(None).is_some());
+        // A lower advertised limit wins.
+        let lower = Governor::local().with_stated_windows(&[(
+            other.to_owned(),
+            600,
+            Duration::from_secs(60),
+        )]);
+        lower
+            .observe_source(
+                other,
+                &window(1, 1, now_ms() + 60_000),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(lower.source_ticket(other, None).unwrap().is_none());
+        assert!(lower.source_ticket(other, None).unwrap().is_some());
+    }
+
+    #[test]
+    fn stated_windows_are_shared_and_paced_across_governors_on_one_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = "example.org/search";
+        let stated = [(scope.to_owned(), 600, Duration::from_secs(60))];
+        let first = Governor::at(dir.path())
+            .unwrap()
+            .with_stated_windows(&stated);
+        let second = Governor::at(dir.path())
+            .unwrap()
+            .with_stated_windows(&stated);
+        // A booking of 13 at 600 per minute holds the scope for 1.3 s, for every process.
+        assert!(matches!(
+            first.book_windows(&[(scope.to_owned(), 13)]).unwrap(),
+            Booking::Booked(_)
+        ));
+        match second.book_windows(&[(scope.to_owned(), 13)]).unwrap() {
+            Booking::Wait(wait) => {
+                assert!(wait > Duration::from_millis(1_200) && wait <= Duration::from_millis(1_300))
+            }
+            Booking::Booked(_) => panic!("the second process must wait for the pacing"),
+        }
+        // Sends that the first process counts use up the window for the second.
+        let tight = [(scope.to_owned(), 2, Duration::from_secs(60))];
+        let dir = tempfile::tempdir().unwrap();
+        let first = Governor::at(dir.path())
+            .unwrap()
+            .with_stated_windows(&tight);
+        let second = Governor::at(dir.path())
+            .unwrap()
+            .with_stated_windows(&tight);
+        assert!(first.source_ticket(scope, None).unwrap().is_none());
+        assert!(first.source_ticket(scope, None).unwrap().is_none());
+        assert!(second.source_ticket(scope, None).unwrap().is_some());
     }
 
     #[test]

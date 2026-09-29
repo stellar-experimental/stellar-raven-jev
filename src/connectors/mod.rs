@@ -85,6 +85,13 @@ fn stated_host_limits() -> Vec<(String, usize)> {
         .collect()
 }
 
+/// Request windows that source operators state, as (request scope, limit, window length). The
+/// governor counts them from the first request, and holds any advertised window of the same scope
+/// to the stated limit.
+pub fn stated_windows() -> Vec<(String, u64, std::time::Duration)> {
+    stellarlight::stated_windows()
+}
+
 /// Fetch slots per host: for each host with a stated limit, that limit divided by the requests
 /// one question may have in flight on a host (its per-host concurrency, plus hedge permits when
 /// hedging is on), and at least 1. Explicit `source_slots` replace these per host and add others.
