@@ -378,6 +378,24 @@ async fn a_hedge_still_waiting_for_a_permit_loses_when_the_primary_decides() {
 }
 
 #[tokio::test]
+async fn a_source_redirect_is_refused_with_its_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = hedging(dir.path(), RunConfig::default());
+    let (url, _, _) = scripted_server(vec![(
+        after(0),
+        "HTTP/1.1 308 Permanent Redirect\r\nLocation: /moved\r\nContent-Length: 0\r\n\r\n",
+    )])
+    .await;
+    let error = recorder
+        .request(Method::GET, &url, vec![], None)
+        .await
+        .unwrap_err();
+    let moved = error.downcast_ref::<Redirected>().unwrap();
+    assert_eq!(moved.status, 308);
+    assert_eq!(moved.location.as_deref(), Some("/moved"));
+}
+
+#[tokio::test]
 async fn a_retry_receipt_names_its_role_and_the_attempt_it_repeats() {
     let dir = tempfile::tempdir().unwrap();
     let recorder = hedging(dir.path(), RunConfig::default());

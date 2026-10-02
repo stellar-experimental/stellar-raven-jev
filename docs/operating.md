@@ -188,6 +188,10 @@ The reader uses its own HTTP client:
 - It refuses a page with more than 4,096 open elements or 250,000 tags.
 - It skips a host that has a fetch-slot cap.
 
+The Algolia docs and site connectors read a record's published page with the source client, which sends no keys there.
+A page that moved on the same host over HTTPS is read at its new location, at most 3 moves.
+A move to another host or off HTTPS is not followed; the indexed record stands in, and it is not lost evidence.
+
 `load.original_reads` counts `eligible` URLs, `reused` bodies, `capped` URLs, `slot_host_skipped` URLs,
 and `attempted`, `used`, `refused`, and `failed` reads, and `session_charged`.
 A refused, failed, or cut read adds a report with the stage `original_read`.

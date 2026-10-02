@@ -83,6 +83,26 @@ pub type ProbeResult = Result<Option<u16>, TransportCause>;
 #[derive(Debug)]
 pub struct Refused(pub String);
 
+/// A redirect that a source client did not follow, with its `Location` when the source sent one.
+/// The caller decides whether the new location may be read.
+#[derive(Debug)]
+pub struct Redirected {
+    pub status: u16,
+    pub location: Option<String>,
+}
+
+impl std::fmt::Display for Redirected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HTTP redirect {} refused; credentials were not forwarded",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for Redirected {}
+
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Public read refused: {}", self.0)
@@ -1846,6 +1866,7 @@ impl HttpRecorder {
                             | "server-timing"
                             | "x-vercel-id"
                             | "x-scout-match-mode"
+                            | "location"
                     )
                 })
                 .map(|(key, value)| {
@@ -1977,7 +1998,11 @@ impl HttpRecorder {
                     .push(sent_at.elapsed().as_millis() as u64);
             }
             if (300..400).contains(&status) {
-                bail!("HTTP redirect {status} refused; credentials were not forwarded");
+                return Err(Redirected {
+                    status,
+                    location: response_headers.get("location").cloned(),
+                }
+                .into());
             }
             Ok(HttpResponse {
                 status,

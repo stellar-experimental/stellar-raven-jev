@@ -406,6 +406,20 @@ fn timestamp_seconds(s: &str) -> Option<u64> {
     Some(days * 86400 + h * 3600 + mi * 60 + se)
 }
 
+/// Where a page moved, when the move stays on the same host over HTTPS without user information.
+fn same_host_move(from: &Url, location: &str) -> Option<Url> {
+    let target = from.join(location).ok()?;
+    (target.scheme() == "https"
+        && target.host_str() == from.host_str()
+        && target.port_or_known_default() == from.port_or_known_default()
+        && target.username().is_empty()
+        && target.password().is_none())
+    .then_some(target)
+}
+
+/// The most same-host moves one original page read follows.
+const MAX_ORIGINAL_REDIRECTS: usize = 3;
+
 async fn original(
     ctx: &FetchContext,
     source: &Source,
@@ -433,9 +447,13 @@ async fn original(
     }
     candidates.push((url.clone(), "original_html"));
     let mut artifacts = vec![];
-    // A server error or a failed transfer is lost evidence; a missing page is not.
+    // A server error or a failed transfer is lost evidence; a missing or moved page is not.
     let mut server_failed = false;
-    for (candidate, kind) in candidates {
+    let mut hops = 0;
+    let mut next = 0;
+    while next < candidates.len() {
+        let (candidate, kind) = candidates[next].clone();
+        next += 1;
         match ctx
             .http
             .request(Method::GET, candidate.as_str(), vec![], None)
@@ -486,15 +504,39 @@ async fn original(
                     ),
                 );
             }
-            Err(_) => {
-                server_failed = true;
-                failure(
-                    result,
-                    source,
-                    "original",
-                    "Original request failed. The recorder retains available failure evidence.",
-                )
-            }
+            Err(error) => match error.downcast_ref::<crate::http::Redirected>() {
+                Some(moved) => {
+                    // A page that moved on the same host over HTTPS is read at its new location.
+                    let target = moved
+                        .location
+                        .as_deref()
+                        .and_then(|location| same_host_move(&candidate, location));
+                    match target {
+                        Some(target) if hops < MAX_ORIGINAL_REDIRECTS => {
+                            hops += 1;
+                            candidates.push((target, kind));
+                        }
+                        _ => failure(
+                            result,
+                            source,
+                            "original",
+                            format!(
+                                "Original page moved (HTTP {}) to a location that is not read: another host, not HTTPS, missing, or past {MAX_ORIGINAL_REDIRECTS} moves.",
+                                moved.status
+                            ),
+                        ),
+                    }
+                }
+                None => {
+                    server_failed = true;
+                    failure(
+                        result,
+                        source,
+                        "original",
+                        "Original request failed. The recorder retains available failure evidence.",
+                    )
+                }
+            },
         }
     }
     if server_failed {
@@ -1206,5 +1248,28 @@ mod tests {
             assert!(a.documents[0].raw_artifacts.is_empty());
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_moved_original_is_followed_only_on_the_same_host_over_https() {
+        let from = Url::parse("https://fernlet.test/connect").unwrap();
+        assert_eq!(
+            same_host_move(&from, "/community").unwrap().as_str(),
+            "https://fernlet.test/community"
+        );
+        assert_eq!(
+            same_host_move(&from, "https://fernlet.test/a?b=1")
+                .unwrap()
+                .as_str(),
+            "https://fernlet.test/a?b=1"
+        );
+        for refused in [
+            "https://quillon.test/community",
+            "http://fernlet.test/community",
+            "https://user:pw@fernlet.test/community",
+            "https://fernlet.test:8443/community",
+        ] {
+            assert!(same_host_move(&from, refused).is_none(), "{refused}");
+        }
     }
 }
