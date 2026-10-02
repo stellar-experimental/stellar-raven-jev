@@ -358,11 +358,9 @@ async fn read(
                     Ok(first) => format!("HTTP {}{}", first.status, refusal(first)),
                     Err(error) => error.to_string().trim_end_matches('.').to_owned(),
                 });
+                let parent = response.as_ref().ok().map(|first| first.artifact.clone());
                 tokio::time::sleep(delay).await;
-                response = ctx
-                    .http
-                    .request(Method::GET, url, auth_headers(), None)
-                    .await;
+                response = ctx.http.request_retry(url, auth_headers(), parent).await;
             }
             Err(reason) => not_retried = Some(reason),
         }

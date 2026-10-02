@@ -553,6 +553,19 @@ pub struct SendGate<'a> {
     pub stop: Option<&'a (dyn Fn() -> bool + Sync)>,
     pub notify: Option<&'a tokio::sync::Notify>,
     pub sending: Option<&'a AtomicBool>,
+    /// What this attempt is, for its receipt.
+    pub tag: Option<&'a AttemptTag>,
+}
+
+/// What an attempt is, written to its receipt: its role (`primary`, `hedge`, or `retry`), the hedge
+/// race it belongs to, and the attempt it repeats. `lost` is set when the other request of its
+/// hedge race decided, so a cancelled loser's receipt names that cause.
+#[derive(Default)]
+pub struct AttemptTag {
+    pub role: &'static str,
+    pub race: Option<String>,
+    pub parent: Option<String>,
+    pub lost: Arc<AtomicBool>,
 }
 
 /// The request was stopped before anything was sent.
@@ -803,6 +816,8 @@ struct RawRecord {
     prefix: String,
     metadata: Value,
     finished: bool,
+    /// Set when the other request of this attempt's hedge race decided.
+    lost: Option<Arc<AtomicBool>>,
 }
 
 impl RawRecord {
@@ -844,7 +859,17 @@ impl Drop for RawRecord {
     fn drop(&mut self) {
         if !self.finished {
             if self.metadata["complete"] != true && self.metadata["failure"].is_null() {
-                self.metadata["failure"] = json!("request cancelled before the response ended");
+                if self
+                    .lost
+                    .as_ref()
+                    .is_some_and(|lost| lost.load(Ordering::SeqCst))
+                {
+                    self.metadata["failure"] =
+                        json!("request cancelled: the other request of its hedge race decided");
+                    self.metadata["cancel_cause"] = json!("hedge_loser");
+                } else {
+                    self.metadata["failure"] = json!("request cancelled before the response ended");
+                }
             }
             let _ = self.finish();
         }
@@ -1264,6 +1289,17 @@ impl HttpRecorder {
         in_share: bool,
     ) -> Result<HttpResponse> {
         let sent = tokio::sync::Notify::new();
+        let race = Some(uuid::Uuid::new_v4().to_string());
+        let primary = AttemptTag {
+            role: "primary",
+            race: race.clone(),
+            ..AttemptTag::default()
+        };
+        let hedge = AttemptTag {
+            role: "hedge",
+            race,
+            ..AttemptTag::default()
+        };
         let first = self.request_recorded(
             Method::GET,
             url,
@@ -1272,6 +1308,7 @@ impl HttpRecorder {
             true,
             SendGate {
                 notify: Some(&sent),
+                tag: Some(&primary),
                 ..SendGate::default()
             },
         );
@@ -1334,6 +1371,7 @@ impl HttpRecorder {
             true,
             SendGate {
                 stop: Some(&take),
+                tag: Some(&hedge),
                 ..SendGate::default()
             },
         );
@@ -1361,6 +1399,12 @@ impl HttpRecorder {
                 }
             }
         };
+        // The loser, dropped when this returns, names the race as its cancellation cause.
+        if hedge_won {
+            primary.lost.store(true, Ordering::SeqCst);
+        } else if hedge_sent.load(Ordering::SeqCst) {
+            hedge.lost.store(true, Ordering::SeqCst);
+        }
         if hedge_won {
             load.hedged
                 .lock()
@@ -1386,6 +1430,33 @@ impl HttpRecorder {
         }
         self.request_recorded(Method::GET, url, headers, None, true, SendGate::default())
             .await
+    }
+
+    /// A source GET that repeats an earlier attempt: its receipt has role `retry` and names the
+    /// attempt it repeats. It is never hedged.
+    pub async fn request_retry(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        parent: Option<String>,
+    ) -> Result<HttpResponse> {
+        let tag = AttemptTag {
+            role: "retry",
+            parent,
+            ..AttemptTag::default()
+        };
+        self.request_recorded(
+            Method::GET,
+            url,
+            headers,
+            None,
+            true,
+            SendGate {
+                tag: Some(&tag),
+                ..SendGate::default()
+            },
+        )
+        .await
     }
 
     /// A GET that every caller in this run shares: the first call sends it, and identical later
@@ -1475,9 +1546,20 @@ impl HttpRecorder {
             metadata: json!({"method": method.as_str(), "body_artifact": streaming_artifact,
                 "body_encoding": "identity", "complete": false}),
             finished: false,
+            lost: None,
         };
         if self.hedge {
             record.metadata["hedge"] = json!(true);
+        }
+        if let Some(tag) = gate.tag {
+            record.metadata["role"] = json!(tag.role);
+            if let Some(race) = &tag.race {
+                record.metadata["race_id"] = json!(race);
+            }
+            if let Some(parent) = &tag.parent {
+                record.metadata["parent_artifact"] = json!(parent);
+            }
+            record.lost = Some(tag.lost.clone());
         }
         let started = Instant::now();
         let operation = async {

@@ -342,6 +342,30 @@ async fn an_in_share_hedge_wins_without_raising_requests_in_flight() {
     assert_eq!(latency["hedged"], 1);
     assert_eq!(latency["hedge_wins"], 1);
     assert!(latency["peak_in_flight"].as_u64().unwrap() <= 2);
+    // Both receipts name their role and race; the cancelled original names the race as its cause.
+    let receipts = receipts(dir.path());
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0]["role"], "primary");
+    assert_eq!(receipts[1]["role"], "hedge");
+    assert_eq!(receipts[0]["race_id"], receipts[1]["race_id"]);
+    assert_eq!(receipts[0]["cancel_cause"], "hedge_loser");
+    assert_eq!(receipts[1]["complete"], true);
+    assert!(receipts[1].get("cancel_cause").is_none());
+}
+
+#[tokio::test]
+async fn a_retry_receipt_names_its_role_and_the_attempt_it_repeats() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = hedging(dir.path(), RunConfig::default());
+    let (url, _, _) = scripted_server(vec![(after(0), OK)]).await;
+    recorder
+        .request_retry(&url, vec![], Some("raw/000041.body.gz".into()))
+        .await
+        .unwrap();
+    let receipts = receipts(dir.path());
+    assert_eq!(receipts[0]["role"], "retry");
+    assert_eq!(receipts[0]["parent_artifact"], "raw/000041.body.gz");
+    assert!(receipts[0].get("race_id").is_none());
 }
 
 #[tokio::test]
