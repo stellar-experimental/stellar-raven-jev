@@ -113,7 +113,7 @@ A page on a tier 4 host is tier 4 even when it holds ordinary text.
 | `source_gate_wait_ms`, `source_booking_wait_ms`, `source_slot_wait_ms` | Waits for source rate limits and fetch slots |
 | `jev_rate_limited_requests`, `jev_wait_ms`, `admission_wait_ms` | Jev refusals and waits, and the wait for a search slot |
 | `source_requests` | Requests per source host |
-| `source_latency` | Per source host: `completed`, `not_completed`, `p50_ms`, `p95_ms`, `max_ms`, `peak_in_flight`, `hedged`, `hedge_wins` |
+| `source_latency` | Per source host: `completed`, `not_completed`, `cancelled_while_queued`, `p50_ms`, `p95_ms`, `max_ms`, `peak_in_flight`, `hedged`, `hedge_wins` |
 | `original_reads` | Original page reads (see [Original pages](#original-pages)) |
 
 A degraded call still returns its results. Ask again later for a complete one.
@@ -220,6 +220,7 @@ These defaults stay below the rates at which the providers refuse requests.
   The wait is the `Retry-After` value (seconds or an HTTP date), at most 10 minutes.
 - A source can advertise a request window with `x-ratelimit-limit` and `x-ratelimit-reset`.
   The host then keeps the limit and window length, and it counts its own requests against each window.
+  A window marked `x-ratelimit-scope: instance` describes one serving instance, not the host, so it is not kept.
 - The tool keeps each Scout host at or under 32 requests in flight and 600 research requests per minute.
   An advertised window never raises this limit.
 - After routing, a question books the first request of every selected source, all at once or not at all.
@@ -266,6 +267,7 @@ Source hedging is off by default. `--source-hedge-ms N` turns it on with a delay
 
 - A rising share of `load.degraded`.
 - Deadline cuts on many sessions in a row. Stellar Scout usually sets the throughput limit of a host.
+  Latency counts from send. `cancelled_while_queued` counts requests that a cut stopped before they left this client's host queue; that time is not the source's.
 - Any `source_rate_limited_requests`, and `busy` exits.
 - `jev_wait_ms` or `jev_rate_limited_requests`: a provider budget is spent, and calls move to the next provider.
 - Network cause classes in `load.jev_failure_causes` (for example `dns` or `connect_denied`) and

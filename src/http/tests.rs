@@ -531,6 +531,37 @@ async fn source_latency_counts_completed_and_peak_in_flight_per_host() {
     assert!(latency["peak_in_flight"].as_u64().unwrap() >= 2);
 }
 
+#[tokio::test]
+async fn a_request_cut_while_it_waits_for_a_host_permit_counts_as_queued_not_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = RunConfig {
+        concurrency: 1,
+        ..RunConfig::default()
+    };
+    let mut recorder = HttpRecorder::new(dir.path(), &config).unwrap();
+    recorder.allow_loopback = true;
+    let recorder = recorder.with_source_gates(Arc::new(crate::governor::Governor::local()));
+    let (url, count) = counting_server(OK, Duration::from_millis(300)).await;
+    let search = format!("{url}/api/find");
+    let first = recorder.request(Method::GET, &search, vec![], None);
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            recorder.request(Method::GET, &search, vec![], None),
+        )
+        .await
+    };
+    let (first, second) = tokio::join!(first, second);
+    first.unwrap();
+    assert!(second.is_err(), "the second request is cut while it waits");
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let latency = &recorder.load_summary()["source_latency"]["127.0.0.1"];
+    assert_eq!(latency["completed"], 1);
+    assert_eq!(latency["not_completed"], 0);
+    assert_eq!(latency["cancelled_while_queued"], 1);
+}
+
 #[test]
 fn rate_limit_headers_never_overflow_and_long_waits_are_kept() {
     let headers = |pairs: &[(&str, &str)]| {
@@ -575,6 +606,34 @@ fn rate_limit_headers_never_overflow_and_long_waits_are_kept() {
     assert_eq!(windowed.limit, None);
     assert_eq!(windowed.remaining, Some(5));
     assert!(windowed.reset_ms.is_some());
+}
+
+#[test]
+fn an_instance_scoped_window_is_not_learned_but_its_refusal_is_kept() {
+    let headers = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let window = [
+        ("x-ratelimit-limit", "1200"),
+        ("x-ratelimit-remaining", "1195"),
+        ("x-ratelimit-reset", "60"),
+    ];
+    let host = source_signals(200, &headers(&window));
+    assert_eq!(host.limit, Some(1200));
+    let mut scoped = window.to_vec();
+    scoped.push(("x-ratelimit-scope", "Instance"));
+    let instance = source_signals(200, &headers(&scoped));
+    assert_eq!(
+        (instance.limit, instance.remaining, instance.reset_ms),
+        (None, None, None)
+    );
+    scoped.push(("retry-after", "2"));
+    let refused = source_signals(429, &headers(&scoped));
+    assert_eq!(refused.retry_after, Some(Duration::from_secs(2)));
+    assert_eq!(refused.limit, None);
 }
 
 #[tokio::test]

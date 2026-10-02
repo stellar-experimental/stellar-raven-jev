@@ -347,6 +347,46 @@ struct LoadCounters {
     hedges: AtomicU64,
     /// Hedges sent, and hedges whose response was returned, per host.
     hedged: Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    /// Source requests cancelled while they still waited for a host permit in this client, per
+    /// host. A deadline cut of such a request is client queue time, not source time.
+    cancelled_while_queued: Mutex<std::collections::BTreeMap<String, u64>>,
+}
+
+/// One source request waiting for its host permit. Dropping it before `sent`, also by
+/// cancellation, counts the request as cancelled while queued.
+struct Queued<'a> {
+    load: &'a LoadCounters,
+    host: String,
+    waiting: bool,
+}
+
+impl<'a> Queued<'a> {
+    fn start(load: &'a LoadCounters, host: &str) -> Self {
+        Self {
+            load,
+            host: host.to_owned(),
+            waiting: true,
+        }
+    }
+
+    /// The request left the queue: it holds its permit, or it ended for a reason of its own.
+    fn left(&mut self) {
+        self.waiting = false;
+    }
+}
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        if self.waiting {
+            *self
+                .load
+                .cancelled_while_queued
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(self.host.clone())
+                .or_default() += 1;
+        }
+    }
 }
 
 /// One source request in flight; dropping it, also by cancellation, ends it.
@@ -449,6 +489,8 @@ pub(crate) fn retry_after(
 /// The rate-limit signals in a source response. Retry-After is seconds or an HTTP-date. A reset
 /// above 10^9 is a Unix time in seconds; a smaller one is seconds from now. Other values are
 /// ignored, and every duration is capped before conversion, so no header can overflow one.
+/// A window that the source scopes to one serving instance (`x-ratelimit-scope: instance`) does
+/// not describe this host's budget, so only its status and Retry-After are kept.
 fn source_signals(
     status: u16,
     headers: &std::collections::BTreeMap<String, String>,
@@ -463,6 +505,10 @@ fn source_signals(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
+    let instance_scoped = headers
+        .get("x-ratelimit-scope")
+        .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("instance"));
+    let number = |name: &str| if instance_scoped { None } else { number(name) };
     crate::governor::SourceSignals {
         status,
         retry_after: retry_after(headers),
@@ -846,8 +892,9 @@ impl HttpRecorder {
     }
 
     /// Per host: completed responses and their send-to-last-byte time (p50, p95, max), requests
-    /// sent that did not complete (failed, cut, or a cancelled hedge race loser), the most requests
-    /// in flight at once, hedges sent, and hedges whose response was returned.
+    /// sent that did not complete (failed, cut, or a cancelled hedge race loser), requests
+    /// cancelled before they were sent while they waited for a host permit, the most requests in
+    /// flight at once, hedges sent, and hedges whose response was returned.
     fn latency_summary(&self) -> Value {
         let sent = self
             .load
@@ -866,7 +913,18 @@ impl HttpRecorder {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let hedged = self.load.hedged.lock().unwrap_or_else(|e| e.into_inner());
-        sent.iter()
+        let queued = self
+            .load
+            .cancelled_while_queued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut hosts = sent;
+        for host in queued.keys() {
+            hosts.entry(host.clone()).or_default();
+        }
+        hosts
+            .iter()
             .map(|(host, count)| {
                 let mut samples = latency.get(host).cloned().unwrap_or_default();
                 samples.sort_unstable();
@@ -879,6 +937,7 @@ impl HttpRecorder {
                     json!({
                         "completed": samples.len(),
                         "not_completed": count.saturating_sub(samples.len() as u64),
+                        "cancelled_while_queued": queued.get(host).copied().unwrap_or(0),
                         "p50_ms": percentile(0.5),
                         "p95_ms": percentile(0.95),
                         "max_ms": samples.last(),
@@ -1460,6 +1519,10 @@ impl HttpRecorder {
                 parsed.port_or_known_default().unwrap_or_default()
             );
             let semaphore = self.hosts.semaphore(&authority);
+            let host = parsed.host_str().unwrap_or_default().to_owned();
+            // Source requests and public reads count per host; Jev requests keep their own usage.
+            let accounted = self.gates.is_some() || self.public.is_some();
+            let mut queued = accounted.then(|| Queued::start(&self.load, &host));
             // Source limits are checked once the request holds its permit, at the moment of
             // sending, so a refusal seen by another request while this one queued still applies.
             // A closed scope releases the permit while it waits.
@@ -1476,6 +1539,9 @@ impl HttpRecorder {
                 };
                 drop(permit);
                 if waited + wait > GATE_WAIT_LIMIT {
+                    if let Some(queued) = queued.as_mut() {
+                        queued.left();
+                    }
                     self.load.rate_limited.fetch_add(1, Ordering::Relaxed);
                     return Err(SourceRateLimited { scope, wait }.into());
                 }
@@ -1485,12 +1551,12 @@ impl HttpRecorder {
                     .fetch_add(wait.as_millis() as u64, Ordering::Relaxed);
                 tokio::time::sleep(wait).await;
             };
+            if let Some(queued) = queued.as_mut() {
+                queued.left();
+            }
             if gate.stop.is_some_and(|stop| stop()) {
                 return Err(NotSent.into());
             }
-            let host = parsed.host_str().unwrap_or_default().to_owned();
-            // Source requests and public reads count per host; Jev requests keep their own usage.
-            let accounted = self.gates.is_some() || self.public.is_some();
             if accounted {
                 *self
                     .load
@@ -1584,6 +1650,7 @@ impl HttpRecorder {
                             | "x-ratelimit-limit"
                             | "x-ratelimit-remaining"
                             | "x-ratelimit-reset"
+                            | "x-ratelimit-scope"
                             | "cf-ray"
                             | "server-timing"
                             | "x-vercel-id"
