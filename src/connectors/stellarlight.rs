@@ -2,7 +2,7 @@
 use crate::http::TransportCause;
 use crate::types::*;
 use anyhow::{anyhow, Result};
-use reqwest::{Method, Url};
+use reqwest::Url;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
@@ -323,15 +323,18 @@ async fn read(
     url: &str,
     hedge_after: Option<std::time::Duration>,
 ) -> Option<(Value, String, String)> {
+    // One id names this read's first attempt (and its hedge), so a retry can name it as its
+    // parent even when that attempt failed before a response.
+    let race = uuid::Uuid::new_v4().to_string();
     let mut response = match hedge_after {
         Some(after) => {
             ctx.http
-                .request_hedged_in_share(url, auth_headers(), after)
+                .request_hedged_in_share(url, auth_headers(), after, race.clone())
                 .await
         }
         None => {
             ctx.http
-                .request(Method::GET, url, auth_headers(), None)
+                .request_attempt(url, auth_headers(), race.clone())
                 .await
         }
     };
@@ -360,7 +363,10 @@ async fn read(
                 });
                 let parent = response.as_ref().ok().map(|first| first.artifact.clone());
                 tokio::time::sleep(delay).await;
-                response = ctx.http.request_retry(url, auth_headers(), parent).await;
+                response = ctx
+                    .http
+                    .request_retry(url, auth_headers(), parent, Some(race.clone()))
+                    .await;
             }
             Err(reason) => not_retried = Some(reason),
         }

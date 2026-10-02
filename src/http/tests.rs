@@ -332,7 +332,7 @@ async fn an_in_share_hedge_wins_without_raising_requests_in_flight() {
     let (url, count, _) = scripted_server(vec![(NEVER, OK), (after(50), OK)]).await;
     let started = Instant::now();
     let response = recorder
-        .request_hedged_in_share(&url, vec![], Duration::from_millis(200))
+        .request_hedged_in_share(&url, vec![], Duration::from_millis(200), "race-a".into())
         .await
         .unwrap();
     assert_eq!(response.status, 200);
@@ -347,10 +347,34 @@ async fn an_in_share_hedge_wins_without_raising_requests_in_flight() {
     assert_eq!(receipts.len(), 2);
     assert_eq!(receipts[0]["role"], "primary");
     assert_eq!(receipts[1]["role"], "hedge");
-    assert_eq!(receipts[0]["race_id"], receipts[1]["race_id"]);
+    assert_eq!(receipts[0]["race_id"], "race-a");
+    assert_eq!(receipts[1]["race_id"], "race-a");
     assert_eq!(receipts[0]["cancel_cause"], "hedge_loser");
     assert_eq!(receipts[1]["complete"], true);
     assert!(receipts[1].get("cancel_cause").is_none());
+}
+
+#[tokio::test]
+async fn a_hedge_still_waiting_for_a_permit_loses_when_the_primary_decides() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = hedging(
+        dir.path(),
+        RunConfig {
+            concurrency: 1,
+            ..RunConfig::default()
+        },
+    );
+    // The primary answers after the hedge delay, while the hedge waits for the only permit.
+    let (url, count, _) = scripted_server(vec![(after(400), OK)]).await;
+    recorder
+        .request_hedged_in_share(&url, vec![], Duration::from_millis(100), "race-d".into())
+        .await
+        .unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let receipts = receipts(dir.path());
+    let hedge = receipts.iter().find(|r| r["role"] == "hedge").unwrap();
+    assert_eq!(hedge["race_id"], "race-d");
+    assert_eq!(hedge["cancel_cause"], "hedge_loser");
 }
 
 #[tokio::test]
@@ -359,12 +383,18 @@ async fn a_retry_receipt_names_its_role_and_the_attempt_it_repeats() {
     let recorder = hedging(dir.path(), RunConfig::default());
     let (url, _, _) = scripted_server(vec![(after(0), OK)]).await;
     recorder
-        .request_retry(&url, vec![], Some("raw/000041.body.gz".into()))
+        .request_retry(
+            &url,
+            vec![],
+            Some("raw/000041.body.gz".into()),
+            Some("race-c".into()),
+        )
         .await
         .unwrap();
     let receipts = receipts(dir.path());
     assert_eq!(receipts[0]["role"], "retry");
     assert_eq!(receipts[0]["parent_artifact"], "raw/000041.body.gz");
+    assert_eq!(receipts[0]["parent_race_id"], "race-c");
     assert!(receipts[0].get("race_id").is_none());
 }
 
@@ -381,7 +411,7 @@ async fn an_in_share_hedge_waits_for_the_hosts_own_permit() {
     let (url, count, _) = scripted_server(vec![(NEVER, OK), (after(0), OK)]).await;
     let result = tokio::time::timeout(
         Duration::from_millis(800),
-        recorder.request_hedged_in_share(&url, vec![], Duration::from_millis(100)),
+        recorder.request_hedged_in_share(&url, vec![], Duration::from_millis(100), "race-b".into()),
     )
     .await;
     assert!(

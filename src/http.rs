@@ -565,6 +565,9 @@ pub struct AttemptTag {
     pub role: &'static str,
     pub race: Option<String>,
     pub parent: Option<String>,
+    /// The race id of the attempt that a retry repeats, kept even when that attempt failed
+    /// before a response.
+    pub parent_race: Option<String>,
     pub lost: Arc<AtomicBool>,
 }
 
@@ -1268,7 +1271,7 @@ impl HttpRecorder {
             && self.config.source_hedge_ms > 0
         {
             let after = Duration::from_millis(self.config.source_hedge_ms);
-            return self.request_hedged(url, headers, after, false).await;
+            return self.request_hedged(url, headers, after, false, None).await;
         }
         self.request_recorded(method, url, headers, body, true, SendGate::default())
             .await
@@ -1287,9 +1290,10 @@ impl HttpRecorder {
         headers: Vec<(String, String)>,
         after: Duration,
         in_share: bool,
+        race: Option<String>,
     ) -> Result<HttpResponse> {
         let sent = tokio::sync::Notify::new();
-        let race = Some(uuid::Uuid::new_v4().to_string());
+        let race = Some(race.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
         let primary = AttemptTag {
             role: "primary",
             race: race.clone(),
@@ -1399,10 +1403,11 @@ impl HttpRecorder {
                 }
             }
         };
-        // The loser, dropped when this returns, names the race as its cancellation cause.
+        // The loser, dropped when this returns, names the race as its cancellation cause. A hedge
+        // still waiting for a permit or a gate loses too.
         if hedge_won {
             primary.lost.store(true, Ordering::SeqCst);
-        } else if hedge_sent.load(Ordering::SeqCst) {
+        } else {
             hedge.lost.store(true, Ordering::SeqCst);
         }
         if hedge_won {
@@ -1424,12 +1429,47 @@ impl HttpRecorder {
         url: &str,
         headers: Vec<(String, String)>,
         after: Duration,
+        race: String,
     ) -> Result<HttpResponse> {
         if self.gates.is_some() && !self.config.fixture {
-            return self.request_hedged(url, headers, after, true).await;
+            return self
+                .request_hedged(url, headers, after, true, Some(race))
+                .await;
         }
-        self.request_recorded(Method::GET, url, headers, None, true, SendGate::default())
-            .await
+        self.request_attempt(url, headers, race).await
+    }
+
+    /// A source GET as the first attempt of race `race`: hedged as `request` would hedge it, and
+    /// otherwise sent once with role `primary`. A later retry names `race` as its parent.
+    pub async fn request_attempt(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        race: String,
+    ) -> Result<HttpResponse> {
+        if self.gates.is_some() && !self.config.fixture && self.config.source_hedge_ms > 0 {
+            let after = Duration::from_millis(self.config.source_hedge_ms);
+            return self
+                .request_hedged(url, headers, after, false, Some(race))
+                .await;
+        }
+        let tag = AttemptTag {
+            role: "primary",
+            race: Some(race),
+            ..AttemptTag::default()
+        };
+        self.request_recorded(
+            Method::GET,
+            url,
+            headers,
+            None,
+            true,
+            SendGate {
+                tag: Some(&tag),
+                ..SendGate::default()
+            },
+        )
+        .await
     }
 
     /// A source GET that repeats an earlier attempt: its receipt has role `retry` and names the
@@ -1439,10 +1479,12 @@ impl HttpRecorder {
         url: &str,
         headers: Vec<(String, String)>,
         parent: Option<String>,
+        parent_race: Option<String>,
     ) -> Result<HttpResponse> {
         let tag = AttemptTag {
             role: "retry",
             parent,
+            parent_race,
             ..AttemptTag::default()
         };
         self.request_recorded(
@@ -1558,6 +1600,9 @@ impl HttpRecorder {
             }
             if let Some(parent) = &tag.parent {
                 record.metadata["parent_artifact"] = json!(parent);
+            }
+            if let Some(parent_race) = &tag.parent_race {
+                record.metadata["parent_race_id"] = json!(parent_race);
             }
             record.lost = Some(tag.lost.clone());
         }
