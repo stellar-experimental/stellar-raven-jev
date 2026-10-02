@@ -325,7 +325,8 @@ async fn read(
     // sends, or after a short delay. A timeout is not retried, because it has already spent its
     // time; neither is HTTP 504, which Scout sends when a function hits its time cap. A second
     // failure is reported with the first, and so is a first one whose retry would wait too long
-    // or end past the fetch deadline.
+    // or start with less than RETRY_ROOM of the fetch deadline left. The deadline can still cut a
+    // retry that has started.
     let mut not_retried = None;
     let mut first_attempt = None;
     let delay = match &response {

@@ -251,7 +251,7 @@ A source can slow down under load before its rate window fills. A slow source is
 - Identical GET requests in one run share one response.
 - Stellar Scout retries HTTP 500, 502, or 503 once. HTTP 504 is Scout's function time cap and is treated as a timeout.
   It also retries a request once when it fails before a complete response, unless the cause is a timeout. It waits for Scout's `Retry-After` plus up to 500 ms, or 250 to 750 ms without one.
-  A `Retry-After` above 4 seconds, or a retry that would end within 1 second of the fetch deadline, is not retried.
+  A `Retry-After` above 4 seconds is not retried. A retry starts only if at least 1 second of the fetch deadline remains after its wait; the deadline can still cut it.
 - A Scout HTTP failure report names Scout's `Retry-After` and the `error` field of its JSON body, when Scout sent them.
 - Scout failure and fallback reports end with Scout's request ID, `Server-Timing`, and match mode.
 
