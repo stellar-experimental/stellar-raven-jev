@@ -1237,7 +1237,6 @@ mod tests {
             http,
             config,
             deadline: None,
-            scout_research: None,
         };
         for source in sources() {
             let a = fetch(&ctx, &source, "question").await.unwrap();

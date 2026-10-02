@@ -1291,7 +1291,7 @@ impl HttpRecorder {
             && self.config.source_hedge_ms > 0
         {
             let after = Duration::from_millis(self.config.source_hedge_ms);
-            return self.request_hedged(url, headers, after, false, None).await;
+            return self.request_hedged(url, headers, after, None).await;
         }
         self.request_recorded(method, url, headers, body, true, SendGate::default())
             .await
@@ -1302,14 +1302,12 @@ impl HttpRecorder {
     /// like any request, and is sent only while the run has hedges left. The first decisive
     /// response wins: one that is not an error, a 429, or a 5xx. The other request is cancelled,
     /// and its receipt is kept. When neither is decisive, the original's result stands, so the
-    /// caller's own retry still applies. With `in_share`, the hedge takes one of the host's own
-    /// request permits instead of a hedge permit, so it never raises the requests in flight.
+    /// caller's own retry still applies.
     async fn request_hedged(
         &self,
         url: &str,
         headers: Vec<(String, String)>,
         after: Duration,
-        in_share: bool,
         race: Option<String>,
     ) -> Result<HttpResponse> {
         let sent = tokio::sync::Notify::new();
@@ -1377,11 +1375,7 @@ impl HttpRecorder {
         };
         let hedger = Self {
             client: self.hedge_client.clone(),
-            hosts: if in_share {
-                self.hosts.clone()
-            } else {
-                self.hedge_hosts.clone()
-            },
+            hosts: self.hedge_hosts.clone(),
             hedge: true,
             // A hedge always counts at send; it never spends another request's booked ticket.
             prepaid: Arc::default(),
@@ -1441,24 +1435,6 @@ impl HttpRecorder {
         result
     }
 
-    /// A source GET that gets one hedge `after` it was sent, whatever the source hedge setting. The
-    /// hedge uses one of this request's own host permits, so the requests in flight on the host do
-    /// not grow. Fixture runs and clones without source gates send the request plainly.
-    pub async fn request_hedged_in_share(
-        &self,
-        url: &str,
-        headers: Vec<(String, String)>,
-        after: Duration,
-        race: String,
-    ) -> Result<HttpResponse> {
-        if self.gates.is_some() && !self.config.fixture {
-            return self
-                .request_hedged(url, headers, after, true, Some(race))
-                .await;
-        }
-        self.request_attempt(url, headers, race).await
-    }
-
     /// A source GET as the first attempt of race `race`: hedged as `request` would hedge it, and
     /// otherwise sent once with role `primary`. A later retry names `race` as its parent.
     pub async fn request_attempt(
@@ -1469,9 +1445,7 @@ impl HttpRecorder {
     ) -> Result<HttpResponse> {
         if self.gates.is_some() && !self.config.fixture && self.config.source_hedge_ms > 0 {
             let after = Duration::from_millis(self.config.source_hedge_ms);
-            return self
-                .request_hedged(url, headers, after, false, Some(race))
-                .await;
+            return self.request_hedged(url, headers, after, Some(race)).await;
         }
         let tag = AttemptTag {
             role: "primary",

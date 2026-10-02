@@ -94,7 +94,7 @@ Change them only to test the tool.
 | `--admission-wait-secs` | `60` | Wait for a search slot before `busy` |
 | `--jev-concurrency` | `32` | Jev calls in flight in one search |
 | `--jev-hedge-ms` | `2000` | Delay before a Jev hedge request. `0` turns Jev hedging off. |
-| `--source-hedge-ms` | `0` | Delay before a general source hedge request. `0` turns general source hedging off. The shared Scout research call is always hedged after 2 seconds. |
+| `--source-hedge-ms` | `0` | Delay before a source hedge request. `0` turns source hedging off. |
 | `--jev-batch` | `1` | Chunks per scoring call |
 | `--today` | today in UTC | Reference date (`YYYY-MM-DD`) for currentness |
 | `--route-passes` | `2` | Routing passes |

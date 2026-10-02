@@ -319,20 +319,13 @@ async fn a_hedge_waits_for_a_hedge_permit_and_never_for_the_originals_permits() 
 }
 
 #[tokio::test]
-async fn an_in_share_hedge_wins_without_raising_requests_in_flight() {
+async fn a_hedge_receipt_names_its_role_and_race_and_the_loser_its_cause() {
     let dir = tempfile::tempdir().unwrap();
-    // Source hedging is off; the in-share hedge still applies.
-    let recorder = hedging(
-        dir.path(),
-        RunConfig {
-            concurrency: 2,
-            ..RunConfig::default()
-        },
-    );
+    let recorder = hedging(dir.path(), hedge_after(200));
     let (url, count, _) = scripted_server(vec![(NEVER, OK), (after(50), OK)]).await;
     let started = Instant::now();
     let response = recorder
-        .request_hedged_in_share(&url, vec![], Duration::from_millis(200), "race-a".into())
+        .request_attempt(&url, vec![], "race-a".into())
         .await
         .unwrap();
     assert_eq!(response.status, 200);
@@ -341,7 +334,6 @@ async fn an_in_share_hedge_wins_without_raising_requests_in_flight() {
     let latency = &recorder.load_summary()["source_latency"]["127.0.0.1"];
     assert_eq!(latency["hedged"], 1);
     assert_eq!(latency["hedge_wins"], 1);
-    assert!(latency["peak_in_flight"].as_u64().unwrap() <= 2);
     // Both receipts name their role and race; the cancelled original names the race as its cause.
     let receipts = receipts(dir.path());
     assert_eq!(receipts.len(), 2);
@@ -357,24 +349,26 @@ async fn an_in_share_hedge_wins_without_raising_requests_in_flight() {
 #[tokio::test]
 async fn a_hedge_still_waiting_for_a_permit_loses_when_the_primary_decides() {
     let dir = tempfile::tempdir().unwrap();
-    let recorder = hedging(
-        dir.path(),
-        RunConfig {
-            concurrency: 1,
-            ..RunConfig::default()
-        },
-    );
-    // The primary answers after the hedge delay, while the hedge waits for the only permit.
-    let (url, count, _) = scripted_server(vec![(after(400), OK)]).await;
-    recorder
-        .request_hedged_in_share(&url, vec![], Duration::from_millis(100), "race-d".into())
-        .await
-        .unwrap();
-    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let recorder = hedging(dir.path(), hedge_after(100));
+    // Three originals answer after the hedge delay. Two hedges hold the host's hedge permits; the
+    // third waits for one until its original answers.
+    let (url, count, _) = scripted_server(vec![
+        (after(400), OK),
+        (after(400), OK),
+        (after(400), OK),
+        (NEVER, OK),
+        (NEVER, OK),
+    ])
+    .await;
+    let requests = (0..3).map(|i| recorder.request_attempt(&url, vec![], format!("race-{i}")));
+    for result in futures::future::join_all(requests).await {
+        assert_eq!(result.unwrap().status, 200);
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 5);
     let receipts = receipts(dir.path());
-    let hedge = receipts.iter().find(|r| r["role"] == "hedge").unwrap();
-    assert_eq!(hedge["race_id"], "race-d");
-    assert_eq!(hedge["cancel_cause"], "hedge_loser");
+    let hedges: Vec<_> = receipts.iter().filter(|r| r["role"] == "hedge").collect();
+    assert_eq!(hedges.len(), 3);
+    assert!(hedges.iter().all(|r| r["cancel_cause"] == "hedge_loser"));
 }
 
 #[tokio::test]
@@ -414,33 +408,6 @@ async fn a_retry_receipt_names_its_role_and_the_attempt_it_repeats() {
     assert_eq!(receipts[0]["parent_artifact"], "raw/000041.body.gz");
     assert_eq!(receipts[0]["parent_race_id"], "race-c");
     assert!(receipts[0].get("race_id").is_none());
-}
-
-#[tokio::test]
-async fn an_in_share_hedge_waits_for_the_hosts_own_permit() {
-    let dir = tempfile::tempdir().unwrap();
-    let recorder = hedging(
-        dir.path(),
-        RunConfig {
-            concurrency: 1,
-            ..RunConfig::default()
-        },
-    );
-    let (url, count, _) = scripted_server(vec![(NEVER, OK), (after(0), OK)]).await;
-    let result = tokio::time::timeout(
-        Duration::from_millis(800),
-        recorder.request_hedged_in_share(&url, vec![], Duration::from_millis(100), "race-b".into()),
-    )
-    .await;
-    assert!(
-        result.is_err(),
-        "the stalled original holds the only permit"
-    );
-    assert_eq!(
-        count.load(Ordering::SeqCst),
-        1,
-        "no second request in flight"
-    );
 }
 
 #[tokio::test]

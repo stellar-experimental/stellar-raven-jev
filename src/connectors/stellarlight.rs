@@ -107,12 +107,6 @@ pub fn host() -> Option<String> {
     Some(Url::parse(BASE).ok()?.host_str()?.to_owned())
 }
 
-/// Whether a source's first request is the one research request that all routed research sources
-/// share, so a question books it once.
-pub fn shares_first_request(source: &Source) -> bool {
-    source.id.starts_with("stellarlight.research.")
-}
-
 /// The request scope (host and path) of a source's first request, as the HTTP recorder names
 /// scopes for source rate limits. Every research origin shares one endpoint.
 pub fn first_request_scope(source: &Source) -> Option<String> {
@@ -168,176 +162,19 @@ fn request_url(path: &str, params: &[(&str, String)]) -> Result<String> {
     Ok(url.into())
 }
 
-/// One multi-source research call that every routed research source of a question shares, so the
-/// question sends one research request (`source=a,b,c&perSource=N`) instead of one per source.
-/// Scout runs each source through its single-source pipeline and groups the rows by source.
-pub struct ResearchBatch {
-    origins: Vec<String>,
-    shared: tokio::sync::OnceCell<SharedRead>,
-}
-
-/// The shared research response, or the failures of the one request that would have produced it.
-struct SharedRead {
-    url: String,
-    read: Option<(Value, String, String)>,
-    failures: Vec<Failure>,
-}
-
-impl ResearchBatch {
-    /// A batch for the research sources among `sources`, when there are two or more.
-    pub fn for_sources<'a>(
-        sources: impl IntoIterator<Item = &'a Source>,
-    ) -> Option<std::sync::Arc<Self>> {
-        let origins: Vec<String> = sources
-            .into_iter()
-            .filter_map(|source| source.id.strip_prefix("stellarlight.research."))
-            .map(str::to_owned)
-            .collect();
-        (origins.len() > 1).then(|| {
-            std::sync::Arc::new(Self {
-                origins,
-                shared: tokio::sync::OnceCell::new(),
-            })
-        })
-    }
-
-    fn covers(&self, origin: &str) -> bool {
-        self.origins.iter().any(|o| o == origin)
-    }
-
-    /// The shared response. The first source to ask sends the request; the others wait for it.
-    async fn read(
-        &self,
-        ctx: &FetchContext,
-        source: &Source,
-        question: &str,
-        per_source: usize,
-    ) -> Result<&SharedRead> {
-        self.shared
-            .get_or_try_init(|| async {
-                let url = request_url(
-                    "/api/research",
-                    &[
-                        ("q", question.to_owned()),
-                        ("source", self.origins.join(",")),
-                        ("perSource", per_source.to_string()),
-                    ],
-                )?;
-                let mut result = FetchResult::default();
-                let read = read(ctx, source, &mut result, &url, Some(RESEARCH_HEDGE_AFTER)).await;
-                Ok(SharedRead {
-                    url,
-                    read,
-                    failures: result.failures,
-                })
-            })
-            .await
-    }
-}
-
-/// One source's part of a shared research response: its rows in Scout's order, and its meta with
-/// that source's status, match mode, document count, and the warnings that name it.
-/// Whether `text` names `origin` as a whole token. Hyphens belong to tokens, so one source name
-/// inside a longer one does not count.
-fn names_source(text: &str, origin: &str) -> bool {
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-        .any(|token| token == origin)
-}
-
-fn source_part(value: &Value, origin: &str, origins: &[String]) -> (Value, Option<Value>) {
-    let rows: Vec<Value> = value["results"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|row| row["source"] == origin)
-        .cloned()
-        .collect();
-    let mut meta = value["meta"].clone();
-    let entry = meta["bySource"]
-        .as_array()
-        .and_then(|entries| entries.iter().find(|e| e["source"] == origin))
-        .cloned();
-    if let Some(object) = meta.as_object_mut() {
-        object.remove("bySource");
-        object.insert("source".into(), json!(origin));
-        // A warning goes to each routed source it names. One that names none of them is about
-        // the whole request; the first routed source carries it, so it is reported once.
-        let first = origins.first().is_some_and(|o| o == origin);
-        let warnings: Vec<Value> = object
-            .get("warnings")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|w| {
-                let text = w
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| w.to_string());
-                names_source(&text, origin)
-                    || (first && !origins.iter().any(|o| names_source(&text, o)))
-            })
-            .cloned()
-            .collect();
-        object.insert(
-            "warnings".into(),
-            if warnings.is_empty() {
-                Value::Null
-            } else {
-                json!(warnings)
-            },
-        );
-        if let Some(entry) = &entry {
-            for key in [
-                "matchMode",
-                "sourceDocCount",
-                "resultsHash",
-                "status",
-                "returned",
-            ] {
-                if let Some(v) = entry.get(key) {
-                    object.insert(key.into(), v.clone());
-                }
-            }
-            // The label follows this source's mode, never the mode of the whole response.
-            let label = if entry["matchMode"] == "keyword" {
-                json!("vector search unavailable for this source; keyword match")
-            } else {
-                entry["matchMode"].clone()
-            };
-            object.insert("matchModeLabel".into(), label);
-        }
-    }
-    (json!({"results": rows, "meta": meta}), entry)
-}
-
-/// When the shared research call has no response this long after it was sent, one more copy goes
-/// out and the first decisive answer wins. One call carries every routed research source, so a
-/// stalled request would otherwise cost all of them.
-const RESEARCH_HEDGE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// `hedge_after`, when set, hedges the first attempt within the host's own request permits.
 async fn read(
     ctx: &FetchContext,
     source: &Source,
     result: &mut FetchResult,
     url: &str,
-    hedge_after: Option<std::time::Duration>,
 ) -> Option<(Value, String, String)> {
     // One id names this read's first attempt (and its hedge), so a retry can name it as its
     // parent even when that attempt failed before a response.
     let race = uuid::Uuid::new_v4().to_string();
-    let mut response = match hedge_after {
-        Some(after) => {
-            ctx.http
-                .request_hedged_in_share(url, auth_headers(), after, race.clone())
-                .await
-        }
-        None => {
-            ctx.http
-                .request_attempt(url, auth_headers(), race.clone())
-                .await
-        }
-    };
+    let mut response = ctx
+        .http
+        .request_attempt(url, auth_headers(), race.clone())
+        .await;
     // Scout answers transient overload with a server error, and a connection can fail before a
     // complete response. Every Scout read is a GET, so one retry is safe: after the Retry-After Scout
     // sends, or after a short delay. A timeout is not retried, because it has already spent its
@@ -966,7 +803,7 @@ async fn hydrate(
         return Ok(());
     };
     let url = request_url(&format!("{path}{slug}"), &[])?;
-    let Some((value, artifact, _)) = read(ctx, source, result, &url, None).await else {
+    let Some((value, artifact, _)) = read(ctx, source, result, &url).await else {
         return Ok(());
     };
     doc.raw_artifacts.push(artifact.clone());
@@ -1102,74 +939,9 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
         if entry.paged {
             params.push(("offset", offset.to_string()));
         }
-        let batch = research.and_then(|origin| {
-            ctx.scout_research
-                .as_ref()
-                .filter(|batch| batch.covers(origin))
-                .map(|batch| (origin, batch))
-        });
-        let (url, value, artifact, trace) = if let Some((origin, batch)) = batch {
-            let per_source = entry.limit.min(ctx.config.max_documents);
-            let shared = batch.read(ctx, source, question, per_source).await?;
-            let Some((value, artifact, trace)) = &shared.read else {
-                for failure in &shared.failures {
-                    let mut failure = failure.clone();
-                    failure.source_id = Some(source.id.clone());
-                    result.failures.push(failure);
-                }
-                break;
-            };
-            if !value["results"].is_array() {
-                failure(
-                    &mut result,
-                    source,
-                    "parse",
-                    format!("Scout's shared research response omitted results. Artifact: {artifact}{trace}"),
-                );
-                break;
-            }
-            let entries = value["meta"]["bySource"].as_array().map_or(0, |all| {
-                all.iter().filter(|e| e["source"] == origin).count()
-            });
-            let (part, entry) = source_part(value, origin, &batch.origins);
-            let rows = part["results"].as_array().map_or(0, Vec::len);
-            let returned = entry.as_ref().and_then(|e| e["returned"].as_u64());
-            let succeeded = entry.as_ref().is_some_and(|e| e["status"] == 200);
-            if entries > 1 || (succeeded && returned != Some(rows as u64)) {
-                failure(
-                    &mut result,
-                    source,
-                    "parse",
-                    format!(
-                        "Scout's shared research response does not account for this source's rows: {entries} entries, returned {}, {rows} rows sent. Artifact: {artifact}{trace}",
-                        returned.map_or_else(|| "missing".to_owned(), |n| n.to_string())
-                    ),
-                );
-            }
-            if entry.as_ref().is_none_or(|e| e["status"] != 200) {
-                let status = entry
-                    .as_ref()
-                    .map(|e| e["status"].to_string())
-                    .unwrap_or_else(|| "missing".into());
-                failure(
-                    &mut result,
-                    source,
-                    "http",
-                    format!(
-                        "Scout did not read this source in the shared research call (status {status}). Artifact: {artifact}{trace}"
-                    ),
-                );
-                notices(source, &part["meta"], trace, &mut result);
-                break;
-            }
-            (shared.url.clone(), part, artifact.clone(), trace.clone())
-        } else {
-            let url = request_url(entry.path, &params)?;
-            let Some((value, artifact, trace)) = read(ctx, source, &mut result, &url, None).await
-            else {
-                break;
-            };
-            (url, value, artifact, trace)
+        let url = request_url(entry.path, &params)?;
+        let Some((value, artifact, trace)) = read(ctx, source, &mut result, &url).await else {
+            break;
         };
         let meta = &value["meta"];
         notices(source, meta, &trace, &mut result);
@@ -1371,7 +1143,6 @@ mod tests {
             http: crate::http::HttpRecorder::loopback_for_test(dir, &config).unwrap(),
             config,
             deadline: None,
-            scout_research: None,
         }
     }
 
@@ -1388,12 +1159,12 @@ mod tests {
         let source = &sources()[0];
         let url = format!("http://{addr}/api/x");
         let mut result = FetchResult::default();
-        let (value, _, _) = read(&ctx, source, &mut result, &url, None)
+        let (value, _, _) = read(&ctx, source, &mut result, &url)
             .await
             .expect("the retry succeeds");
         assert_eq!(value["rows"], json!([]));
         assert!(result.failures.is_empty());
-        assert!(read(&ctx, source, &mut result, &url, None).await.is_none());
+        assert!(read(&ctx, source, &mut result, &url).await.is_none());
         assert_eq!(result.failures.len(), 1);
         let message = &result.failures[0].message;
         assert!(message.contains("HTTP 502"), "{message}");
@@ -1415,9 +1186,7 @@ mod tests {
         let ctx = loopback_context(dir.path());
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
-        assert!(read(&ctx, &sources()[0], &mut result, &url, None)
-            .await
-            .is_none());
+        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
         let message = &result.failures[0].message;
         assert!(message.contains("HTTP 504"), "{message}");
         assert!(!message.contains("First attempt"), "{message}");
@@ -1438,7 +1207,7 @@ mod tests {
         let url = format!("http://{addr}/api/x");
         let mut result = FetchResult::default();
         // Two closed connections: the retry also fails, and the cause class is reported.
-        assert!(read(&ctx, source, &mut result, &url, None).await.is_none());
+        assert!(read(&ctx, source, &mut result, &url).await.is_none());
         let message = &result.failures[0].message;
         assert!(
             message.starts_with("Scout read failed (connection_closed)"),
@@ -1452,7 +1221,7 @@ mod tests {
         .await;
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
-        assert!(read(&ctx, source, &mut result, &url, None).await.is_some());
+        assert!(read(&ctx, source, &mut result, &url).await.is_some());
         assert!(result.failures.is_empty());
     }
 
@@ -1481,13 +1250,10 @@ mod tests {
             http: crate::http::HttpRecorder::loopback_for_test(dir.path(), &config).unwrap(),
             config,
             deadline: None,
-            scout_research: None,
         };
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
-        assert!(read(&ctx, &sources()[0], &mut result, &url, None)
-            .await
-            .is_none());
+        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
         let message = &result.failures[0].message;
         assert!(
@@ -1518,11 +1284,11 @@ mod tests {
         let url = format!("http://{addr}/api/x");
         let mut result = FetchResult::default();
         let started = std::time::Instant::now();
-        assert!(read(&ctx, source, &mut result, &url, None).await.is_some());
+        assert!(read(&ctx, source, &mut result, &url).await.is_some());
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
         // A 30 s Retry-After is past the limit: reported at once, and the next reply is unused.
         let started = std::time::Instant::now();
-        assert!(read(&ctx, source, &mut result, &url, None).await.is_none());
+        assert!(read(&ctx, source, &mut result, &url).await.is_none());
         assert!(started.elapsed() < RETRY_AFTER_LIMIT);
         assert_eq!(result.failures.len(), 1);
         let message = &result.failures[0].message;
@@ -1572,9 +1338,7 @@ mod tests {
         ctx.deadline = Some(tokio::time::Instant::now() + second * 2);
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
-        assert!(read(&ctx, &sources()[0], &mut result, &url, None)
-            .await
-            .is_none());
+        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
         let message = &result.failures[0].message;
         assert!(
             message.contains("HTTP 503 and was not retried"),
@@ -1595,9 +1359,7 @@ mod tests {
         let ctx = loopback_context(dir.path());
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
-        assert!(read(&ctx, &sources()[0], &mut result, &url, None)
-            .await
-            .is_none());
+        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
         let message = &result.failures[0].message;
         assert!(
             message.contains("Scout said: Retry-After: 30; error: database read failed"),
@@ -1606,81 +1368,20 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_research_response_splits_into_each_source_part() {
-        let value = json!({
-            "results": [
-                {"source": "cap", "id": "c1"},
-                {"source": "sep", "id": "s1"},
-                {"source": "cap", "id": "c2"},
-            ],
-            "meta": {
-                "matchMode": "vector",
-                "matchModeLabel": "vector-similarity ranking",
-                "warnings": ["source \"sep\" could not be read", "a note about capacity"],
-                "bySource": [
-                    {"source": "cap", "status": 200, "returned": 2, "matchMode": "vector", "sourceDocCount": 9},
-                    {"source": "sep", "status": 503, "returned": 0, "matchMode": "keyword", "sourceDocCount": 4},
-                ],
-            },
-        });
-        let origins = vec!["cap".to_owned(), "sep".to_owned(), "lumenloop".to_owned()];
-        let (cap, cap_entry) = source_part(&value, "cap", &origins);
-        let ids: Vec<_> = cap["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r["id"].clone())
-            .collect();
-        assert_eq!(ids, vec![json!("c1"), json!("c2")]);
-        assert_eq!(cap_entry.unwrap()["status"], 200);
-        assert_eq!(cap["meta"]["sourceDocCount"], 9);
-        // The warning that names no routed source is about the request; the first source carries it.
-        assert_eq!(
-            cap["meta"]["warnings"],
-            json!(["a note about capacity"]),
-            "a word that only contains a source name does not name it"
-        );
-        assert!(names_source(
-            "source \"lumenloop-research\" is slow",
-            "lumenloop-research"
-        ));
-        assert!(!names_source(
-            "source \"lumenloop-research\" is slow",
-            "lumenloop"
-        ));
-        assert_eq!(cap["meta"]["matchModeLabel"], "vector");
-        assert!(cap["meta"].get("bySource").is_none());
-
-        let (sep, sep_entry) = source_part(&value, "sep", &origins);
-        assert_eq!(sep_entry.unwrap()["status"], 503);
-        assert_eq!(sep["meta"]["warnings"].as_array().unwrap().len(), 1);
-        let mut result = FetchResult::default();
-        notices(&sources()[0], &sep["meta"], "", &mut result);
-        assert!(result.failures.iter().any(|f| f.stage == "search_limit"));
-
-        let (missing, entry) = source_part(&value, "paper", &origins);
-        assert!(entry.is_none());
-        assert!(missing["results"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn research_sources_share_one_batch_and_one_booking() {
+    fn each_research_source_books_its_own_research_request() {
         let all = sources();
         let research: Vec<&Source> = all
             .iter()
             .filter(|s| s.id.starts_with("stellarlight.research."))
             .take(3)
             .collect();
-        let batch = ResearchBatch::for_sources(research.iter().copied()).unwrap();
-        assert_eq!(batch.origins.len(), 3);
-        assert!(ResearchBatch::for_sources(research.iter().copied().take(1)).is_none());
         let listing = all
             .iter()
             .find(|s| s.id == "stellarlight.projects")
             .unwrap();
         let demands = crate::connectors::first_requests(research.iter().copied().chain([listing]));
         let research_scope = first_request_scope(research[0]).unwrap();
-        assert!(demands.contains(&(research_scope, 1)));
+        assert!(demands.contains(&(research_scope, 3)));
         assert_eq!(demands.len(), 2);
     }
 
@@ -1884,7 +1585,6 @@ mod tests {
             http: crate::http::HttpRecorder::new(dir.path(), &config).unwrap(),
             config,
             deadline: None,
-            scout_research: None,
         };
         let source = sources()
             .into_iter()
@@ -2075,7 +1775,6 @@ mod tests {
             http: crate::http::HttpRecorder::new(dir.path(), &config).unwrap(),
             config,
             deadline: None,
-            scout_research: None,
         };
         let catalog = sources();
         let unique: HashSet<_> = catalog.iter().map(|s| &s.id).collect();
@@ -2106,7 +1805,6 @@ mod tests {
             http: crate::http::HttpRecorder::new(dir.path(), &config).unwrap(),
             config,
             deadline: None,
-            scout_research: None,
         };
         let result = fetch(&ctx, &sources()[0], "wallet").await.unwrap();
         assert!(result.documents.is_empty());

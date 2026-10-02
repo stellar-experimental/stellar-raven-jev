@@ -1071,7 +1071,6 @@ mod tests {
             http: http.clone(),
             config: config.clone(),
             deadline: None,
-            scout_research: None,
         };
         for source in sources() {
             let result = fetch(&ctx, &source, "Stellar").await.unwrap();
@@ -1089,7 +1088,6 @@ mod tests {
                 http,
                 config,
                 deadline: None,
-                scout_research: None,
             },
             &sources()[0],
             "Stellar",

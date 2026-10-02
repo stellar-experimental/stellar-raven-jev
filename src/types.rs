@@ -171,6 +171,4 @@ pub struct FetchContext {
     /// When the fetch stage drops unfinished connectors. A connector does not start a wait that
     /// would end past it.
     pub deadline: Option<tokio::time::Instant>,
-    /// The research call that the routed Scout research sources of this question share.
-    pub scout_research: Option<std::sync::Arc<crate::connectors::stellarlight::ResearchBatch>>,
 }

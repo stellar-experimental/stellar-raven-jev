@@ -133,8 +133,7 @@ struct Cli {
     #[arg(long, global = true, hide = true, default_value_t = 2000)]
     jev_hedge_ms: u64,
     /// A source GET without a response this long after it was sent gets one hedge request on a
-    /// fresh connection. 0 turns this general source hedging off. The shared Scout research call
-    /// is always hedged after 2 s, within the question's own request permits.
+    /// fresh connection. 0 turns source hedging off.
     #[arg(long, global = true, hide = true, default_value_t = 0)]
     source_hedge_ms: u64,
     /// Chunks per scoring call. The default is one, because chunks that share a call change each
