@@ -1109,19 +1109,23 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                 );
                 break;
             }
+            let entries = value["meta"]["bySource"].as_array().map_or(0, |all| {
+                all.iter().filter(|e| e["source"] == origin).count()
+            });
             let (part, entry) = source_part(value, origin, &batch.origins);
             let rows = part["results"].as_array().map_or(0, Vec::len);
-            if let Some(returned) = entry.as_ref().and_then(|e| e["returned"].as_u64()) {
-                if returned != rows as u64 {
-                    failure(
-                        &mut result,
-                        source,
-                        "parse",
-                        format!(
-                            "Scout said it returned {returned} rows for this source and sent {rows}. Artifact: {artifact}{trace}"
-                        ),
-                    );
-                }
+            let returned = entry.as_ref().and_then(|e| e["returned"].as_u64());
+            let succeeded = entry.as_ref().is_some_and(|e| e["status"] == 200);
+            if entries > 1 || (succeeded && returned != Some(rows as u64)) {
+                failure(
+                    &mut result,
+                    source,
+                    "parse",
+                    format!(
+                        "Scout's shared research response does not account for this source's rows: {entries} entries, returned {}, {rows} rows sent. Artifact: {artifact}{trace}",
+                        returned.map_or_else(|| "missing".to_owned(), |n| n.to_string())
+                    ),
+                );
             }
             if entry.as_ref().is_none_or(|e| e["status"] != 200) {
                 let status = entry

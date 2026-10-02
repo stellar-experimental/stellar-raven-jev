@@ -406,18 +406,22 @@ impl Governor {
                     *entry = (*entry).max(until);
                 }
                 // A window scoped to one instance does not describe this host. Forget a window
-                // learned before for the scope; a stated window starts again from its stated values.
+                // learned before for the scope.
                 if signals.instance_scoped {
-                    match self.stated.get(scope) {
-                        Some((limit, period_ms)) => {
-                            if let Some(window) = state.windows.get_mut(scope) {
-                                window.limit = *limit;
-                                window.period_ms = *period_ms;
-                                window.paced_until_ms = 0;
-                                window.reset_ms = window.reset_ms.min(now + period_ms);
-                            }
+                    match (self.stated.get(scope), state.windows.get_mut(scope)) {
+                        // A stated window that learned other values goes back to its stated ones.
+                        // One that already has them keeps its count and pacing.
+                        (Some((limit, period_ms)), Some(window))
+                            if window.limit != *limit || window.period_ms != *period_ms =>
+                        {
+                            window.limit = *limit;
+                            window.period_ms = *period_ms;
+                            window.used = window.used.min(*limit);
+                            window.reset_ms = window.reset_ms.min(now + period_ms);
+                            window.paced_until_ms = window.paced_until_ms.min(window.reset_ms);
                         }
-                        None => {
+                        (Some(_), _) => {}
+                        (None, _) => {
                             state.windows.remove(scope);
                         }
                     }

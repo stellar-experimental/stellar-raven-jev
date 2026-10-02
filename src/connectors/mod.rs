@@ -157,10 +157,13 @@ pub fn host_caps<'a>(
             let host_slots = *slots.get(&host)?;
             Some(match stated.get(&host) {
                 Some(&limit) => {
-                    let need = per_question
-                        .max(limit.div_ceil(host_slots.max(1)))
-                        .min(limit);
-                    (host, limit, need)
+                    // Explicit slots can only let fewer questions in at once.
+                    let need = if config.source_slots.contains_key(&host) {
+                        per_question.max(limit.div_ceil(host_slots.max(1)))
+                    } else {
+                        per_question
+                    };
+                    (host, limit, need.min(limit))
                 }
                 None => (host, host_slots, 1),
             })
@@ -202,6 +205,30 @@ mod tests {
         let slots = source_slots(&config);
         assert_eq!(slots[&scout], 1_000);
         assert_eq!(slots["fernlet.test"], 3);
+    }
+
+    #[test]
+    fn a_question_holds_its_own_in_flight_requests_unless_slots_say_fewer_questions() {
+        let scout = stellarlight::host().unwrap();
+        let limit = stellarlight::HOST_CONCURRENCY;
+        let research: Vec<Source> = stellarlight::sources()
+            .into_iter()
+            .filter(|s| s.id.starts_with("stellarlight.research."))
+            .take(1)
+            .collect();
+        let mut config = RunConfig {
+            concurrency: 10,
+            ..RunConfig::default()
+        };
+        assert_eq!(
+            host_caps(research.iter(), &config),
+            vec![(scout.clone(), limit, 10)]
+        );
+        config.source_slots = std::collections::BTreeMap::from([(scout.clone(), 1)]);
+        assert_eq!(
+            host_caps(research.iter(), &config),
+            vec![(scout, limit, limit)]
+        );
     }
 
     #[test]
