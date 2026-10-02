@@ -224,7 +224,7 @@ impl ResearchBatch {
                     ],
                 )?;
                 let mut result = FetchResult::default();
-                let read = read(ctx, source, &mut result, &url).await;
+                let read = read(ctx, source, &mut result, &url, Some(RESEARCH_HEDGE_AFTER)).await;
                 Ok(SharedRead {
                     url,
                     read,
@@ -310,16 +310,31 @@ fn source_part(value: &Value, origin: &str, origins: &[String]) -> (Value, Optio
     (json!({"results": rows, "meta": meta}), entry)
 }
 
+/// When the shared research call has no response this long after it was sent, one more copy goes
+/// out and the first decisive answer wins. One call carries every routed research source, so a
+/// stalled request would otherwise cost all of them.
+const RESEARCH_HEDGE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `hedge_after`, when set, hedges the first attempt within the host's own request permits.
 async fn read(
     ctx: &FetchContext,
     source: &Source,
     result: &mut FetchResult,
     url: &str,
+    hedge_after: Option<std::time::Duration>,
 ) -> Option<(Value, String, String)> {
-    let mut response = ctx
-        .http
-        .request(Method::GET, url, auth_headers(), None)
-        .await;
+    let mut response = match hedge_after {
+        Some(after) => {
+            ctx.http
+                .request_hedged_in_share(url, auth_headers(), after)
+                .await
+        }
+        None => {
+            ctx.http
+                .request(Method::GET, url, auth_headers(), None)
+                .await
+        }
+    };
     // Scout answers transient overload with a server error, and a connection can fail before a
     // complete response. Every Scout read is a GET, so one retry is safe: after the Retry-After Scout
     // sends, or after a short delay. A timeout is not retried, because it has already spent its
@@ -947,7 +962,7 @@ async fn hydrate(
         return Ok(());
     };
     let url = request_url(&format!("{path}{slug}"), &[])?;
-    let Some((value, artifact, _)) = read(ctx, source, result, &url).await else {
+    let Some((value, artifact, _)) = read(ctx, source, result, &url, None).await else {
         return Ok(());
     };
     doc.raw_artifacts.push(artifact.clone());
@@ -1146,7 +1161,8 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
             (shared.url.clone(), part, artifact.clone(), trace.clone())
         } else {
             let url = request_url(entry.path, &params)?;
-            let Some((value, artifact, trace)) = read(ctx, source, &mut result, &url).await else {
+            let Some((value, artifact, trace)) = read(ctx, source, &mut result, &url, None).await
+            else {
                 break;
             };
             (url, value, artifact, trace)
@@ -1368,12 +1384,12 @@ mod tests {
         let source = &sources()[0];
         let url = format!("http://{addr}/api/x");
         let mut result = FetchResult::default();
-        let (value, _, _) = read(&ctx, source, &mut result, &url)
+        let (value, _, _) = read(&ctx, source, &mut result, &url, None)
             .await
             .expect("the retry succeeds");
         assert_eq!(value["rows"], json!([]));
         assert!(result.failures.is_empty());
-        assert!(read(&ctx, source, &mut result, &url).await.is_none());
+        assert!(read(&ctx, source, &mut result, &url, None).await.is_none());
         assert_eq!(result.failures.len(), 1);
         let message = &result.failures[0].message;
         assert!(message.contains("HTTP 502"), "{message}");
@@ -1395,7 +1411,9 @@ mod tests {
         let ctx = loopback_context(dir.path());
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
-        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
+        assert!(read(&ctx, &sources()[0], &mut result, &url, None)
+            .await
+            .is_none());
         let message = &result.failures[0].message;
         assert!(message.contains("HTTP 504"), "{message}");
         assert!(!message.contains("First attempt"), "{message}");
@@ -1416,7 +1434,7 @@ mod tests {
         let url = format!("http://{addr}/api/x");
         let mut result = FetchResult::default();
         // Two closed connections: the retry also fails, and the cause class is reported.
-        assert!(read(&ctx, source, &mut result, &url).await.is_none());
+        assert!(read(&ctx, source, &mut result, &url, None).await.is_none());
         let message = &result.failures[0].message;
         assert!(
             message.starts_with("Scout read failed (connection_closed)"),
@@ -1430,7 +1448,7 @@ mod tests {
         .await;
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
-        assert!(read(&ctx, source, &mut result, &url).await.is_some());
+        assert!(read(&ctx, source, &mut result, &url, None).await.is_some());
         assert!(result.failures.is_empty());
     }
 
@@ -1463,7 +1481,9 @@ mod tests {
         };
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
-        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
+        assert!(read(&ctx, &sources()[0], &mut result, &url, None)
+            .await
+            .is_none());
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
         let message = &result.failures[0].message;
         assert!(
@@ -1494,11 +1514,11 @@ mod tests {
         let url = format!("http://{addr}/api/x");
         let mut result = FetchResult::default();
         let started = std::time::Instant::now();
-        assert!(read(&ctx, source, &mut result, &url).await.is_some());
+        assert!(read(&ctx, source, &mut result, &url, None).await.is_some());
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
         // A 30 s Retry-After is past the limit: reported at once, and the next reply is unused.
         let started = std::time::Instant::now();
-        assert!(read(&ctx, source, &mut result, &url).await.is_none());
+        assert!(read(&ctx, source, &mut result, &url, None).await.is_none());
         assert!(started.elapsed() < RETRY_AFTER_LIMIT);
         assert_eq!(result.failures.len(), 1);
         let message = &result.failures[0].message;
@@ -1548,7 +1568,9 @@ mod tests {
         ctx.deadline = Some(tokio::time::Instant::now() + second * 2);
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
-        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
+        assert!(read(&ctx, &sources()[0], &mut result, &url, None)
+            .await
+            .is_none());
         let message = &result.failures[0].message;
         assert!(
             message.contains("HTTP 503 and was not retried"),
@@ -1569,7 +1591,9 @@ mod tests {
         let ctx = loopback_context(dir.path());
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
-        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
+        assert!(read(&ctx, &sources()[0], &mut result, &url, None)
+            .await
+            .is_none());
         let message = &result.failures[0].message;
         assert!(
             message.contains("Scout said: Retry-After: 30; error: database read failed"),

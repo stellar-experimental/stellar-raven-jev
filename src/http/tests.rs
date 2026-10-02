@@ -319,6 +319,59 @@ async fn a_hedge_waits_for_a_hedge_permit_and_never_for_the_originals_permits() 
 }
 
 #[tokio::test]
+async fn an_in_share_hedge_wins_without_raising_requests_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    // Source hedging is off; the in-share hedge still applies.
+    let recorder = hedging(
+        dir.path(),
+        RunConfig {
+            concurrency: 2,
+            ..RunConfig::default()
+        },
+    );
+    let (url, count, _) = scripted_server(vec![(NEVER, OK), (after(50), OK)]).await;
+    let started = Instant::now();
+    let response = recorder
+        .request_hedged_in_share(&url, vec![], Duration::from_millis(200))
+        .await
+        .unwrap();
+    assert_eq!(response.status, 200);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    let latency = &recorder.load_summary()["source_latency"]["127.0.0.1"];
+    assert_eq!(latency["hedged"], 1);
+    assert_eq!(latency["hedge_wins"], 1);
+    assert!(latency["peak_in_flight"].as_u64().unwrap() <= 2);
+}
+
+#[tokio::test]
+async fn an_in_share_hedge_waits_for_the_hosts_own_permit() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = hedging(
+        dir.path(),
+        RunConfig {
+            concurrency: 1,
+            ..RunConfig::default()
+        },
+    );
+    let (url, count, _) = scripted_server(vec![(NEVER, OK), (after(0), OK)]).await;
+    let result = tokio::time::timeout(
+        Duration::from_millis(800),
+        recorder.request_hedged_in_share(&url, vec![], Duration::from_millis(100)),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "the stalled original holds the only permit"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "no second request in flight"
+    );
+}
+
+#[tokio::test]
 async fn a_429_on_the_hedge_closes_the_gate_and_the_original_decides() {
     let dir = tempfile::tempdir().unwrap();
     let recorder = hedging(dir.path(), hedge_after(200));
