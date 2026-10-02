@@ -244,6 +244,7 @@ A source can slow down under load before its rate window fills. A slow source is
 - Stellar Scout retries a server error once.
   It also retries a request once when it fails before a complete response, unless the cause is a timeout. It waits for Scout's `Retry-After` plus up to 500 ms, or 250 to 750 ms without one.
   A `Retry-After` above 4 seconds, or a retry that would end within 1 second of the fetch deadline, is not retried.
+- A Scout HTTP failure report names Scout's `Retry-After` and the `error` field of its JSON body, when Scout sent them.
 - Scout failure and fallback reports end with Scout's request ID, `Server-Timing`, and match mode.
 
 ### Source hedging

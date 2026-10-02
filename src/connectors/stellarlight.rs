@@ -211,8 +211,10 @@ async fn read(
                     source,
                     "http",
                     format!(
-                        "Scout returned HTTP {}{not_retried}. Artifact: {}{trace}",
-                        response.status, response.artifact
+                        "Scout returned HTTP {}{not_retried}{}. Artifact: {}{trace}",
+                        response.status,
+                        refusal(&response),
+                        response.artifact
                     ),
                 );
                 return None;
@@ -273,6 +275,28 @@ fn trace(headers: &std::collections::BTreeMap<String, String>) -> String {
         String::new()
     } else {
         format!(". Trace: {}", parts.join("; "))
+    }
+}
+
+/// What Scout said about a failed read, as a suffix for its report: the Retry-After and the
+/// `error` field of the JSON body, which names the read that failed. Empty when Scout sent
+/// neither.
+fn refusal(response: &crate::http::HttpResponse) -> String {
+    let mut parts = Vec::new();
+    if let Some(value) = response.headers.get("retry-after") {
+        parts.push(format!("Retry-After: {}", value.trim()));
+    }
+    if let Some(error) = response.json().ok().and_then(|body| {
+        body["error"]
+            .as_str()
+            .map(|error| error.chars().take(200).collect::<String>())
+    }) {
+        parts.push(format!("error: {error}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(". Scout said: {}", parts.join("; "))
     }
 }
 
@@ -1279,6 +1303,27 @@ mod tests {
         let message = &result.failures[0].message;
         assert!(
             message.contains("HTTP 503 and was not retried"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_reports_the_retry_after_and_error_that_scout_sent() {
+        let body = br#"{"error":"database read failed","advisory":"retry","retryAfterSeconds":30}"#;
+        let refused = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let addr = replying(vec![Box::leak(refused.into_bytes().into_boxed_slice())]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = loopback_context(dir.path());
+        let mut result = FetchResult::default();
+        let url = format!("http://{addr}/api/x");
+        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
+        let message = &result.failures[0].message;
+        assert!(
+            message.contains("Scout said: Retry-After: 30; error: database read failed"),
             "{message}"
         );
     }
