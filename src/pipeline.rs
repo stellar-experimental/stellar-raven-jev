@@ -1358,10 +1358,10 @@ pub(crate) async fn finish(
     if !evidence.original_reads.is_null() {
         evidence.load["original_reads"] = evidence.original_reads.clone();
     }
-    let status = if evidence.failures.is_empty() {
-        "complete"
-    } else {
+    let status = if crate::search::evidence_lost(&evidence.failures, &evidence.load) {
         "partial"
+    } else {
+        "complete"
     };
     let usage = add_usage(prior, &backend.usage());
     let outcome = persist(config, &evidence, &usage, status)

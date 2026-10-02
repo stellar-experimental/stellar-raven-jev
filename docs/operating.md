@@ -117,6 +117,8 @@ A page on a tier 4 host is tier 4 even when it holds ordinary text.
 | `original_reads` | Original page reads (see [Original pages](#original-pages)) |
 
 A degraded call still returns its results. Ask again later for a complete one.
+The call status is `partial` (exit 2) only when `lost_evidence_reports` or `source_rate_limited_requests` is not zero.
+A coarser fallback alone sets `degraded`, but the status stays `complete`.
 
 ## Sessions and pools
 

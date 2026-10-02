@@ -234,6 +234,19 @@ const LOSS_STAGES: &[&str] = &[
     "original_lost",
 ];
 
+/// True when evidence was lost: a stage in `LOSS_STAGES`, or a source request refused by a rate
+/// limit. A source that answered with a coarser fallback ranking lost no evidence. This decides
+/// whether a run is `partial`.
+pub(crate) fn evidence_lost(failures: &[Failure], counters: &Value) -> bool {
+    failures
+        .iter()
+        .any(|f| LOSS_STAGES.contains(&f.stage.rsplit('.').next().unwrap_or_default()))
+        || counters["source_rate_limited_requests"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+}
+
 /// What load did to this run. `degraded` is true when evidence was lost: a lost stage (see
 /// `LOSS_STAGES`), a source that answered with a coarser fallback because its own ranking was
 /// limited or down, or a source request refused by a rate limit. Server errors that a retry
@@ -337,6 +350,26 @@ mod load_tests {
         assert_eq!(refused["degraded"], true);
         let recovered = load_summary(&[], &usage, &json!({"source_server_errors": 3}));
         assert_eq!(recovered["degraded"], false);
+    }
+
+    #[test]
+    fn only_lost_evidence_makes_a_run_partial() {
+        for notice in ["freshness", "query_variant", "source_limit", "search_limit"] {
+            assert!(!evidence_lost(&[report(notice)], &Value::Null), "{notice}");
+        }
+        for loss in [
+            "fetch_deadline",
+            "lumenloop.search",
+            "document_score",
+            "currentness",
+        ] {
+            assert!(evidence_lost(&[report(loss)], &Value::Null), "{loss}");
+        }
+        assert!(evidence_lost(
+            &[],
+            &json!({"source_rate_limited_requests": 1})
+        ));
+        assert!(!evidence_lost(&[], &json!({"source_server_errors": 3})));
     }
 }
 
