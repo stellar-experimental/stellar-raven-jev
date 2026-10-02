@@ -133,7 +133,8 @@ struct Cli {
     #[arg(long, global = true, hide = true, default_value_t = 2000)]
     jev_hedge_ms: u64,
     /// A source GET without a response this long after it was sent gets one hedge request on a
-    /// fresh connection. 0 turns source hedging off.
+    /// fresh connection. 0 turns this general source hedging off. The shared Scout research call
+    /// is always hedged after 2 s, within the question's own request permits.
     #[arg(long, global = true, hide = true, default_value_t = 0)]
     source_hedge_ms: u64,
     /// Chunks per scoring call. The default is one, because chunks that share a call change each
@@ -189,7 +190,8 @@ struct Cli {
     #[arg(long, global = true, env = "JEV_HOST_DIR", hide_env_values = true)]
     host_dir: Option<PathBuf>,
     /// Questions that may fetch from a source host at once, as `HOST=N[,HOST=N]` (for example
-    /// `example.org=2`). A named host replaces its default cap.
+    /// `example.org=2`). A named host replaces its default cap. For a host with a stated in-flight
+    /// limit, N times the requests one question may have in flight there must stay within it.
     #[arg(long, global = true, env = "JEV_SOURCE_SLOTS", hide_env_values = true, value_parser = parse_source_slots)]
     source_slots: Option<std::collections::BTreeMap<String, usize>>,
     /// Days without activity before a run folder is removed automatically. 0 keeps every folder.
