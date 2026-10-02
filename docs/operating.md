@@ -221,6 +221,9 @@ These defaults stay below the rates at which the providers refuse requests.
 - A source can advertise a request window with `x-ratelimit-limit` and `x-ratelimit-reset`.
   The host then keeps the limit and window length, and it counts its own requests against each window.
   A window marked `x-ratelimit-scope: instance` describes one serving instance, not the host, so it is not kept.
+- When a question routes to two or more Scout research sources, they share one research request (`source=a,b,c&perSource=N`).
+  Scout reads each source as in a single-source call and groups the rows by source. A source that Scout cannot read fails alone.
+  The question books one research request for all of them.
 - The tool keeps each Scout host at or under 32 requests in flight and 600 research requests per minute.
   An advertised window never raises this limit.
 - After routing, a question books the first request of every selected source, all at once or not at all.

@@ -52,7 +52,8 @@ pub fn sources() -> Vec<Source> {
 }
 
 /// The first request of each source, counted per request scope, so a question can book them in
-/// any window the source advertises before it sends them.
+/// any window the source advertises before it sends them. Sources that share one request book it
+/// once.
 pub fn first_requests<'a>(sources: impl IntoIterator<Item = &'a Source>) -> Vec<(String, u64)> {
     let mut demands = std::collections::BTreeMap::<String, u64>::new();
     for source in sources {
@@ -61,7 +62,10 @@ pub fn first_requests<'a>(sources: impl IntoIterator<Item = &'a Source>) -> Vec<
             _ => None,
         };
         if let Some(scope) = scope {
-            *demands.entry(scope).or_default() += 1;
+            let shared =
+                source.family == "stellarlight" && stellarlight::shares_first_request(source);
+            let demand = demands.entry(scope).or_default();
+            *demand = if shared { 1 } else { *demand + 1 };
         }
     }
     demands.into_iter().collect()

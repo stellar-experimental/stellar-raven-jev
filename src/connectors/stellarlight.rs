@@ -107,6 +107,12 @@ pub fn host() -> Option<String> {
     Some(Url::parse(BASE).ok()?.host_str()?.to_owned())
 }
 
+/// Whether a source's first request is the one research request that all routed research sources
+/// share, so a question books it once.
+pub fn shares_first_request(source: &Source) -> bool {
+    source.id.starts_with("stellarlight.research.")
+}
+
 /// The request scope (host and path) of a source's first request, as the HTTP recorder names
 /// scopes for source rate limits. Every research origin shares one endpoint.
 pub fn first_request_scope(source: &Source) -> Option<String> {
@@ -160,6 +166,137 @@ fn request_url(path: &str, params: &[(&str, String)]) -> Result<String> {
             .extend_pairs(params.iter().map(|(k, v)| (*k, v.as_str())));
     }
     Ok(url.into())
+}
+
+/// One multi-source research call that every routed research source of a question shares, so the
+/// question sends one research request (`source=a,b,c&perSource=N`) instead of one per source.
+/// Scout runs each source through its single-source pipeline and groups the rows by source.
+pub struct ResearchBatch {
+    origins: Vec<String>,
+    shared: tokio::sync::OnceCell<SharedRead>,
+}
+
+/// The shared research response, or the failures of the one request that would have produced it.
+struct SharedRead {
+    url: String,
+    read: Option<(Value, String, String)>,
+    failures: Vec<Failure>,
+}
+
+impl ResearchBatch {
+    /// A batch for the research sources among `sources`, when there are two or more.
+    pub fn for_sources<'a>(
+        sources: impl IntoIterator<Item = &'a Source>,
+    ) -> Option<std::sync::Arc<Self>> {
+        let origins: Vec<String> = sources
+            .into_iter()
+            .filter_map(|source| source.id.strip_prefix("stellarlight.research."))
+            .map(str::to_owned)
+            .collect();
+        (origins.len() > 1).then(|| {
+            std::sync::Arc::new(Self {
+                origins,
+                shared: tokio::sync::OnceCell::new(),
+            })
+        })
+    }
+
+    fn covers(&self, origin: &str) -> bool {
+        self.origins.iter().any(|o| o == origin)
+    }
+
+    /// The shared response. The first source to ask sends the request; the others wait for it.
+    async fn read(
+        &self,
+        ctx: &FetchContext,
+        source: &Source,
+        question: &str,
+        per_source: usize,
+    ) -> Result<&SharedRead> {
+        self.shared
+            .get_or_try_init(|| async {
+                let url = request_url(
+                    "/api/research",
+                    &[
+                        ("q", question.to_owned()),
+                        ("source", self.origins.join(",")),
+                        ("perSource", per_source.to_string()),
+                    ],
+                )?;
+                let mut result = FetchResult::default();
+                let read = read(ctx, source, &mut result, &url).await;
+                Ok(SharedRead {
+                    url,
+                    read,
+                    failures: result.failures,
+                })
+            })
+            .await
+    }
+}
+
+/// One source's part of a shared research response: its rows in Scout's order, and its meta with
+/// that source's status, match mode, document count, and the warnings that name it.
+fn source_part(value: &Value, origin: &str) -> (Value, Option<Value>) {
+    let rows: Vec<Value> = value["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["source"] == origin)
+        .cloned()
+        .collect();
+    let mut meta = value["meta"].clone();
+    let entry = meta["bySource"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|e| e["source"] == origin))
+        .cloned();
+    if let Some(object) = meta.as_object_mut() {
+        object.remove("bySource");
+        object.insert("source".into(), json!(origin));
+        let named = regex::Regex::new(&format!(r"\b{}\b", regex::escape(origin))).ok();
+        let warnings: Vec<Value> = object
+            .get("warnings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|w| {
+                let text = w
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| w.to_string());
+                named.as_ref().is_some_and(|re| re.is_match(&text))
+            })
+            .cloned()
+            .collect();
+        object.insert(
+            "warnings".into(),
+            if warnings.is_empty() {
+                Value::Null
+            } else {
+                json!(warnings)
+            },
+        );
+        if let Some(entry) = &entry {
+            for key in [
+                "matchMode",
+                "sourceDocCount",
+                "resultsHash",
+                "status",
+                "returned",
+            ] {
+                if let Some(v) = entry.get(key) {
+                    object.insert(key.into(), v.clone());
+                }
+            }
+            if entry["matchMode"] == "keyword" {
+                object.insert(
+                    "matchModeLabel".into(),
+                    json!("vector search unavailable for this source; keyword match"),
+                );
+            }
+        }
+    }
+    (json!({"results": rows, "meta": meta}), entry)
 }
 
 async fn read(
@@ -918,9 +1055,47 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
         if entry.paged {
             params.push(("offset", offset.to_string()));
         }
-        let url = request_url(entry.path, &params)?;
-        let Some((value, artifact, trace)) = read(ctx, source, &mut result, &url).await else {
-            break;
+        let batch = research.and_then(|origin| {
+            ctx.scout_research
+                .as_ref()
+                .filter(|batch| batch.covers(origin))
+                .map(|batch| (origin, batch))
+        });
+        let (url, value, artifact, trace) = if let Some((origin, batch)) = batch {
+            let per_source = entry.limit.min(ctx.config.max_documents);
+            let shared = batch.read(ctx, source, question, per_source).await?;
+            let Some((value, artifact, trace)) = &shared.read else {
+                for failure in &shared.failures {
+                    let mut failure = failure.clone();
+                    failure.source_id = Some(source.id.clone());
+                    result.failures.push(failure);
+                }
+                break;
+            };
+            let (part, entry) = source_part(value, origin);
+            if entry.as_ref().is_none_or(|e| e["status"] != 200) {
+                let status = entry
+                    .as_ref()
+                    .map(|e| e["status"].to_string())
+                    .unwrap_or_else(|| "missing".into());
+                failure(
+                    &mut result,
+                    source,
+                    "http",
+                    format!(
+                        "Scout did not read this source in the shared research call (status {status}). Artifact: {artifact}{trace}"
+                    ),
+                );
+                notices(source, &part["meta"], trace, &mut result);
+                break;
+            }
+            (shared.url.clone(), part, artifact.clone(), trace.clone())
+        } else {
+            let url = request_url(entry.path, &params)?;
+            let Some((value, artifact, trace)) = read(ctx, source, &mut result, &url).await else {
+                break;
+            };
+            (url, value, artifact, trace)
         };
         let meta = &value["meta"];
         notices(source, meta, &trace, &mut result);
@@ -1122,6 +1297,7 @@ mod tests {
             http: crate::http::HttpRecorder::loopback_for_test(dir, &config).unwrap(),
             config,
             deadline: None,
+            scout_research: None,
         }
     }
 
@@ -1211,6 +1387,7 @@ mod tests {
             http: crate::http::HttpRecorder::loopback_for_test(dir.path(), &config).unwrap(),
             config,
             deadline: None,
+            scout_research: None,
         };
         let mut result = FetchResult::default();
         let url = format!("http://{addr}/api/x");
@@ -1326,6 +1503,73 @@ mod tests {
             message.contains("Scout said: Retry-After: 30; error: database read failed"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_shared_research_response_splits_into_each_source_part() {
+        let value = json!({
+            "results": [
+                {"source": "cap", "id": "c1"},
+                {"source": "sep", "id": "s1"},
+                {"source": "cap", "id": "c2"},
+            ],
+            "meta": {
+                "matchMode": "vector",
+                "matchModeLabel": "vector-similarity ranking",
+                "warnings": ["source \"sep\" could not be read", "a note about capacity"],
+                "bySource": [
+                    {"source": "cap", "status": 200, "returned": 2, "matchMode": "vector", "sourceDocCount": 9},
+                    {"source": "sep", "status": 503, "returned": 0, "matchMode": "keyword", "sourceDocCount": 4},
+                ],
+            },
+        });
+        let (cap, cap_entry) = source_part(&value, "cap");
+        let ids: Vec<_> = cap["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].clone())
+            .collect();
+        assert_eq!(ids, vec![json!("c1"), json!("c2")]);
+        assert_eq!(cap_entry.unwrap()["status"], 200);
+        assert_eq!(cap["meta"]["sourceDocCount"], 9);
+        assert!(
+            cap["meta"]["warnings"].is_null(),
+            "a word that only contains the name is not a match"
+        );
+        assert!(cap["meta"].get("bySource").is_none());
+
+        let (sep, sep_entry) = source_part(&value, "sep");
+        assert_eq!(sep_entry.unwrap()["status"], 503);
+        assert_eq!(sep["meta"]["warnings"].as_array().unwrap().len(), 1);
+        let mut result = FetchResult::default();
+        notices(&sources()[0], &sep["meta"], "", &mut result);
+        assert!(result.failures.iter().any(|f| f.stage == "search_limit"));
+
+        let (missing, entry) = source_part(&value, "paper");
+        assert!(entry.is_none());
+        assert!(missing["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn research_sources_share_one_batch_and_one_booking() {
+        let all = sources();
+        let research: Vec<&Source> = all
+            .iter()
+            .filter(|s| s.id.starts_with("stellarlight.research."))
+            .take(3)
+            .collect();
+        let batch = ResearchBatch::for_sources(research.iter().copied()).unwrap();
+        assert_eq!(batch.origins.len(), 3);
+        assert!(ResearchBatch::for_sources(research.iter().copied().take(1)).is_none());
+        let listing = all
+            .iter()
+            .find(|s| s.id == "stellarlight.projects")
+            .unwrap();
+        let demands = crate::connectors::first_requests(research.iter().copied().chain([listing]));
+        let research_scope = first_request_scope(research[0]).unwrap();
+        assert!(demands.contains(&(research_scope, 1)));
+        assert_eq!(demands.len(), 2);
     }
 
     #[test]
@@ -1528,6 +1772,7 @@ mod tests {
             http: crate::http::HttpRecorder::new(dir.path(), &config).unwrap(),
             config,
             deadline: None,
+            scout_research: None,
         };
         let source = sources()
             .into_iter()
@@ -1718,6 +1963,7 @@ mod tests {
             http: crate::http::HttpRecorder::new(dir.path(), &config).unwrap(),
             config,
             deadline: None,
+            scout_research: None,
         };
         let catalog = sources();
         let unique: HashSet<_> = catalog.iter().map(|s| &s.id).collect();
@@ -1748,6 +1994,7 @@ mod tests {
             http: crate::http::HttpRecorder::new(dir.path(), &config).unwrap(),
             config,
             deadline: None,
+            scout_research: None,
         };
         let result = fetch(&ctx, &sources()[0], "wallet").await.unwrap();
         assert!(result.documents.is_empty());

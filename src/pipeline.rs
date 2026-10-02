@@ -712,6 +712,8 @@ pub(crate) async fn fetch_sources(
     let selected: BTreeSet<String> = chosen.iter().map(|s| s.id.clone()).collect();
     let fetch_deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(config.fetch_deadline_secs);
+    let scout_research =
+        connectors::stellarlight::ResearchBatch::for_sources(chosen.iter().copied());
     let jobs = stream::iter(chosen.iter().copied())
         .map(|source| {
             let mut source_config = config.clone();
@@ -720,6 +722,7 @@ pub(crate) async fn fetch_sources(
                 http: http.clone(),
                 config: source_config,
                 deadline: Some(fetch_deadline),
+                scout_research: scout_research.clone(),
             };
             async move {
                 (
