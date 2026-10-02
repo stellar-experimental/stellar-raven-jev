@@ -347,9 +347,11 @@ struct LoadCounters {
     hedges: AtomicU64,
     /// Hedges sent, and hedges whose response was returned, per host.
     hedged: Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
-    /// Source requests cancelled while they still waited for a host permit in this client, per
-    /// host. A deadline cut of such a request is client queue time, not source time.
+    /// Source requests cancelled while they still waited in this client (for a host permit or a
+    /// source gate), per host. Hedges and requests that ended in an error are not counted.
     cancelled_while_queued: Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Time from a sent source request's start to its send, per host: this client's queue time.
+    queue_ms: Mutex<std::collections::BTreeMap<String, Vec<u64>>>,
 }
 
 /// One source request waiting for its host permit. Dropping it before `sent`, also by
@@ -511,6 +513,7 @@ fn source_signals(
     let number = |name: &str| if instance_scoped { None } else { number(name) };
     crate::governor::SourceSignals {
         status,
+        instance_scoped,
         retry_after: retry_after(headers),
         limit: number("x-ratelimit-limit")
             .filter(|v| *v <= u32::MAX as f64)
@@ -893,8 +896,9 @@ impl HttpRecorder {
 
     /// Per host: completed responses and their send-to-last-byte time (p50, p95, max), requests
     /// sent that did not complete (failed, cut, or a cancelled hedge race loser), requests
-    /// cancelled before they were sent while they waited for a host permit, the most requests in
-    /// flight at once, hedges sent, and hedges whose response was returned.
+    /// cancelled before they were sent while they waited in this client, this client's queue time
+    /// before each send (p95, max), the most requests in flight at once, hedges sent, and hedges
+    /// whose response was returned.
     fn latency_summary(&self) -> Value {
         let sent = self
             .load
@@ -919,6 +923,12 @@ impl HttpRecorder {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let queue_ms = self
+            .load
+            .queue_ms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut hosts = sent;
         for host in queued.keys() {
             hosts.entry(host.clone()).or_default();
@@ -938,6 +948,14 @@ impl HttpRecorder {
                         "completed": samples.len(),
                         "not_completed": count.saturating_sub(samples.len() as u64),
                         "cancelled_while_queued": queued.get(host).copied().unwrap_or(0),
+                        "queue_p95_ms": queue_ms.get(host).and_then(|samples| {
+                            let mut samples = samples.clone();
+                            samples.sort_unstable();
+                            (!samples.is_empty()).then(|| {
+                                samples[((samples.len() - 1) as f64 * 0.95).round() as usize]
+                            })
+                        }),
+                        "queue_max_ms": queue_ms.get(host).and_then(|samples| samples.iter().max().copied()),
                         "p50_ms": percentile(0.5),
                         "p95_ms": percentile(0.95),
                         "max_ms": samples.last(),
@@ -1522,19 +1540,33 @@ impl HttpRecorder {
             let host = parsed.host_str().unwrap_or_default().to_owned();
             // Source requests and public reads count per host; Jev requests keep their own usage.
             let accounted = self.gates.is_some() || self.public.is_some();
-            let mut queued = accounted.then(|| Queued::start(&self.load, &host));
+            let mut queued = (accounted && !self.hedge).then(|| Queued::start(&self.load, &host));
             // Source limits are checked once the request holds its permit, at the moment of
             // sending, so a refusal seen by another request while this one queued still applies.
             // A closed scope releases the permit while it waits.
             let mut waited = Duration::ZERO;
             let mut booked = None;
             let _permit = loop {
-                let permit = semaphore.clone().acquire_owned().await?;
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        if let Some(queued) = queued.as_mut() {
+                            queued.left();
+                        }
+                        return Err(error.into());
+                    }
+                };
                 let Some(gates) = &self.gates else {
                     break permit;
                 };
                 let booked_epoch = *booked.get_or_insert_with(|| self.take_prepaid(&scope));
-                let Some(wait) = gates.source_ticket(&scope, booked_epoch)? else {
+                let ticket = gates.source_ticket(&scope, booked_epoch);
+                if ticket.is_err() {
+                    if let Some(queued) = queued.as_mut() {
+                        queued.left();
+                    }
+                }
+                let Some(wait) = ticket? else {
                     break permit;
                 };
                 drop(permit);
@@ -1572,7 +1604,17 @@ impl HttpRecorder {
                 sent.notify_one();
             }
             // Wall-clock start after the permit, so timelines separate queue wait from transfer.
-            record.metadata["queued_ms"] = json!(started.elapsed().as_millis() as u64);
+            let queued_ms = started.elapsed().as_millis() as u64;
+            record.metadata["queued_ms"] = json!(queued_ms);
+            if accounted {
+                self.load
+                    .queue_ms
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(host.clone())
+                    .or_default()
+                    .push(queued_ms);
+            }
             record.metadata["started_unix_ms"] = json!(std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

@@ -194,7 +194,7 @@ pub fn validate_config(config: &RunConfig) -> Result<()> {
     if config.uncertain_threshold > config.document_threshold {
         bail!("--uncertain-threshold must not exceed --document-threshold");
     }
-    Ok(())
+    connectors::check_source_slots(config)
 }
 
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {

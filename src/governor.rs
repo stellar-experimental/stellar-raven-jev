@@ -83,6 +83,8 @@ pub struct SourceSignals {
     pub remaining: Option<u64>,
     /// When the current window ends, as Unix milliseconds.
     pub reset_ms: Option<u64>,
+    /// The source says its window counts one serving instance, not this host.
+    pub instance_scoped: bool,
 }
 
 /// One Jev provider as the governor sees it: a stable identity and a send rate.
@@ -402,6 +404,22 @@ impl Governor {
                     let until = now.saturating_add(wait.as_millis() as u64);
                     let entry = state.gates.entry(scope.to_owned()).or_insert(0);
                     *entry = (*entry).max(until);
+                }
+                // A window scoped to one instance does not describe this host. Forget a window
+                // learned before for the scope; a stated window starts again from its stated values.
+                if signals.instance_scoped {
+                    match self.stated.get(scope) {
+                        Some((limit, period_ms)) => {
+                            if let Some(window) = state.windows.get_mut(scope) {
+                                window.limit = *limit;
+                                window.period_ms = *period_ms;
+                            }
+                        }
+                        None => {
+                            state.windows.remove(scope);
+                        }
+                    }
+                    break 'observe;
                 }
                 let (Some(limit), Some(reset_ms)) = (signals.limit, signals.reset_ms) else {
                     break 'observe;
@@ -739,6 +757,53 @@ mod tests {
     }
 
     #[test]
+    fn an_instance_scoped_reply_forgets_a_learned_window_and_restores_a_stated_one() {
+        let instance = SourceSignals {
+            status: 200,
+            instance_scoped: true,
+            ..Default::default()
+        };
+        let scope = "example.org/search";
+        let governor = Governor::local();
+        let ticket = |booked| governor.source_ticket(scope, booked).unwrap();
+        governor
+            .observe_source(
+                scope,
+                &window(1, 1, now_ms() + 60_000),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert!(ticket(None).is_none());
+        assert!(ticket(None).is_some(), "the learned window of 1 is used");
+        governor
+            .observe_source(scope, &instance, Duration::from_secs(10))
+            .unwrap();
+        assert!(ticket(None).is_none(), "the learned window is gone");
+
+        let stated = "example.org/stated";
+        let governor = Governor::local().with_stated_windows(&[(
+            stated.to_owned(),
+            3,
+            Duration::from_secs(60),
+        )]);
+        let ticket = |booked| governor.source_ticket(stated, booked).unwrap();
+        governor
+            .observe_source(
+                stated,
+                &window(1, 1, now_ms() + 60_000),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        governor
+            .observe_source(stated, &instance, Duration::from_secs(10))
+            .unwrap();
+        assert!(ticket(None).is_none());
+        assert!(ticket(None).is_none());
+        assert!(ticket(None).is_none(), "the stated limit of 3 holds again");
+        assert!(ticket(None).is_some());
+    }
+
+    #[test]
     fn a_stated_window_counts_from_the_first_request_and_caps_an_advertised_one() {
         let scope = "example.org/search";
         let governor = Governor::local().with_stated_windows(&[(
@@ -895,6 +960,7 @@ mod tests {
             limit,
             remaining: limit.map(|l| l - 1),
             reset_ms: limit.map(|_| now_ms() + 60_000),
+            instance_scoped: false,
         };
         governor
             .observe_source("example.org/a", &refused(Some(60)), Duration::from_secs(10))

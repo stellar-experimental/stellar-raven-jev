@@ -232,6 +232,7 @@ const LOSS_STAGES: &[&str] = &[
     "currentness",
     crate::pipeline::NOT_ASSESSED_AFTER_STOP,
     "original_lost",
+    "content",
 ];
 
 /// True when evidence was lost: a stage in `LOSS_STAGES`, or a source request refused by a rate

@@ -113,7 +113,7 @@ A page on a tier 4 host is tier 4 even when it holds ordinary text.
 | `source_gate_wait_ms`, `source_booking_wait_ms`, `source_slot_wait_ms` | Waits for source rate limits and fetch slots |
 | `jev_rate_limited_requests`, `jev_wait_ms`, `admission_wait_ms` | Jev refusals and waits, and the wait for a search slot |
 | `source_requests` | Requests per source host |
-| `source_latency` | Per source host: `completed`, `not_completed`, `cancelled_while_queued`, `p50_ms`, `p95_ms`, `max_ms`, `peak_in_flight`, `hedged`, `hedge_wins` |
+| `source_latency` | Per source host: `completed`, `not_completed`, `cancelled_while_queued`, `queue_p95_ms`, `queue_max_ms`, `p50_ms`, `p95_ms`, `max_ms`, `peak_in_flight`, `hedged`, `hedge_wins` |
 | `original_reads` | Original page reads (see [Original pages](#original-pages)) |
 
 A degraded call still returns its results. Ask again later for a complete one.
@@ -240,14 +240,14 @@ A source can slow down under load before its rate window fills. A slow source is
   It holds them for its fetch stage only. It waits up to 65 seconds, then prints `busy`.
 - A host with an in-flight limit has a default cap.
   The cap is that limit divided by the requests that one question may have in flight there. For `stellarlight.xyz` this is 32 / 16 = 2 slots, or 1 slot with source hedging on.
-- A named host replaces its default, and a large N lifts it. Other hosts are not capped.
+- A named host replaces its default. For a host with an in-flight limit, the tool refuses settings where slots times requests per question exceed that limit. Other hosts are not capped.
 - A slot is a file lock, so a crashed process frees it.
 
 ### Requests in one search
 
 - Each host has its own limit of `--concurrency` requests in flight, so a slow host does not delay the others.
 - Identical GET requests in one run share one response.
-- Stellar Scout retries a server error once.
+- Stellar Scout retries HTTP 500, 502, or 503 once. HTTP 504 is Scout's function time cap and is treated as a timeout.
   It also retries a request once when it fails before a complete response, unless the cause is a timeout. It waits for Scout's `Retry-After` plus up to 500 ms, or 250 to 750 ms without one.
   A `Retry-After` above 4 seconds, or a retry that would end within 1 second of the fetch deadline, is not retried.
 - A Scout HTTP failure report names Scout's `Retry-After` and the `error` field of its JSON body, when Scout sent them.
@@ -270,7 +270,7 @@ Source hedging is off by default. `--source-hedge-ms N` turns it on with a delay
 
 - A rising share of `load.degraded`.
 - Deadline cuts on many sessions in a row. Stellar Scout usually sets the throughput limit of a host.
-  Latency counts from send. `cancelled_while_queued` counts requests that a cut stopped before they left this client's host queue; that time is not the source's.
+  Latency counts from send. `cancelled_while_queued` counts requests that a cut stopped before they left this client, and `queue_p95_ms` and `queue_max_ms` show how long sent requests waited here first. That time is not the source's.
 - Any `source_rate_limited_requests`, and `busy` exits.
 - `jev_wait_ms` or `jev_rate_limited_requests`: a provider budget is spent, and calls move to the next provider.
 - Network cause classes in `load.jev_failure_causes` (for example `dns` or `connect_denied`) and

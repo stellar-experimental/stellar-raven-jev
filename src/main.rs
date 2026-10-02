@@ -66,7 +66,10 @@ Output (compact JSON):
                      (dns or connect_denied: usually no network access). jev_providers_skipped
                      names the providers that failed the network check, with the class.
                      not_assessed_after_stop counts items that Jev did not judge because it had
-                     stopped paid work.";
+                     stopped paid work. A fallback alone sets degraded but leaves status complete.
+                     source_latency, per host: send-to-last-byte times, cancelled_while_queued
+                     (requests cut before they left this client), and queue_p95_ms and
+                     queue_max_ms (time a request waited in this client before it was sent).";
 
 const CHECK_FIELDS: &str = "\
 Output: per claim, max_supports, max_contradicts, and max_qualifies (0-1; null when no document

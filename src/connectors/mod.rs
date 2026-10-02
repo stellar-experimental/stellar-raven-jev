@@ -114,6 +114,28 @@ pub fn source_slots(config: &RunConfig) -> std::collections::BTreeMap<String, us
     slots
 }
 
+/// Reject settings that let one question set more requests in flight on a host than its operator
+/// states for one client host: fetch slots times the requests one question may have in flight there.
+pub fn check_source_slots(config: &RunConfig) -> Result<()> {
+    let hedges = if config.source_hedge_ms > 0 {
+        crate::http::HEDGES_PER_HOST
+    } else {
+        0
+    };
+    let per_question = (config.concurrency + hedges).max(1);
+    let slots = source_slots(config);
+    for (host, limit) in stated_host_limits() {
+        let host_slots = slots.get(&host).copied().unwrap_or(1);
+        if host_slots * per_question > limit {
+            bail!(
+                "{host} states at most {limit} requests in flight for one client host; {host_slots} fetch slots of {per_question} requests each allow {}. Lower --source-slots or --concurrency",
+                host_slots * per_question
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The capped hosts that fetching `sources` uses, with their slot counts, in a stable order.
 pub fn host_caps<'a>(
     sources: impl IntoIterator<Item = &'a Source>,
@@ -162,5 +184,25 @@ mod tests {
         let slots = source_slots(&config);
         assert_eq!(slots[&scout], 1_000);
         assert_eq!(slots["fernlet.test"], 3);
+    }
+
+    #[test]
+    fn settings_above_a_stated_host_limit_are_rejected() {
+        let scout = stellarlight::host().unwrap();
+        let limit = stellarlight::HOST_CONCURRENCY;
+        let mut config = RunConfig::default();
+        assert!(check_source_slots(&config).is_ok());
+        config.source_slots = std::collections::BTreeMap::from([(scout.clone(), 3)]);
+        let error = check_source_slots(&config).unwrap_err().to_string();
+        assert!(error.contains(&format!("at most {limit}")), "{error}");
+        config.source_slots.clear();
+        config.concurrency = limit + 1;
+        assert!(check_source_slots(&config).is_err());
+        config.concurrency = 8;
+        config.source_slots = std::collections::BTreeMap::from([("fernlet.test".to_owned(), 40)]);
+        assert!(
+            check_source_slots(&config).is_ok(),
+            "hosts without a stated limit are not checked"
+        );
     }
 }

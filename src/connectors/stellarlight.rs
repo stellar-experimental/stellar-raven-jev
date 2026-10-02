@@ -312,13 +312,13 @@ async fn read(
     // Scout answers transient overload with a server error, and a connection can fail before a
     // complete response. Every Scout read is a GET, so one retry is safe: after the Retry-After Scout
     // sends, or after a short delay. A timeout is not retried, because it has already spent its
-    // time. A second failure is reported, and so is a first one whose retry would wait too long
+    // time; neither is HTTP 504, which Scout sends when a function hits its time cap. A second
+    // failure is reported with the first, and so is a first one whose retry would wait too long
     // or end past the fetch deadline.
     let mut not_retried = None;
+    let mut first_attempt = None;
     let delay = match &response {
-        Ok(first) if matches!(first.status, 500 | 502 | 503 | 504) => {
-            Some(retry_delay(&first.headers))
-        }
+        Ok(first) if matches!(first.status, 500 | 502 | 503) => Some(retry_delay(&first.headers)),
         Err(error) if transport_cause(error).is_some_and(|c| c != TransportCause::Timeout) => {
             Some(retry_delay(&Default::default()))
         }
@@ -327,6 +327,10 @@ async fn read(
     if let Some(delay) = delay {
         match delay.and_then(|delay| within(ctx.deadline, delay)) {
             Ok(delay) => {
+                first_attempt = Some(match &response {
+                    Ok(first) => format!("HTTP {}{}", first.status, refusal(first)),
+                    Err(error) => error.to_string().trim_end_matches('.').to_owned(),
+                });
                 tokio::time::sleep(delay).await;
                 response = ctx
                     .http
@@ -348,9 +352,13 @@ async fn read(
                     source,
                     "http",
                     format!(
-                        "Scout returned HTTP {}{not_retried}{}. Artifact: {}{trace}",
+                        "Scout returned HTTP {}{not_retried}{}{}. Artifact: {}{trace}",
                         response.status,
                         refusal(&response),
+                        first_attempt
+                            .as_ref()
+                            .map(|first| format!(". First attempt: {first}"))
+                            .unwrap_or_default(),
                         response.artifact
                     ),
                 );
@@ -384,8 +392,12 @@ async fn read(
                 source,
                 "http",
                 format!(
-                    "Scout read failed{cause}: {}.{not_retried}",
-                    error.to_string().trim_end_matches('.')
+                    "Scout read failed{cause}: {}.{not_retried}{}",
+                    error.to_string().trim_end_matches('.'),
+                    first_attempt
+                        .as_ref()
+                        .map(|first| format!(" First attempt: {first}."))
+                        .unwrap_or_default()
                 ),
             );
             None
@@ -1323,10 +1335,28 @@ mod tests {
         assert_eq!(result.failures.len(), 1);
         let message = &result.failures[0].message;
         assert!(message.contains("HTTP 502"), "{message}");
+        assert!(message.contains("First attempt: HTTP 502"), "{message}");
         assert!(
             message.contains("x-vercel-id: iad1::abc-1; server-timing: total;dur=12"),
             "{message}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_platform_timeout_is_not_retried() {
+        let addr = replying(vec![
+            b"HTTP/1.1 504 Gateway Timeout\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\ntimeout",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = loopback_context(dir.path());
+        let mut result = FetchResult::default();
+        let url = format!("http://{addr}/api/x");
+        assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
+        let message = &result.failures[0].message;
+        assert!(message.contains("HTTP 504"), "{message}");
+        assert!(!message.contains("First attempt"), "{message}");
     }
 
     #[tokio::test]
