@@ -96,16 +96,22 @@ pub fn stated_windows() -> Vec<(String, u64, std::time::Duration)> {
     stellarlight::stated_windows()
 }
 
-/// Fetch slots per host: for each host with a stated limit, that limit divided by the requests
-/// one question may have in flight on a host (its per-host concurrency, plus hedge permits when
-/// hedging is on), and at least 1. Explicit `source_slots` replace these per host and add others.
-pub fn source_slots(config: &RunConfig) -> std::collections::BTreeMap<String, usize> {
+/// The requests one question may have in flight on one host: its per-host concurrency, plus hedge
+/// permits when hedging is on.
+fn requests_per_question(config: &RunConfig) -> usize {
     let hedges = if config.source_hedge_ms > 0 {
         crate::http::HEDGES_PER_HOST
     } else {
         0
     };
-    let per_question = (config.concurrency + hedges).max(1);
+    (config.concurrency + hedges).max(1)
+}
+
+/// Fetch slots per host: for each host with a stated limit, that limit divided by the requests
+/// one question may have in flight on a host (its per-host concurrency, plus hedge permits when
+/// hedging is on), and at least 1. Explicit `source_slots` replace these per host and add others.
+pub fn source_slots(config: &RunConfig) -> std::collections::BTreeMap<String, usize> {
+    let per_question = requests_per_question(config);
     let mut slots: std::collections::BTreeMap<String, usize> = stated_host_limits()
         .into_iter()
         .map(|(host, limit)| (host, (limit / per_question).max(1)))
@@ -117,12 +123,7 @@ pub fn source_slots(config: &RunConfig) -> std::collections::BTreeMap<String, us
 /// Reject settings that let one question set more requests in flight on a host than its operator
 /// states for one client host: fetch slots times the requests one question may have in flight there.
 pub fn check_source_slots(config: &RunConfig) -> Result<()> {
-    let hedges = if config.source_hedge_ms > 0 {
-        crate::http::HEDGES_PER_HOST
-    } else {
-        0
-    };
-    let per_question = (config.concurrency + hedges).max(1);
+    let per_question = requests_per_question(config);
     let slots = source_slots(config);
     for (host, limit) in stated_host_limits() {
         let host_slots = slots.get(&host).copied().unwrap_or(1);
@@ -136,17 +137,34 @@ pub fn check_source_slots(config: &RunConfig) -> Result<()> {
     Ok(())
 }
 
-/// The capped hosts that fetching `sources` uses, with their slot counts, in a stable order.
+/// The capped hosts that fetching `sources` uses, in a stable order, as (host, units, need). A
+/// host with a stated in-flight limit has that many units, one per request in flight, and a
+/// question needs the requests it may have in flight there, or more when explicit slots allow fewer
+/// questions. A host with only explicit slots has one unit per slot, and a question needs one.
 pub fn host_caps<'a>(
     sources: impl IntoIterator<Item = &'a Source>,
     config: &RunConfig,
-) -> Vec<(String, usize)> {
+) -> Vec<(String, usize, usize)> {
     let slots = source_slots(config);
+    let stated: std::collections::BTreeMap<String, usize> =
+        stated_host_limits().into_iter().collect();
+    let per_question = requests_per_question(config);
     let hosts: std::collections::BTreeSet<String> =
         sources.into_iter().filter_map(search_host).collect();
     hosts
         .into_iter()
-        .filter_map(|host| slots.get(&host).map(|n| (host, *n)))
+        .filter_map(|host| {
+            let host_slots = *slots.get(&host)?;
+            Some(match stated.get(&host) {
+                Some(&limit) => {
+                    let need = per_question
+                        .max(limit.div_ceil(host_slots.max(1)))
+                        .min(limit);
+                    (host, limit, need)
+                }
+                None => (host, host_slots, 1),
+            })
+        })
         .collect()
 }
 

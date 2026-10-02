@@ -236,12 +236,14 @@ These defaults stay below the rates at which the providers refuse requests.
 A source can slow down under load before its rate window fills. A slow source is cut at the fetch deadline.
 `--source-slots` / `JEV_SOURCE_SLOTS` caps how many questions fetch from a host at once, as `HOST=N[,HOST=N]`.
 
-- After routing, a question takes one slot on each capped host that it fetches from. It takes all or none.
+- After routing, a question holds room on each capped host that it fetches from. It holds all or none.
   It holds them for its fetch stage only. It waits up to 65 seconds, then prints `busy`.
-- A host with an in-flight limit has a default cap.
-  The cap is that limit divided by the requests that one question may have in flight there. For `stellarlight.xyz` this is 32 / 16 = 2 slots, or 1 slot with source hedging on.
-- A named host replaces its default. For a host with an in-flight limit, the tool refuses settings where slots times requests per question exceed that limit. Other hosts are not capped.
-- A slot is a file lock, so a crashed process frees it.
+- A host with an in-flight limit has that many units, one per request in flight. For `stellarlight.xyz` this is 32.
+  A question holds the requests it may have in flight there: its `--concurrency` (16 by default), plus 2 with source hedging on.
+  Processes with different settings share one count, so the host never has more than its limit in flight.
+- A named host in `--source-slots` lets that many questions in at once. For a host with an in-flight limit, this can only lower the default.
+  The tool refuses settings where slots times requests per question exceed the limit. Other hosts are not capped.
+- A unit is a file lock, so a crashed process frees it.
 
 ### Requests in one search
 

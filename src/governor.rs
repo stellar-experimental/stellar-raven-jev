@@ -413,6 +413,8 @@ impl Governor {
                             if let Some(window) = state.windows.get_mut(scope) {
                                 window.limit = *limit;
                                 window.period_ms = *period_ms;
+                                window.paced_until_ms = 0;
+                                window.reset_ms = window.reset_ms.min(now + period_ms);
                             }
                         }
                         None => {
@@ -457,12 +459,14 @@ impl Governor {
         })
     }
 
-    /// Wait up to `wait` for one fetch slot on every host in `caps` (host, slots), taken all at
-    /// once: a question never holds some hosts while it waits for others. `None` means no room in
-    /// time and nothing is held. Without a state folder nothing is capped.
+    /// Wait up to `wait` for `need` of the `units` fetch units on every host in `caps`
+    /// (host, units, need), taken all at once: a question never holds some units while it waits
+    /// for others. A unit is one request in flight, so processes with different settings share one
+    /// count. `None` means no room in time and nothing is held. Without a state folder nothing is
+    /// capped.
     pub async fn hold_hosts(
         &self,
-        caps: &[(String, usize)],
+        caps: &[(String, usize, usize)],
         wait: Duration,
     ) -> Result<Option<HostHold>> {
         let Some(dir) = &self.dir else {
@@ -471,13 +475,17 @@ impl Governor {
         let started = std::time::Instant::now();
         loop {
             let mut held = Vec::new();
-            for (host, slots) in caps {
-                match try_host_slot(dir, host, *slots)? {
-                    Some(file) => held.push(file),
-                    None => break,
+            let mut all = true;
+            for (host, units, need) in caps {
+                match try_host_units(dir, host, *units, *need)? {
+                    Some(files) => held.extend(files),
+                    None => {
+                        all = false;
+                        break;
+                    }
                 }
             }
-            if held.len() == caps.len() {
+            if all {
                 return Ok(Some(HostHold { _slots: held }));
             }
             drop(held);
@@ -550,19 +558,27 @@ fn host_file_part(host: &str) -> String {
 }
 
 /// Try to lock one of `slots` fetch slot files for `host`.
-fn try_host_slot(dir: &Path, host: &str, slots: usize) -> Result<Option<File>> {
-    for i in 0..slots.max(1) {
+/// Lock `need` of a host's `units` unit files, or none.
+fn try_host_units(dir: &Path, host: &str, units: usize, need: usize) -> Result<Option<Vec<File>>> {
+    let need = need.clamp(1, units.max(1));
+    let mut held = Vec::new();
+    for i in 0..units.max(1) {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
-            .open(dir.join(format!("fetch-{}-{i}.lock", host_file_part(host))))
-            .context("Cannot open a host fetch slot")?;
+            .open(dir.join(format!("fetch-{}-unit-{i}.lock", host_file_part(host))))
+            .context("Cannot open a host fetch unit")?;
         match file.try_lock() {
-            Ok(()) => return Ok(Some(file)),
+            Ok(()) => {
+                held.push(file);
+                if held.len() == need {
+                    return Ok(Some(held));
+                }
+            }
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(error)) => {
-                return Err(error).context("Cannot lock a host fetch slot")
+                return Err(error).context("Cannot lock a host fetch unit")
             }
         }
     }
@@ -1061,16 +1077,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = Governor::at(dir.path()).unwrap();
         let second = Governor::at(dir.path()).unwrap();
-        let cedar = |n| vec![("cedar.test".to_owned(), n)];
+        let cedar = |n| vec![("cedar.test".to_owned(), n, 1)];
         let short = Duration::from_millis(50);
         let a = first.hold_hosts(&cedar(2), short).await.unwrap().unwrap();
         let _b = second.hold_hosts(&cedar(2), short).await.unwrap().unwrap();
         // A third question waits, then gets no slot; another host is not affected.
         assert!(first.hold_hosts(&cedar(2), short).await.unwrap().is_none());
-        let birch = vec![("birch.test".to_owned(), 1)];
+        let birch = vec![("birch.test".to_owned(), 1, 1)];
         let _c = second.hold_hosts(&birch, short).await.unwrap().unwrap();
         // All or none: with birch full, a question that needs both holds neither.
-        let both = vec![("birch.test".to_owned(), 1), ("cedar.test".to_owned(), 3)];
+        let both = vec![
+            ("birch.test".to_owned(), 1, 1),
+            ("cedar.test".to_owned(), 3, 1),
+        ];
         assert!(first.hold_hosts(&both, short).await.unwrap().is_none());
         assert!(second.hold_hosts(&cedar(3), short).await.unwrap().is_some());
         // Dropping a hold frees its slot.
@@ -1082,6 +1101,21 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn questions_with_different_settings_share_one_in_flight_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let wide = Governor::at(dir.path()).unwrap();
+        let narrow = Governor::at(dir.path()).unwrap();
+        let short = Duration::from_millis(50);
+        let need = |n| vec![("oak.test".to_owned(), 32, n)];
+        let _a = wide.hold_hosts(&need(16), short).await.unwrap().unwrap();
+        let _b = narrow.hold_hosts(&need(8), short).await.unwrap().unwrap();
+        let _c = narrow.hold_hosts(&need(8), short).await.unwrap().unwrap();
+        // 32 units are held; any further question waits, whatever its own setting.
+        assert!(narrow.hold_hosts(&need(1), short).await.unwrap().is_none());
+        assert!(wide.hold_hosts(&need(16), short).await.unwrap().is_none());
     }
 
     #[test]

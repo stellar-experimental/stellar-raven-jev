@@ -974,7 +974,7 @@ impl HttpRecorder {
     /// no caps, nothing needs holding.
     pub async fn hold_hosts(
         &self,
-        caps: &[(String, usize)],
+        caps: &[(String, usize, usize)],
         wait: Duration,
     ) -> Result<Option<crate::governor::HostHold>> {
         match &self.gates {

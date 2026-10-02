@@ -237,7 +237,14 @@ impl ResearchBatch {
 
 /// One source's part of a shared research response: its rows in Scout's order, and its meta with
 /// that source's status, match mode, document count, and the warnings that name it.
-fn source_part(value: &Value, origin: &str) -> (Value, Option<Value>) {
+/// Whether `text` names `origin` as a whole token. Hyphens belong to tokens, so one source name
+/// inside a longer one does not count.
+fn names_source(text: &str, origin: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .any(|token| token == origin)
+}
+
+fn source_part(value: &Value, origin: &str, origins: &[String]) -> (Value, Option<Value>) {
     let rows: Vec<Value> = value["results"]
         .as_array()
         .into_iter()
@@ -253,7 +260,9 @@ fn source_part(value: &Value, origin: &str) -> (Value, Option<Value>) {
     if let Some(object) = meta.as_object_mut() {
         object.remove("bySource");
         object.insert("source".into(), json!(origin));
-        let named = regex::Regex::new(&format!(r"\b{}\b", regex::escape(origin))).ok();
+        // A warning goes to each routed source it names. One that names none of them is about
+        // the whole request; the first routed source carries it, so it is reported once.
+        let first = origins.first().is_some_and(|o| o == origin);
         let warnings: Vec<Value> = object
             .get("warnings")
             .and_then(Value::as_array)
@@ -264,7 +273,8 @@ fn source_part(value: &Value, origin: &str) -> (Value, Option<Value>) {
                     .as_str()
                     .map(str::to_owned)
                     .unwrap_or_else(|| w.to_string());
-                named.as_ref().is_some_and(|re| re.is_match(&text))
+                names_source(&text, origin)
+                    || (first && !origins.iter().any(|o| names_source(&text, o)))
             })
             .cloned()
             .collect();
@@ -288,12 +298,13 @@ fn source_part(value: &Value, origin: &str) -> (Value, Option<Value>) {
                     object.insert(key.into(), v.clone());
                 }
             }
-            if entry["matchMode"] == "keyword" {
-                object.insert(
-                    "matchModeLabel".into(),
-                    json!("vector search unavailable for this source; keyword match"),
-                );
-            }
+            // The label follows this source's mode, never the mode of the whole response.
+            let label = if entry["matchMode"] == "keyword" {
+                json!("vector search unavailable for this source; keyword match")
+            } else {
+                entry["matchMode"].clone()
+            };
+            object.insert("matchModeLabel".into(), label);
         }
     }
     (json!({"results": rows, "meta": meta}), entry)
@@ -372,7 +383,11 @@ async fn read(
                         source,
                         "parse",
                         format!(
-                            "Scout returned invalid JSON. Artifact: {}{trace}",
+                            "Scout returned invalid JSON{}. Artifact: {}{trace}",
+                            first_attempt
+                                .as_ref()
+                                .map(|first| format!(". First attempt: {first}"))
+                                .unwrap_or_default(),
                             response.artifact
                         ),
                     );
@@ -1084,7 +1099,29 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                 }
                 break;
             };
-            let (part, entry) = source_part(value, origin);
+            if !value["results"].is_array() {
+                failure(
+                    &mut result,
+                    source,
+                    "parse",
+                    format!("Scout's shared research response omitted results. Artifact: {artifact}{trace}"),
+                );
+                break;
+            }
+            let (part, entry) = source_part(value, origin, &batch.origins);
+            let rows = part["results"].as_array().map_or(0, Vec::len);
+            if let Some(returned) = entry.as_ref().and_then(|e| e["returned"].as_u64()) {
+                if returned != rows as u64 {
+                    failure(
+                        &mut result,
+                        source,
+                        "parse",
+                        format!(
+                            "Scout said it returned {returned} rows for this source and sent {rows}. Artifact: {artifact}{trace}"
+                        ),
+                    );
+                }
+            }
             if entry.as_ref().is_none_or(|e| e["status"] != 200) {
                 let status = entry
                     .as_ref()
@@ -1553,7 +1590,8 @@ mod tests {
                 ],
             },
         });
-        let (cap, cap_entry) = source_part(&value, "cap");
+        let origins = vec!["cap".to_owned(), "sep".to_owned(), "lumenloop".to_owned()];
+        let (cap, cap_entry) = source_part(&value, "cap", &origins);
         let ids: Vec<_> = cap["results"]
             .as_array()
             .unwrap()
@@ -1563,20 +1601,31 @@ mod tests {
         assert_eq!(ids, vec![json!("c1"), json!("c2")]);
         assert_eq!(cap_entry.unwrap()["status"], 200);
         assert_eq!(cap["meta"]["sourceDocCount"], 9);
-        assert!(
-            cap["meta"]["warnings"].is_null(),
-            "a word that only contains the name is not a match"
+        // The warning that names no routed source is about the request; the first source carries it.
+        assert_eq!(
+            cap["meta"]["warnings"],
+            json!(["a note about capacity"]),
+            "a word that only contains a source name does not name it"
         );
+        assert!(names_source(
+            "source \"lumenloop-research\" is slow",
+            "lumenloop-research"
+        ));
+        assert!(!names_source(
+            "source \"lumenloop-research\" is slow",
+            "lumenloop"
+        ));
+        assert_eq!(cap["meta"]["matchModeLabel"], "vector");
         assert!(cap["meta"].get("bySource").is_none());
 
-        let (sep, sep_entry) = source_part(&value, "sep");
+        let (sep, sep_entry) = source_part(&value, "sep", &origins);
         assert_eq!(sep_entry.unwrap()["status"], 503);
         assert_eq!(sep["meta"]["warnings"].as_array().unwrap().len(), 1);
         let mut result = FetchResult::default();
         notices(&sources()[0], &sep["meta"], "", &mut result);
         assert!(result.failures.iter().any(|f| f.stage == "search_limit"));
 
-        let (missing, entry) = source_part(&value, "paper");
+        let (missing, entry) = source_part(&value, "paper", &origins);
         assert!(entry.is_none());
         assert!(missing["results"].as_array().unwrap().is_empty());
     }
