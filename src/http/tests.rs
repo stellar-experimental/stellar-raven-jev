@@ -350,25 +350,49 @@ async fn a_hedge_receipt_names_its_role_and_race_and_the_loser_its_cause() {
 async fn a_hedge_still_waiting_for_a_permit_loses_when_the_primary_decides() {
     let dir = tempfile::tempdir().unwrap();
     let recorder = hedging(dir.path(), hedge_after(100));
-    // Three originals answer after the hedge delay. Two hedges hold the host's hedge permits; the
-    // third waits for one until its original answers.
+    // Two stalled races send their hedges, which never answer and hold both hedge permits. A third
+    // race starts after that; its hedge waits for a permit until its original answers.
     let (url, count, _) = scripted_server(vec![
-        (after(400), OK),
-        (after(400), OK),
-        (after(400), OK),
         (NEVER, OK),
         (NEVER, OK),
+        (NEVER, OK),
+        (NEVER, OK),
+        (after(400), OK),
     ])
     .await;
-    let requests = (0..3).map(|i| recorder.request_attempt(&url, vec![], format!("race-{i}")));
-    for result in futures::future::join_all(requests).await {
-        assert_eq!(result.unwrap().status, 200);
-    }
-    assert_eq!(count.load(Ordering::SeqCst), 5);
+    let stalled = |race: &'static str| {
+        tokio::time::timeout(
+            Duration::from_millis(1500),
+            recorder.request_attempt(&url, vec![], race.into()),
+        )
+    };
+    let queued = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        recorder
+            .request_attempt(&url, vec![], "race-c".into())
+            .await
+    };
+    let (a, b, c) = tokio::join!(stalled("race-a"), stalled("race-b"), queued);
+    assert!(
+        a.is_err() && b.is_err(),
+        "the stalled races hold their hedge permits"
+    );
+    assert_eq!(c.unwrap().status, 200);
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        5,
+        "the queued hedge never sent"
+    );
     let receipts = receipts(dir.path());
-    let hedges: Vec<_> = receipts.iter().filter(|r| r["role"] == "hedge").collect();
-    assert_eq!(hedges.len(), 3);
-    assert!(hedges.iter().all(|r| r["cancel_cause"] == "hedge_loser"));
+    let hedge = receipts
+        .iter()
+        .find(|r| r["role"] == "hedge" && r["race_id"] == "race-c")
+        .unwrap();
+    assert_eq!(hedge["cancel_cause"], "hedge_loser");
+    assert!(hedge.get("started_unix_ms").is_none());
+    // A hedge that loses its race is not a cut, so it does not count as cancelled while queued.
+    let latency = &recorder.load_summary()["source_latency"]["127.0.0.1"];
+    assert_eq!(latency["cancelled_while_queued"], 0);
 }
 
 #[tokio::test]
