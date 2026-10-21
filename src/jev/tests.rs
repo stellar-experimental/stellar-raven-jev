@@ -39,6 +39,66 @@ fn offline_cloudflare() -> Backend {
         account: "0".repeat(32),
         token: "offline-placeholder".into(),
         gateway: "default".into(),
+        model: Model::Jev,
+    }
+}
+
+#[test]
+fn jev_model_selects_a_clef_model_on_cloudflare_only() {
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    };
+    let no_profile = |_: &str| -> Result<String> { panic!("static token needs no profile") };
+    const ALL: &[(&str, &str)] = &[
+        ("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"),
+        ("CLOUDFLARE_API_TOKEN", "t"),
+        ("TYPESAFE_AI_API_KEY", "k"),
+        ("OPENROUTER_API_KEY", "o"),
+        ("JEV_MODEL", "Clef-Flash"),
+    ];
+    // Only Cloudflare serves a Clef model, so the default chain drops the other providers.
+    let chain = providers_from(env(ALL), no_profile).unwrap();
+    assert_eq!(chain.len(), 1);
+    let (_, _, body) = request_parts(
+        &chain[0],
+        &json!({"x":1}),
+        &Map::from_iter([("q".into(), json!({}))]),
+    )
+    .unwrap();
+    assert_eq!(body["model"], "@cf/cloudflare/clef-flash");
+    assert_eq!(body["input"]["model"], "clef-flash");
+    assert_eq!(body["input"]["state"], json!({"x":1}));
+    // 1,000 tokens at $0.038 per million plus the 5% credit fee.
+    assert_eq!(chain[0].cost_nanos(1000).unwrap(), 39_900);
+    assert_eq!(default_rpm(&chain[0]), 300.0);
+    // Jev and a Clef model on one account keep separate host budgets.
+    assert_ne!(
+        provider_budget(&chain[0], &BTreeMap::new()).key,
+        provider_budget(&offline_cloudflare(), &BTreeMap::new()).key
+    );
+    for bad in [
+        &[("TYPESAFE_AI_API_KEY", "k"), ("JEV_MODEL", "clef")][..],
+        &[
+            ("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"),
+            ("CLOUDFLARE_API_TOKEN", "t"),
+            ("TYPESAFE_AI_API_KEY", "k"),
+            ("JEV_PROVIDERS", "cloudflare,typesafe"),
+            ("JEV_MODEL", "clef"),
+        ][..],
+        &[
+            ("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"),
+            ("CLOUDFLARE_API_TOKEN", "t"),
+            ("JEV_MODEL", "orbweaver"),
+        ][..],
+    ] {
+        let bad: &'static [(&'static str, &'static str)] =
+            Box::leak(bad.to_vec().into_boxed_slice());
+        assert!(providers_from(env(bad), no_profile).is_err());
     }
 }
 use std::path::Path;

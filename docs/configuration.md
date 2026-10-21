@@ -48,6 +48,22 @@ Jev runs through one or more providers. Each configured provider joins a chain i
   The token stays in memory. It must belong to `CLOUDFLARE_ACCOUNT_ID`. Otherwise every Jev call fails with HTTP 401.
 - `doctor` shows the chain. `usage.provider_requests` in the output counts settled requests per provider.
 
+### Decision model
+
+`JEV_MODEL` selects the decision model. All models take the same System One request: the same
+state, questions, and answer types. Only the `cloudflare` provider serves the Clef models.
+
+| `JEV_MODEL` | Workers AI model | Accounted price per million input tokens |
+|---|---|---|
+| `jev` (default) | `typesafe/jev` | $0.0441 on `cloudflare`; see the provider table |
+| `clef` | `@cf/cloudflare/clef` | $0.252 ($0.24 plus a 5% credit fee) |
+| `clef-flash` | `@cf/cloudflare/clef-flash` | $0.0399 ($0.038 plus a 5% credit fee) |
+| `clef-omni` | `@cf/cloudflare/clef-omni` | $0.1575 ($0.15 plus a 5% credit fee) |
+
+- With a Clef model, the chain holds only `cloudflare`. `JEV_PROVIDERS` that names another provider is an error.
+- A Clef model has its own host send budget, with a default of 300 requests per minute.
+- `doctor` shows the model as `jev_model`.
+
 ## Environment variables
 
 | Variable | Default | Meaning |
@@ -59,6 +75,7 @@ Jev runs through one or more providers. Each configured provider joins a chain i
 | `JEV_RETAIN_DAYS` | `7` | Run folders idle this many days are removed after a `search` or `more`. `0` turns this off. |
 | `JEV_MAX_SEARCHES` | `6` | Searches that may run at once on this host |
 | `JEV_SOURCE_SLOTS` | see [operating.md](operating.md#source-fetch-slots) | Questions that may fetch from one source host at once, as `HOST=N[,HOST=N]` |
+| `JEV_MODEL` | `jev` | Decision model: `jev`, `clef`, `clef-flash`, or `clef-omni`. See [Decision model](#decision-model). |
 | `JEV_PROVIDERS` | all configured, in chain order | Jev provider order or subset |
 | `JEV_PROVIDER_RPM` | `cloudflare=400,typesafe=3600,openrouter=3600` | Jev requests per minute per provider on this host. A malformed value is an error. |
 

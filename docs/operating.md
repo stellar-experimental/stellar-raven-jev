@@ -211,7 +211,8 @@ for a slot, then prints `busy` and exits 3. It spends nothing. A slot is a file 
 ### Jev send budgets
 
 Each provider has a budget of requests per minute on the host, with room for a 10-second burst.
-The defaults are `cloudflare` 400, `typesafe` 3,600, and `openrouter` 3,600. `JEV_PROVIDER_RPM` replaces a default.
+The defaults are `cloudflare` 400 (300 with a Clef model), `typesafe` 3,600, and `openrouter` 3,600.
+`JEV_PROVIDER_RPM` replaces a default.
 These defaults stay below the rates at which the providers refuse requests.
 
 - A call spends one send only when its request is sent.
