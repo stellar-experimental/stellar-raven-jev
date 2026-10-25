@@ -147,7 +147,7 @@ Before its first reservation, a call runs a free network check.
 It sends one HEAD request, with no credentials and no body, to each provider's origin. No model runs.
 
 - A provider is reachable when it answers with any HTTP status.
-  It is also reachable when it connects within 5 seconds and has not answered after 6 seconds.
+  It is also reachable when it connects within 15 seconds and has not answered after 16 seconds.
 - A provider that fails the check is not used for the run. `load.jev_providers_skipped` names it.
 - When every check fails, nothing is reserved. `search` fails with a `network_check` report.
   `more` and `check` exit with an error.

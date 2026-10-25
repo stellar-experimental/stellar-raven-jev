@@ -67,11 +67,13 @@ const PUBLIC_HEADERS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The network check's connect limit. It covers name resolution, a proxy tunnel, and TLS.
-const PROBE_CONNECT_LIMIT: Duration = Duration::from_secs(5);
+/// The network check's connect limit. It covers name resolution, a proxy tunnel, and TLS. A
+/// congested link with a 3-second round trip needs about 9 seconds for TCP and TLS, and a paid
+/// request can still use that link within its time limit, so the check must not call it dead.
+const PROBE_CONNECT_LIMIT: Duration = Duration::from_secs(15);
 /// The network check's wait for an answer. It exceeds the connect limit, so a probe that still
 /// waits at this point has a connection: the path works, and only the answer is slow.
-const PROBE_WAIT: Duration = Duration::from_secs(6);
+const PROBE_WAIT: Duration = Duration::from_secs(16);
 
 /// One network check: the HTTP status the origin answered with, `None` when it connected but has
 /// not answered within `PROBE_WAIT`, or the cause class of the failure.

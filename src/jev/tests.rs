@@ -2143,12 +2143,12 @@ async fn the_check_ends_at_the_first_reachable_provider_and_a_pending_one_stays_
 async fn a_short_request_limit_does_not_shorten_the_network_check() {
     let dir = tempfile::tempdir().unwrap();
     // The origin connects and answers only after the check's wait.
-    let (slow, _) = scripted_server(vec![(20_000, "404 Not Found", String::new())]).await;
+    let (slow, _) = scripted_server(vec![(30_000, "404 Not Found", String::new())]).await;
     let mut client = JevClient::loopback_for_test(
         &RunConfig {
             output_dir: dir.path().to_path_buf(),
             budget_usd: 1.0,
-            // Below the check's 6-second wait.
+            // Below the check's 16-second wait.
             timeout_secs: 2,
             ..RunConfig::default()
         },

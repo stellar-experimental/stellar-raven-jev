@@ -230,7 +230,7 @@ struct NetworkCheck {
 }
 
 /// What a passing network check shows, and what it cannot.
-pub const NETWORK_CHECK_SCOPE: &str = "One HEAD request without credentials or body to each Jev provider origin; no model runs, so no provider can bill it. A provider is reachable when it answers with any HTTP status, or when it connects within 5 seconds and has not answered after 6. A pass shows only that the path works now: a later paid request can still fail, and one that fails after it was sent keeps its reservation.";
+pub const NETWORK_CHECK_SCOPE: &str = "One HEAD request without credentials or body to each Jev provider origin; no model runs, so no provider can bill it. A provider is reachable when it answers with any HTTP status, or when it connects within 15 seconds and has not answered after 16. A pass shows only that the path works now: a later paid request can still fail, and one that fails after it was sent keeps its reservation.";
 
 /// The free network check for every named origin at once, for `doctor`.
 pub async fn probe_providers(
