@@ -40,6 +40,7 @@ enum Backend {
         account: String,
         token: String,
         gateway: String,
+        model: Model,
     },
     /// TypeSafe's own API.
     TypeSafe {
@@ -62,11 +63,13 @@ impl Backend {
         }
     }
     /// Accounted costs use nanodollars per 10 input tokens.
-    /// TypeSafe uses 420, OpenRouter uses 444, and other backends use 441.
+    /// TypeSafe uses 420, OpenRouter uses 444, Cloudflare uses its model's price, and other
+    /// backends use 441.
     fn cost_nanos(&self, tokens: u64) -> Result<u64> {
         let per_ten_tokens: u128 = match self {
             Self::TypeSafe { .. } => 420,
             Self::OpenRouter { .. } => 444,
+            Self::Cloudflare { model, .. } => model.cloudflare_nanos_per_ten_tokens(),
             _ => 441,
         };
         let cost = (u128::from(tokens) * per_ten_tokens).div_ceil(10);
@@ -84,6 +87,77 @@ impl Backend {
         origin.set_query(None);
         Ok(origin.to_string())
     }
+}
+
+/// The decision model. Every model takes the same System One request and returns the same
+/// answers. TypeSafe and OpenRouter serve only Jev; the Cloudflare provider serves all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Model {
+    Jev,
+    Clef,
+    ClefFlash,
+    ClefOmni,
+}
+
+impl Model {
+    const ALL: [Model; 4] = [Self::Jev, Self::Clef, Self::ClefFlash, Self::ClefOmni];
+
+    /// The `JEV_MODEL` value, which is also the System One model selector of a Clef model.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Jev => "jev",
+            Self::Clef => "clef",
+            Self::ClefFlash => "clef-flash",
+            Self::ClefOmni => "clef-omni",
+        }
+    }
+
+    /// The Workers AI model ID.
+    fn cloudflare_id(self) -> &'static str {
+        match self {
+            Self::Jev => "typesafe/jev",
+            Self::Clef => "@cf/cloudflare/clef",
+            Self::ClefFlash => "@cf/cloudflare/clef-flash",
+            Self::ClefOmni => "@cf/cloudflare/clef-omni",
+        }
+    }
+
+    /// The list price per million input tokens. Output tokens are free for every model.
+    fn usd_per_million(self) -> f64 {
+        match self {
+            Self::Jev => 0.042,
+            Self::Clef => 0.24,
+            Self::ClefFlash => 0.038,
+            Self::ClefOmni => 0.15,
+        }
+    }
+
+    /// The Cloudflare price in nanodollars per 10 input tokens: the list price plus the 5% fee on
+    /// AI Gateway credits.
+    fn cloudflare_nanos_per_ten_tokens(self) -> u128 {
+        match self {
+            Self::Jev => 441,
+            Self::Clef => 2_520,
+            Self::ClefFlash => 399,
+            Self::ClefOmni => 1_575,
+        }
+    }
+}
+
+/// The decision model from `JEV_MODEL`. The default is Jev.
+pub fn model_from(env: &impl Fn(&str) -> Option<String>) -> Result<Model> {
+    let Some(value) = env("JEV_MODEL") else {
+        return Ok(Model::Jev);
+    };
+    let value = value.trim().to_ascii_lowercase();
+    Model::ALL
+        .into_iter()
+        .find(|model| model.name() == value)
+        .with_context(|| {
+            format!(
+                "JEV_MODEL names an unknown model: {value} (use jev, clef, clef-flash, clef-omni)"
+            )
+        })
 }
 
 /// A Jev call that failed with a known class: a transport class (see
@@ -192,6 +266,7 @@ pub fn provider_origin(name: &str) -> Result<String> {
             account: empty(),
             token: empty(),
             gateway: empty(),
+            model: Model::Jev,
         },
         "typesafe" => Backend::TypeSafe { key: empty() },
         "openrouter" => Backend::OpenRouter { key: empty() },
@@ -399,6 +474,7 @@ impl JevClient {
             config.budget_usd <= SHARED_CEILING_USD,
             "Jev run budget exceeds the shared $100 ceiling"
         );
+        let model = model_from(&env)?;
         let mut chain = if config.fixture {
             vec![Backend::Fixture]
         } else {
@@ -446,10 +522,11 @@ impl JevClient {
         };
         client.write_audit("accounting-policy", &json!({
             "providers": client.chain().iter().map(|b| b.name()).collect::<Vec<_>>(),
+            "model": model.name(),
             "run_budget_usd": config.budget_usd,
             "shared_ceiling_usd": SHARED_CEILING_USD,
             "shared_budget_owner": "lead; this client enforces its run allocation only",
-            "input_usd_per_million": 0.042, "output_usd_per_million": 0.0,
+            "input_usd_per_million": model.usd_per_million(), "output_usd_per_million": 0.0,
             "credit_purchase_multipliers": {"cloudflare": 1.05, "openrouter": 444.0 / 420.0, "typesafe": 1.0},
             "reservation_input_tokens_per_request": MAX_INPUT_TOKENS,
             "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and each provider's credit purchase overhead; reservations use the highest provider price",
@@ -1974,6 +2051,7 @@ fn request_parts(
             account,
             token,
             gateway,
+            model,
         } => {
             headers.extend([
                 ("authorization".into(), format!("Bearer {token}")),
@@ -1981,10 +2059,15 @@ fn request_parts(
                 ("cf-aig-max-attempts".into(), "1".into()),
                 ("cf-aig-skip-cache".into(), "true".into()),
             ]);
+            // A Clef model also takes its System One model selector in the input.
+            let mut input = json!({"state":state,"questions":questions});
+            if *model != Model::Jev {
+                input["model"] = json!(model.name());
+            }
             Ok((
                 format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai/run"),
                 headers,
-                json!({"model":"typesafe/jev","input":{"state":state,"questions":questions}}),
+                json!({"model":model.cloudflare_id(),"input":input}),
             ))
         }
         Backend::TypeSafe { key } => Ok(direct(
@@ -2206,10 +2289,14 @@ fn env_value(name: &str) -> Option<String> {
 /// Provider names in their default chain order.
 const PROVIDERS: [&str; 3] = ["cloudflare", "typesafe", "openrouter"];
 
-/// Default client send limits per provider, in requests per minute.
+/// Default client send limits per provider, in requests per minute. A Clef model has the Workers
+/// AI text generation limit.
 fn default_rpm(backend: &Backend) -> f64 {
     match backend {
-        Backend::Cloudflare { .. } => 400.0,
+        Backend::Cloudflare {
+            model: Model::Jev, ..
+        } => 400.0,
+        Backend::Cloudflare { .. } => 300.0,
         Backend::TypeSafe { .. } | Backend::OpenRouter { .. } => 3_600.0,
         #[cfg(test)]
         Backend::Loopback { .. } => 60_000.0,
@@ -2245,15 +2332,19 @@ fn rpm_overrides(value: Option<String>) -> Result<BTreeMap<String, f64>> {
 }
 
 /// The provider's host budget identity and rate. The key is the provider name plus a digest of the
-/// account and gateway, or of the key, so separate credentials keep separate budgets.
+/// account, gateway, and model, or of the key, so separate credentials and Workers AI models keep
+/// separate budgets.
 fn provider_budget(
     backend: &Backend,
     overrides: &BTreeMap<String, f64>,
 ) -> crate::governor::ProviderBudget {
     let identity = match backend {
         Backend::Cloudflare {
-            account, gateway, ..
-        } => format!("{account}/{gateway}"),
+            account,
+            gateway,
+            model,
+            ..
+        } => format!("{account}/{gateway}/{}", model.name()),
         Backend::TypeSafe { key } | Backend::OpenRouter { key } => key.clone(),
         #[cfg(test)]
         Backend::Loopback { url, .. } => url.clone(),
@@ -2271,17 +2362,21 @@ fn provider_budget(
 }
 
 /// The provider chain. `JEV_PROVIDERS` (comma-separated) sets the order and must name only
-/// configured providers; without it, every configured provider is used in the default order.
+/// configured providers; without it, every configured provider that serves `JEV_MODEL` is used in
+/// the default order.
 fn providers_from(
     env: impl Fn(&str) -> Option<String>,
     resolve: impl FnOnce(&str) -> Result<String>,
 ) -> Result<Vec<Backend>> {
     let order = provider_order(&env)?;
+    let model = model_from(&env)?;
     let mut resolve = Some(resolve);
     order
         .iter()
         .map(|name| match name.as_str() {
-            "cloudflare" => cloudflare_from(&env, resolve.take().expect("one Cloudflare entry")),
+            "cloudflare" => {
+                cloudflare_from(&env, model, resolve.take().expect("one Cloudflare entry"))
+            }
             "typesafe" => Ok(Backend::TypeSafe {
                 key: header_setting(
                     "TYPESAFE_AI_API_KEY",
@@ -2312,6 +2407,8 @@ fn header_setting(name: &str, value: String) -> Result<String> {
 /// The provider chain's names in order, from configuration alone. Starts nothing and sends
 /// nothing, so `doctor` can show it.
 pub fn provider_order(env: &impl Fn(&str) -> Option<String>) -> Result<Vec<String>> {
+    let model = model_from(env)?;
+    let serves = |name: &str| model == Model::Jev || name == "cloudflare";
     let configured = |name: &str| match name {
         "cloudflare" => {
             env("CLOUDFLARE_ACCOUNT_ID").is_some()
@@ -2335,6 +2432,11 @@ pub fn provider_order(env: &impl Fn(&str) -> Option<String>) -> Result<Vec<Strin
                 );
                 ensure!(!names[..i].contains(name), "JEV_PROVIDERS repeats {name}");
                 ensure!(
+                    serves(name),
+                    "JEV_PROVIDERS names {name}, which does not serve JEV_MODEL={} (use cloudflare)",
+                    model.name()
+                );
+                ensure!(
                     configured(name),
                     "JEV_PROVIDERS names {name}, but its credentials are missing"
                 );
@@ -2343,10 +2445,15 @@ pub fn provider_order(env: &impl Fn(&str) -> Option<String>) -> Result<Vec<Strin
         }
         None => PROVIDERS
             .iter()
-            .filter(|n| configured(n))
+            .filter(|n| serves(n) && configured(n))
             .map(|n| (*n).to_owned())
             .collect(),
     };
+    ensure!(
+        model == Model::Jev || !order.is_empty(),
+        "JEV_MODEL={} needs the cloudflare provider: set CLOUDFLARE_ACCOUNT_ID with CLOUDFLARE_API_TOKEN or JEV_CLOUDFLARE_AUTH_PROFILE",
+        model.name()
+    );
     ensure!(
         !order.is_empty(),
         "No Jev provider is configured: set CLOUDFLARE_ACCOUNT_ID (with CLOUDFLARE_API_TOKEN or JEV_CLOUDFLARE_AUTH_PROFILE), TYPESAFE_AI_API_KEY, or OPENROUTER_API_KEY"
@@ -2356,6 +2463,7 @@ pub fn provider_order(env: &impl Fn(&str) -> Option<String>) -> Result<Vec<Strin
 
 fn cloudflare_from(
     env: &impl Fn(&str) -> Option<String>,
+    model: Model,
     resolve: impl FnOnce(&str) -> Result<String>,
 ) -> Result<Backend> {
     let account = env("CLOUDFLARE_ACCOUNT_ID")
@@ -2375,6 +2483,7 @@ fn cloudflare_from(
             "JEV_GATEWAY_ID",
             env("JEV_GATEWAY_ID").unwrap_or_else(|| "default".into()),
         )?,
+        model,
     })
 }
 

@@ -924,12 +924,18 @@ async fn main() -> Result<()> {
                     |order| json!(order),
                 )
             });
+            let jev_model = (!config.fixture).then(|| {
+                stellar_raven_jev::jev::model_from(&env).map_or_else(
+                    |error| json!({"error": error.to_string()}),
+                    |model| json!(model.name()),
+                )
+            });
             println!(
                 "{}",
                 serde_json::to_string(&json!({
                     "mode":if config.fixture {"offline-fixture"} else {"live-jev"},
                     "network_checked":network_check.is_some(),"network_check":network_check,
-                    "jev_providers":jev_providers,
+                    "jev_providers":jev_providers,"jev_model":jev_model,
                     "jev_authentication_check":result.as_ref().ok(),
                     "local_configuration_ready":configuration_ready,
                     "jev_configuration_ready":result.is_ok(),
