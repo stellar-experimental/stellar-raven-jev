@@ -1358,7 +1358,7 @@ impl HttpRecorder {
         let take = || {
             let taken = load
                 .hedges
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                     (n < HEDGES_PER_RUN).then_some(n + 1)
                 })
                 .is_ok();

@@ -1669,7 +1669,7 @@ impl reqwest::dns::Resolve for FlakyDns {
         };
         let failed = self
             .failures
-            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
             .is_ok();
         Box::pin(async move {
             tokio::time::sleep(delay).await;

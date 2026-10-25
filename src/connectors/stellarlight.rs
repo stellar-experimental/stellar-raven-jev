@@ -1126,11 +1126,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            for n in 0.. {
+            let last = *replies.last().unwrap();
+            for reply in replies.into_iter().chain(std::iter::repeat(last)) {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = vec![0; 4096];
                 let _ = socket.read(&mut request).await;
-                let reply = replies[n.min(replies.len() - 1)];
                 let _ = socket.write_all(reply).await;
             }
         });
