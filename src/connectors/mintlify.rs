@@ -276,11 +276,15 @@ fn heading(content: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
-/// Published Markdown without the documentation-index notice that the site puts before each page:
-/// the first block quote, when the page starts with one, and the blank lines after it. A later
-/// block quote stays.
+/// The words that open the notice the site puts before each published Markdown page.
+const INDEX_NOTICE: &str = "Documentation Index";
+
+/// Published Markdown without the site's documentation-index notice: the first block quote and
+/// the blank lines after it, when the page starts with a block quote whose first line holds
+/// [`INDEX_NOTICE`]. Any other block quote is page text and stays.
 fn without_index_notice(text: &str) -> String {
-    if !text.trim_start().starts_with('>') {
+    let first = text.trim_start().lines().next().unwrap_or_default();
+    if !first.trim_start().starts_with('>') || !first.contains(INDEX_NOTICE) {
         return text.to_owned();
     }
     let rest: Vec<&str> = text
@@ -808,9 +812,14 @@ mod tests {
         );
         // Only the first block quote is the notice; a later one is page text.
         assert_eq!(
-            without_index_notice("> Notice.\n\n> A note that is page text.\n\n# Receipts"),
+            without_index_notice(
+                "> ## Documentation Index\n> Fetch it.\n\n> A note that is page text.\n\n# Receipts"
+            ),
             "> A note that is page text.\n\n# Receipts"
         );
+        // A page that starts with its own note keeps it.
+        let note = "> Note: Quillon receipts batch hourly.\n\n# Receipts\n\nBody";
+        assert_eq!(without_index_notice(note), note);
     }
 
     #[test]

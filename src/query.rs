@@ -101,7 +101,7 @@ impl QueryPlan {
         }
     }
     /// All keyword tokens in question order, as one query. Use it when a source gets one request only.
-    /// Pair it with an any-word mode, such as Algolia `allOptional`; an AND match on many facets returns nothing.
+    /// Pair it with an any-word match mode: an AND match on many facets returns nothing.
     pub fn keyword_text(&self) -> String {
         let keywords = self.of_kind(VariantKind::Keywords);
         if keywords.is_empty() {
