@@ -726,6 +726,9 @@ pub struct TransportFailure {
     /// closed connection can also come before the request. A connection still not open at the
     /// request time limit is not marked, because that limit is not a connect-phase error.
     pub unsent: bool,
+    /// The HTTP status that arrived before the body failed. `None` when the request failed
+    /// before a response.
+    pub status: Option<u16>,
     text: String,
 }
 
@@ -734,6 +737,7 @@ impl TransportFailure {
         Self {
             cause: transport_cause(error),
             unsent: error.is_connect(),
+            status: None,
             text,
         }
     }
@@ -1923,7 +1927,13 @@ impl HttpRecorder {
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
                     let e = e.without_url();
-                    TransportFailure::new(&e, format!("Response body failed: {e}"))
+                    TransportFailure {
+                        status: Some(status),
+                        ..TransportFailure::new(
+                            &e,
+                            format!("Response body failed after HTTP {status}: {e}"),
+                        )
+                    }
                 })?;
                 let available = self.config.max_body_bytes.saturating_sub(bytes.len());
                 let mut retain_count = chunk.len().min(available);

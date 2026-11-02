@@ -194,6 +194,114 @@ mod tests {
         }
     }
 
+    /// A loopback server that answers each request path from `routes` (status line and body),
+    /// and logs the paths it was asked for.
+    async fn site(
+        routes: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = vec![0; 4096];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let line = String::from_utf8_lossy(&request[..n]).into_owned();
+                let path = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                seen.lock().unwrap().push(path.clone());
+                let (status, body) = routes
+                    .iter()
+                    .find(|(route, _, _)| *route == path)
+                    .map(|(_, status, body)| (*status, *body))
+                    .unwrap_or(("404 Not Found", ""));
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        (addr, log)
+    }
+
+    const ARTICLE: &str = "<!doctype html><html><body><nav>Menu</nav><article><h1>Quillon receipts</h1><p>The fictional Quillon ledger batches its receipts every hour.</p></article></body></html>";
+
+    async fn read_from(
+        routes: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (Read, Vec<String>) {
+        let (addr, log) = site(routes).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig::default();
+        let ctx = FetchContext {
+            http: crate::http::HttpRecorder::loopback_for_test(dir.path(), &config).unwrap(),
+            config,
+            deadline: None,
+        };
+        let source = Source {
+            id: "quillon.docs".into(),
+            name: "Quillon docs".into(),
+            description: String::new(),
+            family: "test".into(),
+        };
+        let url = Url::parse(&format!("http://{addr}/receipts")).unwrap();
+        let read = read(&ctx, &source, &url, true).await;
+        let paths = log.lock().unwrap().clone();
+        (read, paths)
+    }
+
+    #[tokio::test]
+    async fn a_missing_markdown_page_falls_back_to_html_without_lost_evidence() {
+        let (read, paths) = read_from(vec![("/receipts", "200 OK", ARTICLE)]).await;
+        assert_eq!(paths, ["/receipts.md", "/receipts"]);
+        assert_eq!(read.meta["kind"], "original_html");
+        assert_eq!(read.meta["full_original"], true);
+        assert!(read.text.unwrap().contains("batches its receipts"));
+        let stages: Vec<_> = read.failures.iter().map(|f| f.stage.as_str()).collect();
+        assert_eq!(stages, ["original"]);
+    }
+
+    #[tokio::test]
+    async fn markdown_that_is_an_html_page_is_not_read_as_markdown() {
+        let (read, paths) = read_from(vec![
+            ("/receipts.md", "200 OK", ARTICLE),
+            ("/receipts", "200 OK", ARTICLE),
+        ])
+        .await;
+        assert_eq!(paths, ["/receipts.md", "/receipts"]);
+        assert_eq!(read.meta["kind"], "original_html");
+        assert!(read.meta["fetched_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/receipts"));
+        assert!(!read.text.unwrap().contains("Menu"));
+    }
+
+    #[tokio::test]
+    async fn server_errors_on_both_forms_are_lost_evidence() {
+        let (read, paths) = read_from(vec![
+            ("/receipts.md", "503 Service Unavailable", ""),
+            ("/receipts", "503 Service Unavailable", ""),
+        ])
+        .await;
+        assert_eq!(paths, ["/receipts.md", "/receipts"]);
+        assert!(read.text.is_none());
+        assert_eq!(read.meta["full_original"], false);
+        assert_eq!(read.meta["requested"], true);
+        assert!(read.failures.iter().any(|f| f.stage == "original_lost"));
+    }
+
     #[test]
     fn a_moved_original_is_followed_only_on_the_same_host_over_https() {
         let from = Url::parse("https://fernlet.test/connect").unwrap();
