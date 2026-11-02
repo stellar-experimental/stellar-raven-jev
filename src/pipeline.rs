@@ -1523,15 +1523,33 @@ pub async fn continue_session(
         "The session has spent its budget of ${cap:.3}"
     );
     config.budget_usd = current.budget_usd.min(remaining);
+    let registry = connectors::sources();
     let (tails, unfetched) = open_pools(&evidence);
+    // A saved unfetched pool of a source that this version does not register cannot be fetched.
+    // Its saved unscored documents stay in `tails`.
+    let (unfetched, unavailable): (Vec<String>, Vec<String>) = unfetched
+        .into_iter()
+        .partition(|id| registry.iter().any(|source| &source.id == id));
     let requested: BTreeSet<String> = match pools {
-        None => tails
-            .keys()
-            .cloned()
-            .chain(unfetched.iter().cloned())
-            .collect(),
+        None => {
+            let open: BTreeSet<String> = tails
+                .keys()
+                .cloned()
+                .chain(unfetched.iter().cloned())
+                .collect();
+            ensure!(
+                !open.is_empty() || unavailable.is_empty(),
+                "The session has no open pools that this version can spend. Unavailable sources: {}. Start a new search to use the current sources",
+                unavailable.join(", ")
+            );
+            open
+        }
         Some(ids) => {
             for id in ids {
+                ensure!(
+                    !unavailable.contains(id),
+                    "{id} is a pool of a source that this version no longer has, so it cannot be fetched. Start a new search to use the current sources"
+                );
                 ensure!(
                     tails.contains_key(id) || unfetched.contains(id),
                     "{id} is not an open pool of this session; open pools: {}",
@@ -1560,7 +1578,6 @@ pub async fn continue_session(
         return Err(error);
     }
     let run_started = std::time::Instant::now();
-    let registry = connectors::sources();
     let chosen: Vec<&Source> = registry
         .iter()
         .filter(|source| unfetched.contains(&source.id) && requested.contains(&source.id))

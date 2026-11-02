@@ -85,7 +85,8 @@ Pools list what a session has not spent: sources routed but not fetched, and fet
 not yet scored. `pools.actionable` lists only pools with a signal. `more` scores or fetches them
 against the original question and prints the re-ranked session. When part of the question has
 no support at all, a narrower `search` works better than `more`. A default search fetches and
-scores everything, so it normally leaves no pools.";
+scores everything, so it normally leaves no pools. An `unavailable` pool names a routed source
+that this version no longer has: `more` cannot fetch it, so start a new search.";
 
 #[derive(Parser)]
 #[command(

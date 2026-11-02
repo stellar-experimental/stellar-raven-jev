@@ -242,14 +242,19 @@ pub fn pools_view(root: &Path) -> Result<Value> {
         let Some(id) = decision["source_id"].as_str() else {
             continue;
         };
+        let source = registry.iter().find(|s| s.id == id);
         let state = if decision["selected"] == true && decision["fetched"] == false {
-            "unfetched"
+            // This version cannot fetch a source that it does not register.
+            if source.is_some() {
+                "unfetched"
+            } else {
+                "unavailable"
+            }
         } else if tails.contains_key(id) {
             "unscored_tail"
         } else {
             continue;
         };
-        let source = registry.iter().find(|s| s.id == id);
         let (scored, chosen, best) = stats.get(id).copied().unwrap_or((0, 0, 0.0));
         pools.push(json!({
             "id": id,
@@ -298,6 +303,7 @@ pub fn pool_summary(pools: &Value, config: &Value) -> Value {
     json!({
         "unfetched": of("unfetched").count(),
         "unscored_tails": of("unscored_tail").count(),
+        "unavailable": of("unavailable").count(),
         "best_unfetched_route": max(of("unfetched").filter_map(|p| p["route"].as_f64()).collect()),
         "best_tail_score": max(of("unscored_tail").filter_map(|p| p["best"].as_f64()).collect()),
         "actionable": actionable,

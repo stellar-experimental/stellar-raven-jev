@@ -376,6 +376,78 @@ fn a_session_spends_its_pools_and_checks_claims() {
 }
 
 #[test]
+fn a_saved_pool_of_a_source_this_version_lacks_is_unavailable() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = |args: &[&str]| {
+        cli()
+            .args(["--fixture", "--output-dir"])
+            .arg(temp.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let json = |output: std::process::Output| -> Value {
+        assert!(
+            matches!(output.status.code(), Some(0 | 2)),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let first = json(command(&[
+        "search",
+        "How does the fictional Quillon ledger batch its receipts?",
+        "--fetch-threshold",
+        "0.9",
+    ]));
+    let session = first["session"]["id"].as_str().unwrap().to_owned();
+    // The session routed a source that a later version no longer registers.
+    let decisions = std::path::Path::new(&session).join("source-decisions.json");
+    let saved = std::fs::read_to_string(&decisions).unwrap();
+    assert!(saved.contains("\"mintlify:docs\""));
+    std::fs::write(
+        &decisions,
+        saved.replace("\"mintlify:docs\"", "\"retired.quillon\""),
+    )
+    .unwrap();
+
+    let explicit = command(&["more", &session, "--pool", "retired.quillon"]);
+    assert_eq!(explicit.status.code(), Some(1));
+    assert!(explicit.stdout.is_empty());
+    let message = String::from_utf8_lossy(&explicit.stderr);
+    assert!(message.contains("retired.quillon"), "{message}");
+    assert!(message.contains("Start a new search"), "{message}");
+
+    let all = json(command(&["more", &session, "--all"]));
+    // The refused call did not count as a session call.
+    assert_eq!(all["session"]["calls"], 2);
+    assert_eq!(all["pools"]["unavailable"], 1);
+    assert_eq!(all["pools"]["unfetched"], 0);
+    assert!(all["pools"]["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["id"] != "retired.quillon"));
+    let pools = stellar_raven_jev::session::pools_view(std::path::Path::new(&session)).unwrap();
+    let row = pools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "retired.quillon")
+        .expect("the unavailable pool is listed");
+    assert_eq!(row["state"], "unavailable");
+    assert_eq!(row["source_requests"], 0);
+
+    let again = command(&["more", &session, "--all"]);
+    assert_eq!(again.status.code(), Some(1));
+    let message = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        message.contains("Unavailable sources: retired.quillon"),
+        "{message}"
+    );
+}
+
+#[test]
 fn a_bundle_holds_the_full_text_of_each_shown_result_in_rank_order() {
     let temp = tempfile::tempdir().unwrap();
     let output = cli()
