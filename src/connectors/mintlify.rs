@@ -296,14 +296,19 @@ fn without_index_notice(text: &str) -> String {
 }
 
 /// Whether a search outcome may be repeated: a server error, or a failure before a complete
-/// response (a timeout too) unless a status below 500 had already arrived. A 4xx answer is final,
-/// even when its body then fails, and so is a refusal by a rate limit.
+/// response (a timeout too), unless the status that arrived first was a 4xx. A 4xx answer is
+/// final, even when its body then fails, and so is a refusal by a rate limit. A failed 2xx or 3xx
+/// body is repeated.
 fn retryable(outcome: &anyhow::Result<crate::http::HttpResponse>) -> bool {
     match outcome {
         Ok(response) => response.status >= 500,
         Err(error) => error
             .downcast_ref::<crate::http::TransportFailure>()
-            .is_some_and(|failure| failure.status.is_none_or(|status| status >= 500)),
+            .is_some_and(|failure| {
+                !failure
+                    .status
+                    .is_some_and(|status| (400..500).contains(&status))
+            }),
     }
 }
 
@@ -1115,6 +1120,13 @@ mod tests {
             assert!(result.documents.is_empty());
             assert_eq!(result.failures[0].stage, "search", "{status}");
         }
+        // A failed 200 body is not a 4xx answer, so it keeps its retry.
+        let incomplete = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\nConnection: close\r\n\r\n[".to_owned();
+        let (result, _, requests, _) =
+            search_with(vec![incomplete, reply("200 OK", &ok)], "Quillon receipts").await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(result.documents.len(), 1);
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
     }
 
     #[tokio::test]
