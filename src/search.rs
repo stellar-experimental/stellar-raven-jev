@@ -907,7 +907,7 @@ mod tests {
     fn uncertain_ties_break_by_completeness_then_id() {
         let document = |id: &str, scope: &str| Document {
             id: id.into(),
-            source_id: "algolia:docs".into(),
+            source_id: "mintlify:docs".into(),
             title: String::new(),
             url: String::new(),
             text: String::new(),

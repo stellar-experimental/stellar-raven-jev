@@ -324,10 +324,10 @@ fn a_session_spends_its_pools_and_checks_claims() {
     assert!(pools.iter().all(|p| p["state"] == "unfetched"));
     let pool = pools
         .iter()
-        .find(|p| p["id"] == "algolia:docs:primary")
+        .find(|p| p["id"] == "mintlify:docs")
         .expect("the docs index is an open pool");
     assert_eq!(pool["source_requests"], 1);
-    let more = run(&["more", &session, "--pool", "algolia:docs:primary"]);
+    let more = run(&["more", &session, "--pool", "mintlify:docs"]);
     assert_eq!(more["session"]["calls"], 2);
     assert_eq!(more["session"]["documents_scored"], 1);
     assert_eq!(more["results"].as_array().unwrap().len(), 1);
@@ -335,7 +335,7 @@ fn a_session_spends_its_pools_and_checks_claims() {
         .as_array()
         .unwrap()
         .iter()
-        .all(|p| p["id"] != "algolia:docs:primary"));
+        .all(|p| p["id"] != "mintlify:docs"));
     // A text path stays the same when later calls re-rank the session.
     let text_path = more["results"][0]["text_path"].as_str().unwrap().to_owned();
     let unknown = cli()
@@ -365,7 +365,14 @@ fn a_session_spends_its_pools_and_checks_claims() {
         .collect();
     assert_eq!(calls.into_iter().collect::<Vec<_>>(), vec![2, 4]);
     assert_eq!(all["pools"]["actionable"].as_array().unwrap().len(), 0);
-    assert_eq!(all["results"][0]["text_path"], text_path.as_str());
+    let title = &more["results"][0]["title"];
+    let same = all["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| &r["title"] == title)
+        .expect("the docs result stays in the session");
+    assert_eq!(same["text_path"], text_path.as_str());
 }
 
 #[test]

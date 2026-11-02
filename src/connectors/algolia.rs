@@ -1,5 +1,5 @@
-//! Read-only Algolia retrieval.
-use crate::extract::{html_article_text, markdown_for_scoring, unresolved_markdown_component};
+//! Read-only Algolia retrieval of the stellar.org site indexes.
+use super::published;
 use crate::types::*;
 use anyhow::{bail, Result};
 use reqwest::{Method, Url};
@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DOCS: [&str; 2] = ["crawler_Stellar Docs - Docusaurus", "docs_replica_agent"];
 const SITE: [&str; 18] = [
     "dev_pages",
     "dev_pages_asc",
@@ -31,55 +30,36 @@ const SITE: [&str; 18] = [
 
 #[derive(Clone, Copy)]
 struct Index {
-    scope: &'static str,
     name: &'static str,
 }
 impl Index {
     fn id(self) -> String {
-        if self.name == DOCS[0] {
-            "algolia:docs:primary".into()
-        } else {
-            format!("algolia:{}:{}", self.scope.to_lowercase(), self.name)
-        }
+        format!("algolia:site:{}", self.name)
     }
     fn production(self) -> bool {
         !self.name.starts_with("dev_") && !self.name.starts_with("staging_")
     }
     fn spanish(self) -> bool {
-        self.scope == "SITE" && self.name.contains("_es")
+        self.name.contains("_es")
     }
     fn replica(self) -> bool {
-        self.name == DOCS[1] || self.name.ends_with("_asc") || self.name.ends_with("_desc")
+        self.name.ends_with("_asc") || self.name.ends_with("_desc")
     }
 }
-/// Original pages read at once by one connector.
-const ORIGINAL_READS: usize = 6;
 
 fn indices() -> impl Iterator<Item = Index> {
-    DOCS.into_iter()
-        .map(|name| Index {
-            scope: "DOCS",
-            name,
-        })
-        .chain(SITE.into_iter().map(|name| Index {
-            scope: "SITE",
-            name,
-        }))
+    SITE.into_iter().map(|name| Index { name })
 }
 
 pub fn sources() -> Vec<Source> {
     indices().filter(|index| !index.replica()).map(|index| {
-        let content = if index.scope == "DOCS" {
-            "Official developer documentation and protocol meeting notes. Records contain headings or sections."
-        } else {
-            "Official Stellar site pages, announcements, events, partners, audits, and page sections."
-        };
+        let content = "Official Stellar site pages, announcements, events, partners, audits, and page sections.";
         let locale = if index.spanish() { "Spanish." } else { "English." };
         let environment = if index.production() { "Production index." } else {
             "Development or staging index. Content can be stale, unpublished, or different from production."
         };
         let replica = if index.replica() { "Replica of another index. Results are not independent evidence." } else { "Primary index." };
-        Source { id: index.id(), name: format!("Algolia {} / {}", index.scope, index.name),
+        Source { id: index.id(), name: format!("Algolia SITE / {}", index.name),
             description: format!("{content} {locale} {environment} {replica}"), family: "algolia".into() }
     }).collect()
 }
@@ -101,10 +81,10 @@ fn endpoint(app: &str, index: Option<&str>) -> Result<Url> {
     }
     Ok(url)
 }
-fn search_params(question: &str, page: usize, size: usize, relaxed: bool) -> Value {
+fn search_params(question: &str, page: usize, size: usize) -> Value {
     json!({"query":question,"page":page,"hitsPerPage":size,"analytics":false,"clickAnalytics":false,
         "distinct":false,"attributesToRetrieve":["*"],"attributesToHighlight":[],"attributesToSnippet":[],
-        "removeWordsIfNoResults":if relaxed { "allOptional" } else { "none" }})
+        "removeWordsIfNoResults":"none"})
 }
 fn local_site_keyword_variant(question: &str) -> Option<String> {
     let stop = [
@@ -234,77 +214,19 @@ fn planned_query(index: Index, plan: &crate::query::QueryPlan) -> (String, &'sta
     (text, kind)
 }
 
-fn docs_facet_queries(
-    plan: &crate::query::QueryPlan,
-    max_pages: usize,
-    max_documents: usize,
-) -> Vec<String> {
-    if max_pages < 2 || max_documents < 2 {
-        return Vec::new();
-    }
-    let mut seen = HashSet::new();
-    let queries: Vec<_> = plan
-        .keyword()
-        .into_iter()
-        .filter(|variant| {
-            variant.kind == crate::query::VariantKind::Keywords
-                && !variant.text.trim().is_empty()
-                && variant.facet.is_some_and(|facet| seen.insert(facet))
-        })
-        .map(|variant| variant.text.clone())
-        .collect();
-    if queries.len() < 2 {
-        return Vec::new();
-    }
-    queries
-        .into_iter()
-        .take(max_pages.min(max_documents))
-        .collect()
-}
-
-fn facet_document_ceiling(max_documents: usize, retained: usize, remaining_facets: usize) -> usize {
-    retained + max_documents.saturating_sub(retained) / remaining_facets.max(1)
-}
-
-/// Whether `url` is a canonical page of an indexed site: HTTPS on developers.stellar.org or
-/// stellar.org, with no credentials, port, or encoded path separators. Callers outside the
-/// connector use it before fetching an indexed page again.
-pub(crate) fn is_canonical_page(url: &str) -> bool {
-    let Ok(url) = Url::parse(url) else {
-        return false;
-    };
-    let path = url.path().to_lowercase();
-    url.scheme() == "https"
-        && matches!(
-            url.host_str(),
-            Some("developers.stellar.org" | "stellar.org")
-        )
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.port().is_none()
-        && !path.contains('\\')
-        && !path.contains("%2f")
-        && !path.contains("%5c")
-}
-
 fn canonical(index: Index, hit: &Value) -> Option<Url> {
     let raw = hit
         .get("url_without_anchor")
         .and_then(Value::as_str)
         .or_else(|| hit.get("url").and_then(Value::as_str))?;
     // Reject schemes, credentials, ports, and off-site URLs before any original fetch.
-    let mut url = if raw.starts_with('/') && !raw.starts_with("//") && index.scope == "SITE" {
+    let mut url = if raw.starts_with('/') && !raw.starts_with("//") {
         Url::parse("https://stellar.org").ok()?.join(raw).ok()?
     } else {
         Url::parse(raw).ok()?
     };
-    let host = if index.scope == "DOCS" {
-        "developers.stellar.org"
-    } else {
-        "stellar.org"
-    };
     if url.scheme() != "https"
-        || url.host_str() != Some(host)
+        || url.host_str() != Some("stellar.org")
         || !url.username().is_empty()
         || url.password().is_some()
         || url.port().is_some()
@@ -406,160 +328,24 @@ fn timestamp_seconds(s: &str) -> Option<u64> {
     Some(days * 86400 + h * 3600 + mi * 60 + se)
 }
 
-/// Where a page moved, when the move stays on the same host over HTTPS without user information.
-fn same_host_move(from: &Url, location: &str) -> Option<Url> {
-    let target = from.join(location).ok()?;
-    (target.scheme() == "https"
-        && target.host_str() == from.host_str()
-        && target.port_or_known_default() == from.port_or_known_default()
-        && target.username().is_empty()
-        && target.password().is_none())
-    .then_some(target)
-}
-
-/// The most same-host moves one original page read follows.
-const MAX_ORIGINAL_REDIRECTS: usize = 3;
-
-async fn original(
-    ctx: &FetchContext,
-    source: &Source,
-    index: Index,
-    url: &Url,
-) -> (Option<String>, Value, Vec<String>, FetchResult) {
-    let mut failures = FetchResult::default();
-    let result = &mut failures;
+/// The published page of a production record. Development and staging records have none.
+async fn original(ctx: &FetchContext, source: &Source, index: Index, url: &Url) -> published::Read {
     if !index.production() {
-        return (
-            None,
-            json!({"kind":"index_record","full_original":false,
-            "limitation":"No published original fetch for development or staging records. Published content can differ."}),
-            vec![],
-            failures,
-        );
+        return published::Read {
+            text: None,
+            meta: json!({"kind":"index_record","full_original":false,
+                "limitation":"No published original fetch for development or staging records. Published content can differ."}),
+            artifacts: vec![],
+            failures: vec![],
+        };
     }
-    let mut candidates = vec![];
-    if index.scope == "DOCS" {
-        let mut md = url.clone();
-        if !md.path().ends_with(".md") {
-            md.set_path(&format!("{}.md", md.path().trim_end_matches('/')));
-        }
-        candidates.push((md, "published_markdown"));
-    }
-    candidates.push((url.clone(), "original_html"));
-    let mut artifacts = vec![];
-    // A server error or a failed transfer is lost evidence; a missing or moved page is not.
-    let mut server_failed = false;
-    let mut hops = 0;
-    let mut next = 0;
-    while next < candidates.len() {
-        let (candidate, kind) = candidates[next].clone();
-        next += 1;
-        match ctx
-            .http
-            .request(Method::GET, candidate.as_str(), vec![], None)
-            .await
-        {
-            Ok(response) => {
-                server_failed |= response.status >= 500;
-                artifacts.push(response.artifact.clone());
-                let text = response.text();
-                let html = text
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("<!doctype html")
-                    || text.trim_start().to_ascii_lowercase().starts_with("<html");
-                if response.status == 200
-                    && !text.trim().is_empty()
-                    && (kind != "published_markdown"
-                        || (!html && !unresolved_markdown_component(&text)))
-                {
-                    let extracted = if kind == "published_markdown" {
-                        markdown_for_scoring(&text)
-                            .map(|text| (text, "published_markdown_main_content"))
-                    } else {
-                        html_article_text(&text)
-                    };
-                    if let Some((scoring_text, scope)) = extracted {
-                        return (
-                            Some(scoring_text),
-                            json!({"kind":kind,"full_original":true,"fetched_url":candidate.as_str(),
-                                "content_scope":scope,"raw_body_chars":text.chars().count(),
-                                "extraction_limitations":[
-                                    "The raw artifact preserves the complete returned body. Scoring text is an extracted representation.",
-                                    "Extraction does not execute scripts or external CSS. Dynamic and externally hidden content remains uncertain.",
-                                    "Markdown can omit generated components. HTML extraction can omit non-text media and layout information."]}),
-                            artifacts,
-                            failures,
-                        );
-                    }
-                }
-
-                failure(
-                    result,
-                    source,
-                    "original",
-                    format!(
-                        "Original request returned HTTP {}, an unusable body, or unresolved Markdown components. Artifact: {}",
-                        response.status, response.artifact
-                    ),
-                );
-            }
-            Err(error) => match error.downcast_ref::<crate::http::Redirected>() {
-                Some(moved) => {
-                    // A page that moved on the same host over HTTPS is read at its new location.
-                    let target = moved
-                        .location
-                        .as_deref()
-                        .and_then(|location| same_host_move(&candidate, location));
-                    match target {
-                        Some(target) if hops < MAX_ORIGINAL_REDIRECTS => {
-                            hops += 1;
-                            candidates.push((target, kind));
-                        }
-                        _ => failure(
-                            result,
-                            source,
-                            "original",
-                            format!(
-                                "Original page moved (HTTP {}) to a location that is not read: another host, not HTTPS, missing, or past {MAX_ORIGINAL_REDIRECTS} moves.",
-                                moved.status
-                            ),
-                        ),
-                    }
-                }
-                None => {
-                    server_failed = true;
-                    failure(
-                        result,
-                        source,
-                        "original",
-                        "Original request failed. The recorder retains available failure evidence.",
-                    )
-                }
-            },
-        }
-    }
-    if server_failed {
-        failure(
-            result,
-            source,
-            "original_lost",
-            format!("The original page {url} failed with a server or transfer error. The indexed record stands in for it."),
-        );
-    }
-    (
-        None,
-        json!({"kind":"index_record","full_original":false,"requested":true,
-        "limitation":"The original document was unavailable. Indexed records can contain only sections or metadata."}),
-        artifacts,
-        failures,
-    )
+    published::read(ctx, source, url, false).await
 }
 
 /// The search host of an Algolia source: its application's endpoint, when configured.
 pub fn search_host(source: &Source) -> Option<String> {
-    let index = indices().find(|index| index.id() == source.id)?;
-    let app = std::env::var(format!("ALGOLIA_APPLICATION_ID_{}", index.scope))
+    indices().find(|index| index.id() == source.id)?;
+    let app = std::env::var("ALGOLIA_APPLICATION_ID_SITE")
         .ok()
         .filter(|s| !s.is_empty())?;
     endpoint(&app, None).ok()?.host_str().map(str::to_owned)
@@ -581,9 +367,9 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
     }
     if ctx.config.fixture {
         result.documents.push(Document { id:format!("{}:fixture",source.id), source_id:source.id.clone(),
-            title:format!("Fixture: {}",index.name),url:if index.scope=="DOCS" {"https://developers.stellar.org/docs/tools/cli/install-cli".into()}else{"https://stellar.org/enterprise-fund".into()},
+            title:format!("Fixture: {}",index.name),url:"https://stellar.org/enterprise-fund".into(),
             text:"Offline Algolia fixture. This is synthetic content, not a live source response.".into(),
-            provenance:json!({"fixture":true,"application":index.scope,"index":index.name,"content_kind":"fixture","full_original":false}),raw_artifacts:vec![] });
+            provenance:json!({"fixture":true,"application":"SITE","index":index.name,"content_kind":"fixture","full_original":false}),raw_artifacts:vec![] });
         return Ok(result);
     }
     let query_plan = crate::query::plan(question);
@@ -598,10 +384,10 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
             ),
         );
     }
-    let app = std::env::var(format!("ALGOLIA_APPLICATION_ID_{}", index.scope))
+    let app = std::env::var("ALGOLIA_APPLICATION_ID_SITE")
         .ok()
         .filter(|s| !s.is_empty());
-    let key = std::env::var(format!("ALGOLIA_API_KEY_{}", index.scope))
+    let key = std::env::var("ALGOLIA_API_KEY_SITE")
         .ok()
         .filter(|s| !s.is_empty());
     let (app, key) = match (app, key) {
@@ -611,7 +397,7 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                 &mut result,
                 source,
                 "authentication",
-                format!("Missing Algolia {} read credentials.", index.scope),
+                "Missing Algolia SITE read credentials.",
             );
             return Ok(result);
         }
@@ -632,38 +418,8 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
         );
     }
     let url = endpoint(&app, Some(index.name))?;
-    let docs_queries = if index.scope == "DOCS" {
-        docs_facet_queries(&query_plan, ctx.config.max_pages, ctx.config.max_documents)
-    } else {
-        Vec::new()
-    };
-    let facet_mode = !docs_queries.is_empty();
-    if facet_mode {
-        let mut seen_facets = HashSet::new();
-        for omitted in query_plan
-            .keyword()
-            .into_iter()
-            .filter(|variant| variant.facet.is_some_and(|facet| seen_facets.insert(facet)))
-            .filter(|variant| !docs_queries.contains(&variant.text))
-        {
-            failure(
-                &mut result,
-                source,
-                "query_plan",
-                format!(
-                    "The query or document limit omitted a DOCS facet: {}",
-                    omitted.text
-                ),
-            );
-        }
-    }
-    let size = if facet_mode {
-        ctx.config.max_documents.saturating_mul(3).min(100)
-    } else {
-        ctx.config.max_documents.min(100)
-    };
+    let size = ctx.config.max_documents.min(100);
     let mut page = 0;
-    let mut relaxed = false;
     let (mut active_query, mut query_kind) = planned_query(index, &query_plan);
     let mut keyword_retry = false;
     let mut variants = Vec::<Value>::new();
@@ -674,24 +430,9 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
     let mut pending: Vec<(usize, Url)> = Vec::new();
     let search = async {
         for request_number in 0..ctx.config.max_pages {
-            let document_ceiling = if facet_mode {
-                let Some(query) = docs_queries.get(request_number) else {
-                    break;
-                };
-                active_query = query.clone();
-                query_kind = "keyword_facet";
-                page = 0;
-                facet_document_ceiling(
-                    ctx.config.max_documents,
-                    result.documents.len(),
-                    docs_queries.len() - request_number,
-                )
-            } else {
-                ctx.config.max_documents
-            };
-            let params = search_params(&active_query, page, size, relaxed);
-            variants.push(json!({"query":active_query,"page":page,"matching_mode":if relaxed {"allOptional"} else {"none"},
-                "kind":query_kind,"variant":if facet_mode {"docs_independent_facet"} else if keyword_retry {"site_shared_keyword_or_local_entity"} else if relaxed {"docs_optional_words"} else {"shared_initial"}}));
+            let params = search_params(&active_query, page, size);
+            variants.push(json!({"query":active_query,"page":page,"matching_mode":"none",
+                "kind":query_kind,"variant":if keyword_retry {"site_shared_keyword_or_local_entity"} else {"shared_initial"}}));
             let response = match ctx
                 .http
                 .request(Method::POST, url.as_str(), headers.clone(), Some(params))
@@ -818,14 +559,7 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                     }
                     continue;
                 }
-                if result.documents.len() >= document_ceiling {
-                    // A later facet can still admit this record into its reserved capacity.
-                    seen.remove(id);
-                    if facet_mode && request_number + 1 < docs_queries.len() {
-                        failure(&mut result, source, "query_facet_limit",
-                            "The connector reserved document capacity for later DOCS facets. Raw responses retain omitted candidates.");
-                        break;
-                    }
+                if result.documents.len() >= ctx.config.max_documents {
                     failure(&mut result,source,"limit","The document limit omitted indexed candidates. Full search responses retain them.");
                     break;
                 }
@@ -849,8 +583,8 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                             .to_owned()
                     }),
                     text: record_text(hit),
-                    provenance: json!({"application":index.scope,"index":index.name,"replica":index.replica(),"production":index.production(),
-                        "query":question,"query_variant":{"kind":query_kind,"text":active_query},"query_used":active_query,"query_variants":variants,"relaxed_query":relaxed,"search_page":page,"records":[hit_provenance(hit)],"content_scope":original_meta.get("content_scope").cloned().unwrap_or(json!("indexed_sections_or_metadata")),
+                    provenance: json!({"application":"SITE","index":index.name,"replica":index.replica(),"production":index.production(),
+                        "query":question,"query_variant":{"kind":query_kind,"text":active_query},"query_used":active_query,"query_variants":variants,"search_page":page,"records":[hit_provenance(hit)],"content_scope":original_meta.get("content_scope").cloned().unwrap_or(json!("indexed_sections_or_metadata")),
                         "extraction_limitations":original_meta.get("extraction_limitations").cloned().unwrap_or(json!(["Only indexed sections or metadata are available."])),"original":original_meta,
                         "index_metadata":null,"index_age_seconds":null,"index_inventory_verified_at_unix":null,
                         "limitations":["Index timestamps do not prove document freshness or corpus completeness.",
@@ -860,25 +594,9 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                 pages_by_url.insert(group, result.documents.len());
                 result.documents.push(doc);
             }
-            if facet_mode {
-                if body
-                    .get("nbPages")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|n| n > 1)
-                {
-                    failure(&mut result, source, "query_facet_limit",
-                        "The bounded DOCS facet search retained one response page. Additional matching records remain unread.");
-                }
-                // Each independent intent gets its reserved capacity before the local cap ends retrieval.
-                if request_number + 1 < docs_queries.len() {
-                    continue;
-                }
-                break;
-            }
             if hits.is_empty()
                 && page == 0
                 && !keyword_retry
-                && index.scope == "SITE"
                 && total == Some(0)
                 && body.get("message").is_none()
                 && request_number + 1 < ctx.config.max_pages
@@ -906,23 +624,6 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                 }
             }
             let pages = body.get("nbPages").and_then(Value::as_u64).unwrap_or(0) as usize;
-            if hits.is_empty()
-                && page == 0
-                && !relaxed
-                && index.scope == "DOCS"
-                && total == Some(0)
-                && body.get("message").is_none()
-                && request_number + 1 < ctx.config.max_pages
-            {
-                relaxed = true;
-                failure(
-                    &mut result,
-                    source,
-                    "query_relaxation",
-                    "The strict search returned no hits. The next query permits optional words.",
-                );
-                continue;
-            }
             if page + 1 >= pages {
                 break;
             }
@@ -942,11 +643,20 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                 .map(|(position, url)| async move {
                     (position, original(ctx, source, index, &url).await)
                 })
-                .buffered(ORIGINAL_READS)
+                .buffered(published::READS)
                 .collect()
                 .await;
-        for (position, (text, meta, artifacts, mut failures)) in originals {
-            result.failures.append(&mut failures.failures);
+        for (
+            position,
+            published::Read {
+                text,
+                meta,
+                artifacts,
+                mut failures,
+            },
+        ) in originals
+        {
+            result.failures.append(&mut failures);
             let doc = &mut result.documents[position];
             if let Some(text) = text {
                 doc.text = text;
@@ -1041,19 +751,16 @@ mod tests {
     #[test]
     fn catalog_avoids_replica_fanout_and_inventory_covers_every_index() {
         let sources = sources();
-        assert_eq!(indices().count(), 20);
-        assert_eq!(sources.len(), 7);
+        assert_eq!(indices().count(), 18);
+        assert_eq!(sources.len(), 6);
         assert_eq!(
             sources.iter().map(|s| &s.id).collect::<HashSet<_>>().len(),
-            7
+            6
         );
     }
     #[test]
     fn spanish_originals_use_the_verified_locale_prefix() {
-        let index = Index {
-            scope: "SITE",
-            name: "pages_es",
-        };
+        let index = Index { name: "pages_es" };
         assert_eq!(
             canonical(index, &json!({"url":"/fondo-empresarial#x"}))
                 .unwrap()
@@ -1069,10 +776,7 @@ mod tests {
     }
     #[test]
     fn originals_never_use_an_untrusted_host_or_scheme() {
-        let index = Index {
-            scope: "SITE",
-            name: "pages",
-        };
+        let index = Index { name: "pages" };
         for url in [
             "https://evil.test/page",
             "//evil.test/page",
@@ -1104,7 +808,7 @@ mod tests {
     }
     #[test]
     fn searches_always_disable_analytics_and_retrieve_all_attributes() {
-        let p = search_params("q", 1, 20, false);
+        let p = search_params("q", 1, 20);
         assert_eq!(p["analytics"], false);
         assert_eq!(p["clickAnalytics"], false);
         assert_eq!(p["distinct"], false);
@@ -1146,84 +850,20 @@ mod tests {
     fn initial_query_uses_shared_content_words_and_respects_index_language() {
         let plan = crate::query::plan("How do I rotate expired Widgetd signing keys?");
         assert_eq!(
-            planned_query(
-                Index {
-                    scope: "DOCS",
-                    name: DOCS[0]
-                },
-                &plan
-            ),
+            planned_query(Index { name: "pages" }, &plan),
             ("rotate expired Widgetd signing keys".into(), "keywords")
         );
         let spanish = crate::query::plan(
             "¿Dónde encuentro documentación sobre límites y firmas de transacciones de Widgetd?",
         );
         assert_eq!(
-            planned_query(
-                Index {
-                    scope: "SITE",
-                    name: "pages_es"
-                },
-                &spanish
-            )
-            .0,
+            planned_query(Index { name: "pages_es" }, &spanish).0,
             spanish.keyword_text()
         );
         assert_eq!(
-            planned_query(
-                Index {
-                    scope: "SITE",
-                    name: "pages"
-                },
-                &spanish
-            ),
+            planned_query(Index { name: "pages" }, &spanish),
             ("Widgetd".into(), "entity")
         );
-    }
-    #[test]
-    fn docs_plan_separates_independent_intents_before_optional_word_noise() {
-        let plan = crate::query::plan(
-            "Find sources on rotating signer keys and recovering locked accounts.",
-        );
-        let queries = docs_facet_queries(&plan, 2, 3);
-        assert_eq!(
-            queries,
-            ["rotating signer keys", "recovering locked accounts"]
-        );
-        for query in queries {
-            let request = search_params(&query, 0, 9, false);
-            assert_eq!(request["removeWordsIfNoResults"], "none");
-            assert_eq!(request["analytics"], false);
-        }
-    }
-    #[test]
-    fn docs_facet_budget_reserves_both_intents_and_keeps_single_intent_behavior() {
-        assert_eq!(facet_document_ceiling(3, 0, 2), 1);
-        assert_eq!(facet_document_ceiling(3, 1, 1), 3);
-        let broad = crate::query::plan("Find SEP-99 onboarding and SEP-98 token usage sources");
-        let queries = docs_facet_queries(&broad, 2, 3);
-        assert_eq!(queries.len(), 2);
-        assert!(queries[0].contains("SEP-99"));
-        assert!(queries[1].contains("SEP-98"));
-        assert!(docs_facet_queries(&broad, 1, 3).is_empty());
-        assert!(docs_facet_queries(&broad, 2, 1).is_empty());
-        let single = crate::query::plan("How do I rotate expired Widgetd signing keys?");
-        assert!(docs_facet_queries(&single, 2, 3).is_empty());
-    }
-    #[test]
-    fn only_canonical_site_pages_are_fetched_again() {
-        assert!(is_canonical_page("https://developers.stellar.org/docs/a"));
-        assert!(is_canonical_page("https://stellar.org/blog/x"));
-        for url in [
-            "http://stellar.org/blog/x",
-            "https://internal.example/a",
-            "https://user:pw@stellar.org/a",
-            "https://stellar.org:8443/a",
-            "https://stellar.org/a%2F..%2Fb",
-            "https://evil.stellar.org.example/a",
-        ] {
-            assert!(!is_canonical_page(url), "{url}");
-        }
     }
     #[tokio::test]
     async fn fixture_runs_without_credentials_or_network() {
@@ -1247,28 +887,5 @@ mod tests {
             assert!(a.documents[0].raw_artifacts.is_empty());
         }
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_moved_original_is_followed_only_on_the_same_host_over_https() {
-        let from = Url::parse("https://fernlet.test/connect").unwrap();
-        assert_eq!(
-            same_host_move(&from, "/community").unwrap().as_str(),
-            "https://fernlet.test/community"
-        );
-        assert_eq!(
-            same_host_move(&from, "https://fernlet.test/a?b=1")
-                .unwrap()
-                .as_str(),
-            "https://fernlet.test/a?b=1"
-        );
-        for refused in [
-            "https://quillon.test/community",
-            "http://fernlet.test/community",
-            "https://user:pw@fernlet.test/community",
-            "https://fernlet.test:8443/community",
-        ] {
-            assert!(same_host_move(&from, refused).is_none(), "{refused}");
-        }
     }
 }

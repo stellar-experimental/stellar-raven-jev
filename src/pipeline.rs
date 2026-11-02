@@ -1725,8 +1725,8 @@ async fn backfill_page_dates(http: &HttpRecorder, evidence: &mut Evidence, today
         .iter()
         .enumerate()
         .filter(|(_, d)| {
-            d.source_id.starts_with("algolia:")
-                && connectors::algolia::is_canonical_page(&d.url)
+            (d.source_id.starts_with("algolia:") || d.source_id == connectors::mintlify::SOURCE_ID)
+                && connectors::published::is_canonical_page(&d.url)
                 && !crate::rank::document_date(d, today)
                     .is_some_and(|x| crate::rank::drives_recency(x.kind))
         })
