@@ -38,7 +38,9 @@ It also explains how searches on one host share capacity, and what a run folder 
 The developer-docs connector asks the Mintlify search for 50 sections per request.
 The search returns no scores or counts, and it returns its nearest sections even for a topic the docs do not cover.
 When no returned section holds a query term, the connector keeps no section and adds a `search_notice` report.
+The first path segment (`docs`, `meetings`) does not count as a match, because every page has one.
 Such a result does not show that the docs lack the topic. The connector keeps one document for each page.
+Pages that hold a query term come first, then the others, each group in search order, up to the document limit.
 
 The tool asks the same general questions of every question and every document.
 No code path depends on the topic of a question. See [AGENTS.md](../AGENTS.md).
@@ -145,6 +147,8 @@ The lean first pass, `--fetch-threshold 0.4 --score-depth 4`, does less at first
 reached the uncertain threshold, and unfetched sources routed within 0.1 of the fetch threshold.
 Each row gives facts only: the source, its routing score, its state, and the pending documents.
 It also gives what the session already scored and selected from that source.
+A pool is `unavailable` when it names a routed source that this version no longer has. `more` cannot fetch it,
+`pools.unavailable` counts it, and `more --pool` with its ID fails. Start a new search to use the current sources.
 
 `more` spends pools. It fetches or scores them against the original question, removes documents that the
 session already holds, and prints the re-ranked session. Fetches are booked in source request windows as in `search`.
@@ -263,7 +267,8 @@ A source can slow down under load before its rate window fills. A slow source is
   It also retries a request once when it fails before a complete response, unless the cause is a timeout. It waits for Scout's `Retry-After` plus up to 500 ms, or 250 to 750 ms without one.
   A `Retry-After` above 4 seconds is not retried. A retry starts only if at least 1 second of the fetch deadline remains after its wait; the deadline can still cut it.
 - The developer-docs search retries an HTTP 5xx response or a failure before a complete response, timeouts included, once.
-  It waits 250 to 750 ms, and it retries only if 1 second of the fetch deadline remains. It never retries a 4xx response.
+  It waits 250 to 750 ms. It retries only if at least 1 second of the fetch deadline remains after its wait.
+  It never retries a 4xx response, even when the body of that response fails.
 - A Scout HTTP failure report names Scout's `Retry-After` and the `error` field of its JSON body, when Scout sent them.
 - Scout failure and fallback reports end with Scout's request ID, `Server-Timing`, and match mode.
 

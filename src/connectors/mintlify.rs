@@ -225,16 +225,19 @@ fn query_terms(query: &str) -> Vec<String> {
     terms
 }
 
-/// Whether a section holds a query term at a word start, in its title, path, or content. A query
-/// without terms matches every section.
+/// Whether a section holds a query term at a word start, in its title, its path after the first
+/// segment, or its content. Every path starts with a section of the site (`docs/`, `meetings/`),
+/// so that segment shows no match. A query without terms matches every section.
 fn mentions(section: &Section, terms: &[String]) -> bool {
     if terms.is_empty() {
         return true;
     }
-    let haystack = normalized(&format!(
-        "{} {} {}",
-        section.title, section.path, section.content
-    ));
+    let path = section
+        .path
+        .trim_start_matches('/')
+        .split_once('/')
+        .map_or("", |(_, rest)| rest);
+    let haystack = normalized(&format!("{} {} {}", section.title, path, section.content));
     terms
         .iter()
         .any(|term| haystack.contains(&format!(" {term}")))
@@ -255,36 +258,52 @@ fn clean_section(content: &str) -> String {
         .join("\n")
 }
 
-/// The first heading of a section, when it starts with one.
+/// The first heading of a section, when it starts with one. A closing `#` run is removed only
+/// when a space comes before it, so `## Using C#` keeps its `#`.
 fn heading(content: &str) -> Option<String> {
     let line = content.trim_start().lines().next()?;
     let text = line.trim_start_matches('#');
-    (text.len() < line.len() && text.starts_with(' '))
-        .then(|| text.trim().trim_end_matches('#').trim().to_owned())
-        .filter(|text| !text.is_empty())
+    if text.len() == line.len() || !text.starts_with(' ') {
+        return None;
+    }
+    let text = text.trim();
+    let open = text.trim_end_matches('#');
+    let text = if open.len() < text.len() && (open.is_empty() || open.ends_with(' ')) {
+        open.trim_end()
+    } else {
+        text
+    };
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// Published Markdown without the documentation-index notice that the site puts before each page:
-/// a block quote ahead of the first line that is not one.
+/// the first block quote, when the page starts with one, and the blank lines after it. A later
+/// block quote stays.
 fn without_index_notice(text: &str) -> String {
+    if !text.trim_start().starts_with('>') {
+        return text.to_owned();
+    }
     let rest: Vec<&str> = text
+        .trim_start()
         .lines()
-        .skip_while(|line| line.trim_start().starts_with('>') || line.trim().is_empty())
+        .skip_while(|line| line.trim_start().starts_with('>'))
+        .skip_while(|line| line.trim().is_empty())
         .collect();
-    if rest.is_empty() || !text.trim_start().starts_with('>') {
+    if rest.is_empty() {
         return text.to_owned();
     }
     rest.join("\n")
 }
 
-/// Whether a search outcome may be repeated: a server error or a failure before a complete
-/// response, including a timeout. A 4xx answer is final, and so is a refusal by a rate limit.
+/// Whether a search outcome may be repeated: a server error, or a failure before a complete
+/// response (a timeout too) unless a status below 500 had already arrived. A 4xx answer is final,
+/// even when its body then fails, and so is a refusal by a rate limit.
 fn retryable(outcome: &anyhow::Result<crate::http::HttpResponse>) -> bool {
     match outcome {
         Ok(response) => response.status >= 500,
         Err(error) => error
             .downcast_ref::<crate::http::TransportFailure>()
-            .is_some(),
+            .is_some_and(|failure| failure.status.is_none_or(|status| status >= 500)),
     }
 }
 
@@ -544,8 +563,26 @@ async fn search(
             );
             continue;
         }
-        for (rank, section) in sections.iter().enumerate() {
-            let Some(page) = page_url(&section.path) else {
+        // Pages that hold a query term come first, each group in search order, so the document
+        // limit cuts nearest pages without a term before pages with one. A later section joins
+        // the page it belongs to.
+        let pages: Vec<Option<Url>> = sections.iter().map(|s| page_url(&s.path)).collect();
+        let holding: HashSet<String> = sections
+            .iter()
+            .zip(&pages)
+            .filter(|(section, _)| mentions(section, &terms))
+            .filter_map(|(_, page)| page.as_ref().map(Url::to_string))
+            .collect();
+        let mut order: Vec<usize> = (0..sections.len()).collect();
+        order.sort_by_key(|&rank| {
+            !pages[rank]
+                .as_ref()
+                .is_some_and(|page| holding.contains(page.as_str()))
+        });
+        let mut omitted = false;
+        for rank in order {
+            let section = &sections[rank];
+            let Some(page) = pages[rank].clone() else {
                 failure(
                     result,
                     source,
@@ -576,18 +613,8 @@ async fn search(
                 continue;
             }
             if result.documents.len() >= ceiling {
-                let stage = if number + 1 < queries.len() {
-                    "query_facet_limit"
-                } else {
-                    "limit"
-                };
-                failure(
-                    result,
-                    source,
-                    stage,
-                    "The document limit omitted pages the search returned. The search response retains them.",
-                );
-                break;
+                omitted = true;
+                continue;
             }
             let title = if section.title.is_empty() {
                 page.path()
@@ -615,6 +642,19 @@ async fn search(
                     "limitations":["The search returns its nearest sections without scores or counts. A page it did not return can still hold the answer."]}),
                 raw_artifacts: vec![response.artifact.clone()],
             });
+        }
+        if omitted {
+            let stage = if number + 1 < queries.len() {
+                "query_facet_limit"
+            } else {
+                "limit"
+            };
+            failure(
+                result,
+                source,
+                stage,
+                "The document limit omitted pages the search returned. The search response retains them.",
+            );
         }
     }
     pending
@@ -725,6 +765,19 @@ mod tests {
             &query_terms("rotate Stellar")
         ));
         assert!(mentions(&section("docs/a", "", ""), &query_terms("a an")));
+        // The first path segment is the site's section, shared by every row.
+        assert!(!mentions(
+            &section("docs/fernlet", "Fernlet", "Fernlet text"),
+            &query_terms("docs")
+        ));
+        assert!(!mentions(
+            &section("meetings/2031/01/02/x", "", ""),
+            &query_terms("meetings")
+        ));
+        assert!(mentions(
+            &section("docs/meetings-guide", "", ""),
+            &query_terms("meetings")
+        ));
     }
 
     #[test]
@@ -735,6 +788,9 @@ mod tests {
             "## Install\n\n```sh\nquillon add\n```"
         );
         assert_eq!(heading(content).as_deref(), Some("Install"));
+        assert_eq!(heading("## Using C#").as_deref(), Some("Using C#"));
+        assert_eq!(heading("## Receipts ##").as_deref(), Some("Receipts"));
+        assert_eq!(heading("### Quillon #2 #").as_deref(), Some("Quillon #2"));
         assert_eq!(heading("Plain text"), None);
         let page = "> ## Documentation Index\n> Fetch the index.\n\n# Receipts\n\n> Batching receipts.\n\nBody";
         assert_eq!(
@@ -744,6 +800,11 @@ mod tests {
         assert_eq!(
             without_index_notice("# Receipts\n\nBody"),
             "# Receipts\n\nBody"
+        );
+        // Only the first block quote is the notice; a later one is page text.
+        assert_eq!(
+            without_index_notice("> Notice.\n\n> A note that is page text.\n\n# Receipts"),
+            "> A note that is page text.\n\n# Receipts"
         );
     }
 
@@ -832,9 +893,21 @@ mod tests {
         replies: Vec<String>,
         question: &str,
     ) -> (FetchResult, Vec<(usize, Url)>, Vec<String>, String) {
+        search_within(replies, question, None, RunConfig::default().max_documents).await
+    }
+
+    /// `search_with`, with a fetch deadline `deadline` from now and a document limit.
+    async fn search_within(
+        replies: Vec<String>,
+        question: &str,
+        deadline: Option<std::time::Duration>,
+        max_documents: usize,
+    ) -> (FetchResult, Vec<(usize, Url)>, Vec<String>, String) {
         let (addr, seen) = replying(replies).await;
         let dir = tempfile::tempdir().unwrap();
-        let ctx = loopback(dir.path());
+        let mut ctx = loopback(dir.path());
+        ctx.deadline = deadline.map(|d| tokio::time::Instant::now() + d);
+        ctx.config.max_documents = max_documents;
         let mut result = FetchResult::default();
         let plan = crate::query::plan(question);
         let pending = search(
@@ -996,6 +1069,93 @@ mod tests {
         .await;
         assert_eq!(requests.len(), 1);
         assert_eq!(result.failures[0].stage, "search");
+    }
+
+    #[tokio::test]
+    async fn a_failure_before_a_response_is_retried_unless_the_deadline_is_close() {
+        let question = "How does Quillon batch receipts?";
+        let ok = json!([{"path":"docs/quillon","content":"Quillon receipts","metadata":{"title":"Quillon"}}])
+            .to_string();
+        // An empty reply closes the connection without a response.
+        let (result, _, requests, _) =
+            search_with(vec![String::new(), reply("200 OK", &ok)], question).await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(result.documents.len(), 1);
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+
+        let (result, _, requests, _) = search_within(
+            vec![reply("503 Service Unavailable", "{}"), reply("200 OK", &ok)],
+            question,
+            Some(std::time::Duration::from_millis(300)),
+            RunConfig::default().max_documents,
+        )
+        .await;
+        assert_eq!(requests.len(), 1);
+        let failure = &result.failures[0];
+        assert_eq!(failure.stage, "search");
+        assert!(
+            failure.message.contains("not retried"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_4xx_whose_body_fails_is_not_retried() {
+        let ok = json!([{"path":"docs/quillon","content":"Quillon","metadata":{"title":"Q"}}])
+            .to_string();
+        for status in ["401 Unauthorized", "429 Too Many Requests"] {
+            // The body is shorter than its declared length, so reading it fails.
+            let incomplete = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 200\r\nConnection: close\r\n\r\n{{}}"
+            );
+            let (result, _, requests, _) =
+                search_with(vec![incomplete, reply("200 OK", &ok)], "Quillon receipts").await;
+            assert_eq!(requests.len(), 1, "{status}");
+            assert!(result.documents.is_empty());
+            assert_eq!(result.failures[0].stage, "search", "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pages_that_hold_a_query_term_are_kept_before_nearer_pages_without_one() {
+        let mut rows: Vec<Value> = (0..12)
+            .map(|i| json!({"path":format!("docs/fernlet/{i}"),"content":"Fernlet overview","metadata":{"title":"Fernlet"}}))
+            .collect();
+        rows.push(json!({"path":"docs/fernlet/receipts","content":"Quillon batches receipts.","metadata":{"title":"Batching"}}));
+        rows.push(json!({"path":"docs/fernlet/0","content":"More overview","metadata":{"title":"Fernlet"}}));
+        let (result, pending, _, _) = search_within(
+            vec![reply("200 OK", &Value::Array(rows).to_string())],
+            "How does Quillon batch receipts?",
+            None,
+            12,
+        )
+        .await;
+        assert_eq!(result.documents.len(), 12);
+        assert_eq!(pending.len(), 12);
+        assert_eq!(
+            result.documents[0].url,
+            "https://developers.stellar.org/docs/fernlet/receipts"
+        );
+        assert!(result
+            .documents
+            .iter()
+            .all(|d| d.url != "https://developers.stellar.org/docs/fernlet/11"));
+        // A later section joins a kept page, even at the limit.
+        let first = result
+            .documents
+            .iter()
+            .find(|d| d.url.ends_with("/fernlet/0"))
+            .unwrap();
+        assert_eq!(first.provenance["records"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            result
+                .failures
+                .iter()
+                .filter(|f| f.stage == "limit")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
