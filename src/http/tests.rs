@@ -420,8 +420,10 @@ async fn a_retry_receipt_names_its_role_and_the_attempt_it_repeats() {
     let (url, _, _) = scripted_server(vec![(after(0), OK)]).await;
     recorder
         .request_retry(
+            Method::GET,
             &url,
             vec![],
+            None,
             Some("raw/000041.body.gz".into()),
             Some("race-c".into()),
         )

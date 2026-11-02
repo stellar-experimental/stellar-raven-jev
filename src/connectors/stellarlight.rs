@@ -202,7 +202,14 @@ async fn read(
                 tokio::time::sleep(delay).await;
                 response = ctx
                     .http
-                    .request_retry(url, auth_headers(), parent, Some(race.clone()))
+                    .request_retry(
+                        reqwest::Method::GET,
+                        url,
+                        auth_headers(),
+                        None,
+                        parent,
+                        Some(race.clone()),
+                    )
                     .await;
             }
             Err(reason) => not_retried = Some(reason),

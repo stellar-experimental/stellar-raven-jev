@@ -1468,12 +1468,14 @@ impl HttpRecorder {
         .await
     }
 
-    /// A source GET that repeats an earlier attempt: its receipt has role `retry` and names the
+    /// A source request that repeats an earlier attempt: its receipt has role `retry` and names the
     /// attempt it repeats. It is never hedged.
     pub async fn request_retry(
         &self,
+        method: Method,
         url: &str,
         headers: Vec<(String, String)>,
+        body: Option<Value>,
         parent: Option<String>,
         parent_race: Option<String>,
     ) -> Result<HttpResponse> {
@@ -1484,10 +1486,10 @@ impl HttpRecorder {
             ..AttemptTag::default()
         };
         self.request_recorded(
-            Method::GET,
+            method,
             url,
             headers,
-            None,
+            body,
             true,
             SendGate {
                 tag: Some(&tag),
