@@ -43,8 +43,8 @@ cargo test --locked
 | `src/jev.rs` | Jev requests, the provider chain, budgets, reservations, and hedging |
 | `src/http.rs` | The recording HTTP client, source rate-limit gates, source hedging, and the original-page client |
 | `src/governor.rs` | Host-wide state shared between processes: admission slots, Jev send budgets, source windows, and fetch slots |
-| `src/connectors/` | One file per source family (`algolia.rs`, `lumenloop.rs`, `stellarlight.rs`), plus `original.rs` for original pages and `mod.rs` for the source registry |
-| `src/extract.rs` | Shared HTML and Markdown text extraction, used by the Algolia connector and the original-page reader |
+| `src/connectors/` | One file per source family (`algolia.rs`, `lumenloop.rs`, `mintlify.rs`, `stellarlight.rs`), plus `published.rs` for the pages that search connectors read, `original.rs` for original pages, and `mod.rs` for the source registry |
+| `src/extract.rs` | Shared HTML and Markdown text extraction, used by the published-page and original-page readers |
 | `src/query.rs` | The query planner: keyword and semantic queries from the words of the question |
 | `src/rank.rs` | Dates, authority tiers, and the final ranking |
 | `src/search.rs` | The report, the compact output, and the evidence bundle |

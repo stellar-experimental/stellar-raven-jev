@@ -35,6 +35,11 @@ It also explains how searches on one host share capacity, and what a run folder 
 8. Duplicates. Documents with the same URL, title, and text are scored once.
    The score, or the failure, is copied to each ID with its own provenance.
 
+The developer-docs connector asks the Mintlify search for 50 sections per request.
+The search returns no scores or counts, and it returns its nearest sections even for a topic the docs do not cover.
+When no returned section holds a query term, the connector keeps no section and adds a `search_notice` report.
+Such a result does not show that the docs lack the topic. The connector keeps one document for each page.
+
 The tool asks the same general questions of every question and every document.
 No code path depends on the topic of a question. See [AGENTS.md](../AGENTS.md).
 
@@ -188,7 +193,8 @@ The reader uses its own HTTP client:
 - It refuses a page with more than 4,096 open elements or 250,000 tags.
 - It skips a host that has a fetch-slot cap.
 
-The Algolia docs and site connectors read a record's published page with the source client, which sends no keys there.
+The developer-docs and stellar.org site connectors read each page they find with the source client, which sends no keys there.
+The developer-docs connector reads the page's published Markdown (`<page>.md`) first, then its HTML.
 A page that moved on the same host over HTTPS is read at its new location, at most 3 moves.
 A move to another host or off HTTPS is not followed; the indexed record stands in, and it is not lost evidence.
 
@@ -228,6 +234,8 @@ These defaults stay below the rates at which the providers refuse requests.
   A window marked `x-ratelimit-scope: instance` describes one serving instance, not the host, so it is not kept.
 - The tool keeps each Scout host at or under 32 requests in flight and 600 research requests per minute.
   An advertised window never raises this limit.
+- Mintlify allows 10,000 developer-docs search requests per hour for its whole organization, shared with other clients.
+  The tool does not count this window. A question sends one docs search, or one for each facet, up to `--max-pages`.
 - After routing, a question books the first request of every selected source, all at once or not at all.
   It waits up to 65 seconds for room. Without room, it prints `busy` with `retry_after_ms`. Only routing was spent.
 - Every other request is checked when it is sent. At a closed window it waits at most 4 seconds.

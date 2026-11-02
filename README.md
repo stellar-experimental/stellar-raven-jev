@@ -5,7 +5,7 @@ It searches 45 Stellar sources and scores each document with Jev, a relevance mo
 It prints compact JSON: ranked results with URLs, short excerpts, and paths to the full text.
 It does not write answers. The agent reads the text and writes the answer.
 
-The sources are LumenLoop, the Algolia indexes of the Stellar developer docs and stellar.org, and Stellar Scout.
+The sources are LumenLoop, the Stellar developer docs search on Mintlify, the Algolia indexes of stellar.org, and Stellar Scout.
 Stellar Scout is the research API of Stellar Light (`stellarlight.xyz`).
 
 ## Install
@@ -26,7 +26,7 @@ Or copy `skills/stellar-raven-jev/` into the skills folder of your agent.
 
 Copy [`.env.example`](.env.example) to `.env` and fill it in. You need:
 
-- The LumenLoop and Algolia source keys. Stellar Scout needs no key.
+- The LumenLoop, Mintlify, and Algolia source keys. Stellar Scout needs no key.
 - At least one Jev provider: Cloudflare Workers AI, TypeSafe, or OpenRouter.
 - `JEV_BUDGET_USD`, the Jev spending limit for one call. Live calls need a value above 0 and at most 100.
 

@@ -24,7 +24,7 @@ Such a key, token, or gateway ID fails at startup. The error names the setting.
 | Source | Settings |
 |---|---|
 | LumenLoop | `LUMENLOOP_API_KEY` |
-| Algolia, Stellar developer docs | `ALGOLIA_APPLICATION_ID_DOCS`, `ALGOLIA_API_KEY_DOCS` |
+| Mintlify, Stellar developer docs | `MINTLIFY_ASSISTANT_API_KEY`, a project assistant key with the prefix `mint_dsc_`. Never use an admin key. |
 | Algolia, stellar.org | `ALGOLIA_APPLICATION_ID_SITE`, `ALGOLIA_API_KEY_SITE` |
 | Stellar Scout (`stellarlight.xyz`) | None. `STELLAR_LIGHT_API_KEY` is an optional Stellar Scout partner key, sent as a bearer token. |
 
