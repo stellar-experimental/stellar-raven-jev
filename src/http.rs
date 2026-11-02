@@ -726,6 +726,9 @@ pub struct TransportFailure {
     /// closed connection can also come before the request. A connection still not open at the
     /// request time limit is not marked, because that limit is not a connect-phase error.
     pub unsent: bool,
+    /// The HTTP status that arrived before the body failed. `None` when the request failed
+    /// before a response.
+    pub status: Option<u16>,
     text: String,
 }
 
@@ -734,6 +737,7 @@ impl TransportFailure {
         Self {
             cause: transport_cause(error),
             unsent: error.is_connect(),
+            status: None,
             text,
         }
     }
@@ -1468,12 +1472,14 @@ impl HttpRecorder {
         .await
     }
 
-    /// A source GET that repeats an earlier attempt: its receipt has role `retry` and names the
+    /// A source request that repeats an earlier attempt: its receipt has role `retry` and names the
     /// attempt it repeats. It is never hedged.
     pub async fn request_retry(
         &self,
+        method: Method,
         url: &str,
         headers: Vec<(String, String)>,
+        body: Option<Value>,
         parent: Option<String>,
         parent_race: Option<String>,
     ) -> Result<HttpResponse> {
@@ -1484,10 +1490,10 @@ impl HttpRecorder {
             ..AttemptTag::default()
         };
         self.request_recorded(
-            Method::GET,
+            method,
             url,
             headers,
-            None,
+            body,
             true,
             SendGate {
                 tag: Some(&tag),
@@ -1921,7 +1927,13 @@ impl HttpRecorder {
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
                     let e = e.without_url();
-                    TransportFailure::new(&e, format!("Response body failed: {e}"))
+                    TransportFailure {
+                        status: Some(status),
+                        ..TransportFailure::new(
+                            &e,
+                            format!("Response body failed after HTTP {status}: {e}"),
+                        )
+                    }
                 })?;
                 let available = self.config.max_body_bytes.saturating_sub(bytes.len());
                 let mut retain_count = chunk.len().min(available);

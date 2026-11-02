@@ -1,6 +1,8 @@
 pub mod algolia;
 pub mod lumenloop;
+pub mod mintlify;
 pub mod original;
+pub(crate) mod published;
 pub mod stellarlight;
 
 use crate::types::*;
@@ -21,7 +23,7 @@ impl SourceScope {
             Self::All => true,
             Self::Agentic => matches!(
                 source.id.as_str(),
-                "algolia:docs:primary"
+                "mintlify:docs"
                     | "stellarlight.skills"
                     | "stellarlight.repos"
                     | "stellarlight.contracts"
@@ -47,6 +49,7 @@ impl SourceScope {
 pub fn sources() -> Vec<Source> {
     let mut result = lumenloop::sources();
     result.extend(stellarlight::sources());
+    result.extend(mintlify::sources());
     result.extend(algolia::sources());
     result
 }
@@ -72,6 +75,7 @@ pub fn search_host(source: &Source) -> Option<String> {
     match source.family.as_str() {
         "stellarlight" => stellarlight::host(),
         "lumenloop" => lumenloop::host(),
+        "mintlify" => mintlify::search_host(),
         "algolia" => algolia::search_host(source),
         _ => None,
     }
@@ -171,6 +175,7 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
     match source.family.as_str() {
         "lumenloop" => lumenloop::fetch(ctx, source, question).await,
         "stellarlight" => stellarlight::fetch(ctx, source, question).await,
+        "mintlify" => mintlify::fetch(ctx, source, question).await,
         "algolia" => algolia::fetch(ctx, source, question).await,
         family => bail!("Unknown connector family: {family}"),
     }

@@ -21,7 +21,7 @@ Never send API keys or `.env` files.
 
 In scope: the `stellar-raven-jev` binary and the agent skill in this repository.
 
-Out of scope: LumenLoop, Algolia, Stellar Scout, Cloudflare, TypeSafe, OpenRouter, and the pages the tool reads.
+Out of scope: LumenLoop, Mintlify, Algolia, Stellar Scout, Cloudflare, TypeSafe, OpenRouter, and the pages the tool reads.
 Report problems in those services to their operators.
 
 This repository is not part of the Stellar Development Foundation bug bounty program.

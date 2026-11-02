@@ -179,7 +179,7 @@ fn source() -> Source {
     Source {
         id: "docs".into(),
         name: "Official docs".into(),
-        family: "algolia".into(),
+        family: "mintlify".into(),
         description: "Official developer documentation".into(),
     }
 }

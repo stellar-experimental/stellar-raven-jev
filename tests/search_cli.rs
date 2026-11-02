@@ -324,10 +324,10 @@ fn a_session_spends_its_pools_and_checks_claims() {
     assert!(pools.iter().all(|p| p["state"] == "unfetched"));
     let pool = pools
         .iter()
-        .find(|p| p["id"] == "algolia:docs:primary")
+        .find(|p| p["id"] == "mintlify:docs")
         .expect("the docs index is an open pool");
     assert_eq!(pool["source_requests"], 1);
-    let more = run(&["more", &session, "--pool", "algolia:docs:primary"]);
+    let more = run(&["more", &session, "--pool", "mintlify:docs"]);
     assert_eq!(more["session"]["calls"], 2);
     assert_eq!(more["session"]["documents_scored"], 1);
     assert_eq!(more["results"].as_array().unwrap().len(), 1);
@@ -335,7 +335,7 @@ fn a_session_spends_its_pools_and_checks_claims() {
         .as_array()
         .unwrap()
         .iter()
-        .all(|p| p["id"] != "algolia:docs:primary"));
+        .all(|p| p["id"] != "mintlify:docs"));
     // A text path stays the same when later calls re-rank the session.
     let text_path = more["results"][0]["text_path"].as_str().unwrap().to_owned();
     let unknown = cli()
@@ -365,7 +365,86 @@ fn a_session_spends_its_pools_and_checks_claims() {
         .collect();
     assert_eq!(calls.into_iter().collect::<Vec<_>>(), vec![2, 4]);
     assert_eq!(all["pools"]["actionable"].as_array().unwrap().len(), 0);
-    assert_eq!(all["results"][0]["text_path"], text_path.as_str());
+    let title = &more["results"][0]["title"];
+    let same = all["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| &r["title"] == title)
+        .expect("the docs result stays in the session");
+    assert_eq!(same["text_path"], text_path.as_str());
+}
+
+#[test]
+fn a_saved_pool_of_a_source_this_version_lacks_is_unavailable() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = |args: &[&str]| {
+        cli()
+            .args(["--fixture", "--output-dir"])
+            .arg(temp.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let json = |output: std::process::Output| -> Value {
+        assert!(
+            matches!(output.status.code(), Some(0 | 2)),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let first = json(command(&[
+        "search",
+        "How does the fictional Quillon ledger batch its receipts?",
+        "--fetch-threshold",
+        "0.9",
+    ]));
+    let session = first["session"]["id"].as_str().unwrap().to_owned();
+    // The session routed a source that a later version no longer registers.
+    let decisions = std::path::Path::new(&session).join("source-decisions.json");
+    let saved = std::fs::read_to_string(&decisions).unwrap();
+    assert!(saved.contains("\"mintlify:docs\""));
+    std::fs::write(
+        &decisions,
+        saved.replace("\"mintlify:docs\"", "\"retired.quillon\""),
+    )
+    .unwrap();
+
+    let explicit = command(&["more", &session, "--pool", "retired.quillon"]);
+    assert_eq!(explicit.status.code(), Some(1));
+    assert!(explicit.stdout.is_empty());
+    let message = String::from_utf8_lossy(&explicit.stderr);
+    assert!(message.contains("retired.quillon"), "{message}");
+    assert!(message.contains("Start a new search"), "{message}");
+
+    let all = json(command(&["more", &session, "--all"]));
+    // The refused call did not count as a session call.
+    assert_eq!(all["session"]["calls"], 2);
+    assert_eq!(all["pools"]["unavailable"], 1);
+    assert_eq!(all["pools"]["unfetched"], 0);
+    assert!(all["pools"]["actionable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["id"] != "retired.quillon"));
+    let pools = stellar_raven_jev::session::pools_view(std::path::Path::new(&session)).unwrap();
+    let row = pools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "retired.quillon")
+        .expect("the unavailable pool is listed");
+    assert_eq!(row["state"], "unavailable");
+    assert_eq!(row["source_requests"], 0);
+
+    let again = command(&["more", &session, "--all"]);
+    assert_eq!(again.status.code(), Some(1));
+    let message = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        message.contains("Unavailable sources: retired.quillon"),
+        "{message}"
+    );
 }
 
 #[test]

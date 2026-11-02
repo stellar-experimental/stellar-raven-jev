@@ -85,7 +85,8 @@ Pools list what a session has not spent: sources routed but not fetched, and fet
 not yet scored. `pools.actionable` lists only pools with a signal. `more` scores or fetches them
 against the original question and prints the re-ranked session. When part of the question has
 no support at all, a narrower `search` works better than `more`. A default search fetches and
-scores everything, so it normally leaves no pools.";
+scores everything, so it normally leaves no pools. An `unavailable` pool names a routed source
+that this version no longer has: `more` cannot fetch it, so start a new search.";
 
 #[derive(Parser)]
 #[command(
@@ -546,10 +547,7 @@ fn source_credentials(present: impl Fn(&str) -> bool) -> serde_json::Value {
     let mut sources = serde_json::Map::new();
     for (source, keys) in [
         ("lumenloop", &["LUMENLOOP_API_KEY"][..]),
-        (
-            "algolia_docs",
-            &["ALGOLIA_APPLICATION_ID_DOCS", "ALGOLIA_API_KEY_DOCS"][..],
-        ),
+        ("mintlify_docs", &["MINTLIFY_ASSISTANT_API_KEY"][..]),
         (
             "algolia_site",
             &["ALGOLIA_APPLICATION_ID_SITE", "ALGOLIA_API_KEY_SITE"][..],
@@ -1152,13 +1150,18 @@ mod tests {
     #[test]
     fn doctor_reports_source_presence_and_missing_keys_without_values() {
         let credentials = source_credentials(|key| {
-            matches!(key, "LUMENLOOP_API_KEY" | "ALGOLIA_APPLICATION_ID_DOCS")
+            matches!(key, "LUMENLOOP_API_KEY" | "ALGOLIA_APPLICATION_ID_SITE")
         });
         assert_eq!(credentials["lumenloop"]["ready"], true);
-        assert_eq!(credentials["algolia_docs"]["ready"], false);
+        assert_eq!(credentials["mintlify_docs"]["ready"], false);
         assert_eq!(
-            credentials["algolia_docs"]["missing"],
-            json!(["ALGOLIA_API_KEY_DOCS"])
+            credentials["mintlify_docs"]["missing"],
+            json!(["MINTLIFY_ASSISTANT_API_KEY"])
+        );
+        assert_eq!(credentials["algolia_site"]["ready"], false);
+        assert_eq!(
+            credentials["algolia_site"]["missing"],
+            json!(["ALGOLIA_API_KEY_SITE"])
         );
         assert_eq!(credentials["stellarlight"]["credentials_required"], false);
         assert_eq!(credentials["stellarlight"]["ready"], true);
