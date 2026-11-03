@@ -69,6 +69,7 @@ Output (compact JSON):
                      names the providers that failed the network check, with the class.
                      not_assessed_after_stop counts items that Jev did not judge because it had
                      stopped paid work. A fallback alone sets degraded but leaves status complete.
+                     source_retried_requests counts source reads sent again after a server error.
                      source_latency, per host: send-to-last-byte times, cancelled_while_queued
                      (requests cut before they left this client), and queue_p95_ms and
                      queue_max_ms (time a request waited in this client before it was sent).";

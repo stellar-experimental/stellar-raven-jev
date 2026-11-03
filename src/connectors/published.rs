@@ -80,10 +80,9 @@ pub(crate) async fn read(ctx: &FetchContext, source: &Source, url: &Url, markdow
     while next < candidates.len() {
         let (candidate, kind) = candidates[next].clone();
         next += 1;
-        match ctx
-            .http
-            .request(Method::GET, candidate.as_str(), vec![], None)
+        match super::read(ctx, Method::GET, candidate.as_str(), vec![], None)
             .await
+            .response
         {
             Ok(response) => {
                 server_failed |= response.status >= 500;
@@ -295,7 +294,12 @@ mod tests {
             ("/receipts", "503 Service Unavailable", ""),
         ])
         .await;
-        assert_eq!(paths, ["/receipts.md", "/receipts"]);
+        // The markdown form is sent again twice. The page form is not, because the host has
+        // then failed 4 reads in a row.
+        assert_eq!(
+            paths,
+            ["/receipts.md", "/receipts.md", "/receipts.md", "/receipts"]
+        );
         assert!(read.text.is_none());
         assert_eq!(read.meta["full_original"], false);
         assert_eq!(read.meta["requested"], true);

@@ -128,24 +128,27 @@ async fn read(
     args: Value,
 ) -> std::result::Result<Reply, ReadError> {
     // Tool names are constants selected below. The question never selects an operation or URL.
-    let response = ctx
-        .http
-        .request(
-            Method::POST,
-            &format!("{BASE}/{tool}"),
-            vec![
-                ("Authorization".into(), format!("Bearer {key}")),
-                ("Accept".into(), "application/json".into()),
-            ],
-            Some(args),
-        )
-        .await
-        .map_err(|error| ReadError {
-            message: error.to_string(),
-            stop: false,
-            artifact: None,
-            notice: false,
-        })?;
+    // Every tool is a read, so `super::read` may send it again after a server error.
+    let super::Read { response, note } = super::read(
+        ctx,
+        Method::POST,
+        &format!("{BASE}/{tool}"),
+        vec![
+            ("Authorization".into(), format!("Bearer {key}")),
+            ("Accept".into(), "application/json".into()),
+        ],
+        Some(args),
+    )
+    .await;
+    let response = response.map_err(|error| ReadError {
+        message: match &note {
+            Some(note) => format!("{}. {note}", error.to_string().trim_end_matches('.')),
+            None => error.to_string(),
+        },
+        stop: false,
+        artifact: None,
+        notice: false,
+    })?;
     let envelope = response.json().map_err(|_| ReadError {
         message: format!("Invalid JSON; response: {}", response.artifact),
         stop: matches!(response.status, 401 | 402 | 403 | 429),

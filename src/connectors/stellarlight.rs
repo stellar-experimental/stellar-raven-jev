@@ -168,72 +168,25 @@ async fn read(
     result: &mut FetchResult,
     url: &str,
 ) -> Option<(Value, String, String)> {
-    // One id names this read's first attempt (and its hedge), so a retry can name it as its
-    // parent even when that attempt failed before a response.
-    let race = uuid::Uuid::new_v4().to_string();
-    let mut response = ctx
-        .http
-        .request_attempt(url, auth_headers(), race.clone())
-        .await;
     // Scout answers transient overload with a server error, and a connection can fail before a
-    // complete response. Every Scout read is a GET, so one retry is safe: after the Retry-After Scout
-    // sends, or after a short delay. A timeout is not retried, because it has already spent its
-    // time; neither is HTTP 504, which Scout sends when a function hits its time cap. A second
-    // failure is reported with the first, and so is a first one whose retry would wait too long
-    // or start with less than RETRY_ROOM of the fetch deadline left. The deadline can still cut a
-    // retry that has started.
-    let mut not_retried = None;
-    let mut first_attempt = None;
-    let delay = match &response {
-        Ok(first) if matches!(first.status, 500 | 502 | 503) => Some(retry_delay(&first.headers)),
-        Err(error) if transport_cause(error).is_some_and(|c| c != TransportCause::Timeout) => {
-            Some(retry_delay(&Default::default()))
-        }
-        _ => None,
-    };
-    if let Some(delay) = delay {
-        match delay.and_then(|delay| within(ctx.deadline, delay)) {
-            Ok(delay) => {
-                first_attempt = Some(match &response {
-                    Ok(first) => format!("HTTP {}{}", first.status, refusal(first)),
-                    Err(error) => error.to_string().trim_end_matches('.').to_owned(),
-                });
-                let parent = response.as_ref().ok().map(|first| first.artifact.clone());
-                tokio::time::sleep(delay).await;
-                response = ctx
-                    .http
-                    .request_retry(
-                        reqwest::Method::GET,
-                        url,
-                        auth_headers(),
-                        None,
-                        parent,
-                        Some(race.clone()),
-                    )
-                    .await;
-            }
-            Err(reason) => not_retried = Some(reason),
-        }
-    }
+    // complete response. Every Scout read is a GET, so `super::read` sends it again; it does not
+    // repeat a timeout or HTTP 504, which Scout sends when a function hits its time cap. The
+    // deadline can still cut a retry that has started.
+    let super::Read { response, note } =
+        super::read(ctx, reqwest::Method::GET, url, auth_headers(), None).await;
+    let note = note.map(|note| format!(" {note}")).unwrap_or_default();
     match response {
         Ok(response) => {
             let trace = trace(&response.headers);
             if !(200..300).contains(&response.status) {
-                let not_retried = not_retried
-                    .map(|reason| format!(" and was not retried: {reason}"))
-                    .unwrap_or_default();
                 failure(
                     result,
                     source,
                     "http",
                     format!(
-                        "Scout returned HTTP {}{not_retried}{}{}. Artifact: {}{trace}",
+                        "Scout returned HTTP {}{}.{note} Artifact: {}{trace}",
                         response.status,
                         refusal(&response),
-                        first_attempt
-                            .as_ref()
-                            .map(|first| format!(". First attempt: {first}"))
-                            .unwrap_or_default(),
                         response.artifact
                     ),
                 );
@@ -247,11 +200,7 @@ async fn read(
                         source,
                         "parse",
                         format!(
-                            "Scout returned invalid JSON{}. Artifact: {}{trace}",
-                            first_attempt
-                                .as_ref()
-                                .map(|first| format!(". First attempt: {first}"))
-                                .unwrap_or_default(),
+                            "Scout returned invalid JSON.{note} Artifact: {}{trace}",
                             response.artifact
                         ),
                     );
@@ -263,20 +212,13 @@ async fn read(
             let cause = transport_cause(&error)
                 .map(|cause| format!(" ({cause})"))
                 .unwrap_or_default();
-            let not_retried = not_retried
-                .map(|reason| format!(" It was not retried: {reason}."))
-                .unwrap_or_default();
             failure(
                 result,
                 source,
                 "http",
                 format!(
-                    "Scout read failed{cause}: {}.{not_retried}{}",
+                    "Scout read failed{cause}: {}.{note}",
                     error.to_string().trim_end_matches('.'),
-                    first_attempt
-                        .as_ref()
-                        .map(|first| format!(" First attempt: {first}."))
-                        .unwrap_or_default()
                 ),
             );
             None
@@ -336,48 +278,6 @@ fn auth_headers() -> Vec<(String, String)> {
         .filter(|key| !key.is_empty())
         .map(|key| vec![("Authorization".to_owned(), format!("Bearer {key}"))])
         .unwrap_or_default()
-}
-
-/// The longest Retry-After the one retry waits out. A longer one would spend most of the fetch
-/// deadline, so the failure is reported instead.
-const RETRY_AFTER_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
-/// Time left for the retried request itself after its wait, before the fetch deadline.
-const RETRY_ROOM: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// When to retry a server error: after the Retry-After Scout sends, or after 250 ms without one,
-/// plus up to 500 ms of spread so that concurrent readers do not retry together. A Retry-After
-/// above [`RETRY_AFTER_LIMIT`] is the reason not to retry.
-fn retry_delay(
-    headers: &std::collections::BTreeMap<String, String>,
-) -> Result<std::time::Duration, String> {
-    let spread = std::time::Duration::from_millis((uuid::Uuid::new_v4().as_u128() % 500) as u64);
-    match crate::http::retry_after(headers) {
-        Some(asked) if asked > RETRY_AFTER_LIMIT => Err(format!(
-            "its Retry-After of {} s is above the {} s retry limit",
-            asked.as_secs_f64(),
-            RETRY_AFTER_LIMIT.as_secs()
-        )),
-        Some(asked) => Ok(asked + spread),
-        None => Ok(std::time::Duration::from_millis(250) + spread),
-    }
-}
-
-/// `delay` when a retry after it still leaves [`RETRY_ROOM`] before the fetch deadline. A
-/// connector still running at the deadline loses every document, so it reports the failure and
-/// keeps what it has instead.
-fn within(
-    deadline: Option<tokio::time::Instant>,
-    delay: std::time::Duration,
-) -> Result<std::time::Duration, String> {
-    match deadline {
-        Some(deadline) if tokio::time::Instant::now() + delay + RETRY_ROOM > deadline => {
-            Err(format!(
-                "a retry after {} ms would end past the fetch deadline",
-                delay.as_millis()
-            ))
-        }
-        _ => Ok(delay),
-    }
 }
 
 fn string_field<'a>(row: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -1200,9 +1100,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_connection_that_closes_before_a_response_is_retried_once() {
-        // The first two connections close with no response; the third answers.
+    async fn a_connection_that_closes_before_a_response_is_retried() {
+        // The first three connections close with no response; the fourth answers.
         let addr = replying(vec![
+            b"",
             b"",
             b"",
             b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
@@ -1213,7 +1114,7 @@ mod tests {
         let source = &sources()[0];
         let url = format!("http://{addr}/api/x");
         let mut result = FetchResult::default();
-        // Two closed connections: the retry also fails, and the cause class is reported.
+        // Three closed connections: both retries also fail, and the cause class is reported.
         assert!(read(&ctx, source, &mut result, &url).await.is_none());
         let message = &result.failures[0].message;
         assert!(
@@ -1296,7 +1197,7 @@ mod tests {
         // A 30 s Retry-After is past the limit: reported at once, and the next reply is unused.
         let started = std::time::Instant::now();
         assert!(read(&ctx, source, &mut result, &url).await.is_none());
-        assert!(started.elapsed() < RETRY_AFTER_LIMIT);
+        assert!(started.elapsed() < super::super::RETRY_AFTER_LIMIT);
         assert_eq!(result.failures.len(), 1);
         let message = &result.failures[0].message;
         assert!(
@@ -1305,36 +1206,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retry_delay_follows_retry_after_seconds_and_dates() {
-        let headers = |value: &str| {
-            std::collections::BTreeMap::from([("retry-after".to_owned(), value.to_owned())])
-        };
-        let ms = std::time::Duration::from_millis;
-        let short = retry_delay(&Default::default()).unwrap();
-        assert!(short >= ms(250) && short < ms(750));
-        let two = retry_delay(&headers("2")).unwrap();
-        assert!(two >= ms(2_000) && two < ms(2_500));
-        assert!(retry_delay(&headers("4")).is_ok());
-        let long = retry_delay(&headers("5")).unwrap_err();
-        assert!(long.contains("Retry-After of 5 s"), "{long}");
-        // An HTTP-date in the past means now; a far one is above the limit.
-        let past = retry_delay(&headers("Sun, 06 Nov 1994 08:49:37 GMT")).unwrap();
-        assert!(past < ms(500));
-        assert!(retry_delay(&headers("Fri, 31 Dec 2100 23:59:59 GMT")).is_err());
-        // A value that is neither falls back to the short delay.
-        assert!(retry_delay(&headers("soon")).unwrap() < ms(750));
-    }
-
     #[tokio::test]
     async fn a_retry_that_would_end_past_the_deadline_is_not_sent() {
-        let now = tokio::time::Instant::now();
         let second = std::time::Duration::from_secs(1);
-        assert_eq!(within(None, second * 3), Ok(second * 3));
-        assert_eq!(within(Some(now + second * 10), second * 2), Ok(second * 2));
-        let late = within(Some(now + second * 2), second * 2).unwrap_err();
-        assert!(late.contains("past the fetch deadline"), "{late}");
-
         let addr = replying(vec![
             b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Length: 0\r\n\r\n",
             b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"rows\":[]}",
@@ -1348,7 +1222,7 @@ mod tests {
         assert!(read(&ctx, &sources()[0], &mut result, &url).await.is_none());
         let message = &result.failures[0].message;
         assert!(
-            message.contains("HTTP 503 and was not retried"),
+            message.contains("HTTP 503") && message.contains("It was not retried: a retry after"),
             "{message}"
         );
     }

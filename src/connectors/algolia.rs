@@ -433,10 +433,16 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
             let params = search_params(&active_query, page, size);
             variants.push(json!({"query":active_query,"page":page,"matching_mode":"none",
                 "kind":query_kind,"variant":if keyword_retry {"site_shared_keyword_or_local_entity"} else {"shared_initial"}}));
-            let response = match ctx
-                .http
-                .request(Method::POST, url.as_str(), headers.clone(), Some(params))
-                .await
+            // A search is a read, so `super::read` may send it again after a server error.
+            let response = match super::read(
+                ctx,
+                Method::POST,
+                url.as_str(),
+                headers.clone(),
+                Some(params),
+            )
+            .await
+            .response
             {
                 Ok(response) => response,
                 Err(_) => {

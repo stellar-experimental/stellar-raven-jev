@@ -355,6 +355,10 @@ const BOOKING_WAIT_LIMIT: Duration = Duration::from_secs(65);
 struct LoadCounters {
     rate_limited: AtomicU64,
     server_errors: AtomicU64,
+    /// Source reads sent again after a server error or a failed response.
+    retried: AtomicU64,
+    /// Server errors and failed responses in a row, per host. An answer resets the count.
+    host_failures: Mutex<std::collections::BTreeMap<String, u32>>,
     gate_wait_ms: AtomicU64,
     booking_wait_ms: AtomicU64,
     /// Time spent waiting for fetch slots on capped source hosts.
@@ -934,12 +938,43 @@ impl HttpRecorder {
         clone
     }
 
+    /// Take one of the run's `limit` source retries. False when they are spent.
+    pub(crate) fn take_source_retry(&self, limit: u64) -> bool {
+        self.load
+            .retried
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                (used < limit).then_some(used + 1)
+            })
+            .is_ok()
+    }
+
+    /// Record whether a source read to `url`'s host and port failed, and return its failures in a
+    /// row. Every source in the run shares the count.
+    pub(crate) fn note_source_outcome(&self, url: &str, failed: bool) -> u32 {
+        let host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| {
+                let host = url.host_str()?.to_owned();
+                Some(format!("{host}:{}", url.port_or_known_default()?))
+            })
+            .unwrap_or_default();
+        let mut failures = self
+            .load
+            .host_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let count = failures.entry(host).or_default();
+        *count = if failed { count.saturating_add(1) } else { 0 };
+        *count
+    }
+
     /// Source load in this run: requests refused by rate limits (429 responses and requests not
     /// sent at a closed gate), server errors (5xx), and time spent waiting at gates.
     pub fn load_summary(&self) -> Value {
         json!({
             "source_rate_limited_requests": self.load.rate_limited.load(Ordering::Relaxed),
             "source_server_errors": self.load.server_errors.load(Ordering::Relaxed),
+            "source_retried_requests": self.load.retried.load(Ordering::Relaxed),
             "source_gate_wait_ms": self.load.gate_wait_ms.load(Ordering::Relaxed),
                         "source_booking_wait_ms": self.load.booking_wait_ms.load(Ordering::Relaxed),
             "source_slot_wait_ms": self.load.slot_wait_ms.load(Ordering::Relaxed),

@@ -117,6 +117,7 @@ A page on a tier 4 host is tier 4 even when it holds ordinary text.
 | `jev_failure_causes` | Failed Jev calls by cause class, for example `dns`, `connect_denied`, `timeout`, `http_503` |
 | `jev_providers_skipped` | Providers that failed the network check, with the cause class |
 | `source_server_errors` | Source server errors, including errors that a retry recovered |
+| `source_retried_requests` | Source reads sent again after a server error or a failed response |
 | `source_gate_wait_ms`, `source_booking_wait_ms`, `source_slot_wait_ms` | Waits for source rate limits and fetch slots |
 | `jev_rate_limited_requests`, `jev_wait_ms`, `admission_wait_ms` | Jev refusals and waits, and the wait for a search slot |
 | `source_requests` | Requests per source host |
@@ -263,12 +264,16 @@ A source can slow down under load before its rate window fills. A slow source is
 
 - Each host has its own limit of `--concurrency` requests in flight, so a slow host does not delay the others.
 - Identical GET requests in one run share one response.
-- Stellar Scout retries HTTP 500, 502, or 503 once. HTTP 504 is Scout's function time cap and is treated as a timeout.
-  It also retries a request once when it fails before a complete response, unless the cause is a timeout. It waits for Scout's `Retry-After` plus up to 500 ms, or 250 to 750 ms without one.
-  A `Retry-After` above 4 seconds is not retried. A retry starts only if at least 1 second of the fetch deadline remains after its wait; the deadline can still cut it.
-- The developer-docs search retries once after an HTTP 5xx response or a failure before a complete response, timeouts included.
-  A failed body counts as such a failure, unless its status was 4xx. It never retries a 4xx response.
-  It waits 250 to 750 ms. It retries only if at least 1 second of the fetch deadline remains after its wait.
+- Every source read (Scout, Lumenloop, Algolia, the developer-docs search, and published pages) is sent again at most 2 times.
+  This happens after HTTP 500, 502, or 503, or after a failure before a complete response.
+  A timeout, HTTP 504, a 4xx status, and a rate-limit refusal are not retried. HTTP 504 means the upstream already used its time limit.
+- The first retry waits 250 ms and the second waits 500 ms. Each wait gets up to the same again of random spread.
+  When the host sent a `Retry-After`, the retry waits at least that long. A `Retry-After` above 4 seconds is not retried.
+- A retry starts only if, after its wait, the fetch deadline leaves at least 1 second and at least as long as the attempt before it took.
+  The deadline can still cut it.
+- A host that failed 4 reads in a row gets no retries until it answers again. This keeps retries off a host that is down.
+- One run sends at most 64 source retries. `load.source_retried_requests` counts them.
+- A failure report names the earlier attempts, and the reason when a read was not sent again.
 - A Scout HTTP failure report names Scout's `Retry-After` and the `error` field of its JSON body, when Scout sent them.
 - Scout failure and fallback reports end with Scout's request ID, `Server-Timing`, and match mode.
 

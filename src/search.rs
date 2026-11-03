@@ -278,6 +278,7 @@ fn load_summary(failures: &[Failure], usage: &crate::types::Usage, counters: &Va
         "source_fallback_responses": fallback,
         "source_rate_limited_requests": refused,
         "source_server_errors": counter("source_server_errors"),
+        "source_retried_requests": counter("source_retried_requests"),
         "source_gate_wait_ms": counter("source_gate_wait_ms"),
                 "source_booking_wait_ms": counter("source_booking_wait_ms"),
         "source_slot_wait_ms": counter("source_slot_wait_ms"),

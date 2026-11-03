@@ -23,8 +23,6 @@ const CANDIDATES: usize = 50;
 const NO_RESULTS: &str = "No results found";
 /// Characters of an API error message kept in a report.
 const MAX_ERROR_CHARS: usize = 200;
-/// Time the fetch deadline must leave when a retry starts. The deadline can still cut it.
-const RETRY_ROOM: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub fn sources() -> Vec<Source> {
     vec![Source {
@@ -299,79 +297,6 @@ fn without_index_notice(text: &str) -> String {
     rest.join("\n")
 }
 
-/// Whether a search outcome may be repeated: a server error, or a failure before a complete
-/// response (a timeout too), unless the status that arrived first was a 4xx. A 4xx answer is
-/// final, even when its body then fails, and so is a refusal by a rate limit. A failed 2xx or 3xx
-/// body is repeated.
-fn retryable(outcome: &anyhow::Result<crate::http::HttpResponse>) -> bool {
-    match outcome {
-        Ok(response) => response.status >= 500,
-        Err(error) => error
-            .downcast_ref::<crate::http::TransportFailure>()
-            .is_some_and(|failure| {
-                !failure
-                    .status
-                    .is_some_and(|status| (400..500).contains(&status))
-            }),
-    }
-}
-
-/// A short outcome of a search attempt, for a report.
-fn outcome_text(outcome: &anyhow::Result<crate::http::HttpResponse>) -> String {
-    match outcome {
-        Ok(response) => format!("HTTP {}", response.status),
-        Err(error) => error.to_string().trim_end_matches('.').to_owned(),
-    }
-}
-
-/// Send one search, and repeat it once when [`retryable`], after 250 to 750 ms, if the fetch
-/// deadline then still leaves [`RETRY_ROOM`]. The search is a read, so a repeat is safe. Returns
-/// the last outcome and, when the first attempt failed, a note about it for a report.
-async fn post_search(
-    ctx: &FetchContext,
-    url: &str,
-    headers: &[(String, String)],
-    body: &Value,
-) -> (anyhow::Result<crate::http::HttpResponse>, Option<String>) {
-    let first = ctx
-        .http
-        .request(Method::POST, url, headers.to_vec(), Some(body.clone()))
-        .await;
-    if !retryable(&first) {
-        return (first, None);
-    }
-    let delay =
-        std::time::Duration::from_millis(250 + (uuid::Uuid::new_v4().as_u128() % 500) as u64);
-    let first_text = outcome_text(&first);
-    if ctx.deadline.is_some_and(|deadline| {
-        deadline.saturating_duration_since(tokio::time::Instant::now()) < delay + RETRY_ROOM
-    }) {
-        return (
-            first,
-            Some(format!(
-                "It was not retried: the fetch deadline is too close. First attempt: {first_text}."
-            )),
-        );
-    }
-    let parent = first
-        .as_ref()
-        .ok()
-        .map(|response| response.artifact.clone());
-    tokio::time::sleep(delay).await;
-    let retry = ctx
-        .http
-        .request_retry(
-            Method::POST,
-            url,
-            headers.to_vec(),
-            Some(body.clone()),
-            parent,
-            None,
-        )
-        .await;
-    (retry, Some(format!("First attempt: {first_text}.")))
-}
-
 fn record(section: &Section, rank: usize, query: &str) -> Value {
     json!({"path":section.path,"title":section.title,"section":heading(&section.content),
         "search_rank":rank,"query":query})
@@ -516,7 +441,11 @@ async fn search(
         };
         variants.push(json!({"query":query,"kind":kind}));
         let body = json!({"query":query,"pageSize":CANDIDATES});
-        let (outcome, note) = post_search(ctx, url, &headers, &body).await;
+        // The search is a read, so `super::read` may send it again after a server error.
+        let super::Read {
+            response: outcome,
+            note,
+        } = super::read(ctx, Method::POST, url, headers.to_vec(), Some(body)).await;
         let note = note.map(|note| format!(" {note}")).unwrap_or_default();
         let response = match outcome {
             Ok(response) => response,
@@ -1058,11 +987,12 @@ mod tests {
             vec![
                 reply("502 Bad Gateway", r#"{"error":"upstream"}"#),
                 reply("503 Service Unavailable", r#"{"error":"busy"}"#),
+                reply("503 Service Unavailable", r#"{"error":"busy"}"#),
             ],
             question,
         )
         .await;
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         let failure = &result.failures[0];
         assert_eq!(failure.stage, "search");
         assert!(
@@ -1071,7 +1001,9 @@ mod tests {
             failure.message
         );
         assert!(
-            failure.message.contains("First attempt: HTTP 502"),
+            failure
+                .message
+                .contains("First attempt: HTTP 502. Second attempt: HTTP 503."),
             "{}",
             failure.message
         );
