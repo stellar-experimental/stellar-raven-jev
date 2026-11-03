@@ -112,10 +112,12 @@ impl Model {
         }
     }
 
-    /// The Workers AI model ID.
+    /// The Workers AI model ID. Workers AI has no Jev alias, and its unversioned `typesafe/jev`
+    /// does not follow new Jev releases, so Jev names the newest release. Move it when TypeSafe
+    /// moves `jev-latest`, which the TypeSafe and OpenRouter providers send.
     fn cloudflare_id(self) -> &'static str {
         match self {
-            Self::Jev => "typesafe/jev",
+            Self::Jev => "typesafe/jev-1.14.0",
             Self::Clef => "@cf/cloudflare/clef",
             Self::ClefFlash => "@cf/cloudflare/clef-flash",
             Self::ClefOmni => "@cf/cloudflare/clef-omni",
@@ -2044,7 +2046,7 @@ fn request_parts(
             Ok((
                 url.clone(),
                 headers,
-                json!({"model":"typesafe/jev","input":{"state":state,"questions":questions}}),
+                json!({"model":Model::Jev.cloudflare_id(),"input":{"state":state,"questions":questions}}),
             ))
         }
         Backend::Cloudflare {

@@ -36,12 +36,14 @@ Jev runs through one or more providers. Each configured provider joins a chain i
 
 | Provider | Settings | Endpoint and model | Accounted price per million input tokens |
 |---|---|---|---|
-| `cloudflare` | `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_AUTH_PROFILE`; optional `JEV_GATEWAY_ID` (default `default`) | Workers AI `typesafe/jev` | $0.0441 ($0.042 plus a 5% credit fee) |
+| `cloudflare` | `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_AUTH_PROFILE`; optional `JEV_GATEWAY_ID` (default `default`) | Workers AI `typesafe/jev-1.14.0` | $0.0441 ($0.042 plus a 5% credit fee) |
 | `typesafe` | `TYPESAFE_AI_API_KEY` | `https://api.typesafe.ai/v1/systemone`, `jev-latest` | $0.042 |
 | `openrouter` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1/systemone`, `~typesafe/jev-latest` | $0.0444 |
 
 - `JEV_PROVIDERS` (comma-separated) sets another order or a subset. It must name only configured providers.
-- All three serve the same model with the same request shape. Output tokens are free.
+- All three serve the newest Jev release with the same request shape. Output tokens are free.
+- `typesafe` and `openrouter` send the `jev-latest` alias, which TypeSafe moves to each new
+  release. Workers AI has no Jev alias, so `cloudflare` names the release.
 - `JEV_GATEWAY_ID` names the Cloudflare AI Gateway. The gateway's own settings decide how Cloudflare bills the request.
 - `CLOUDFLARE_API_TOKEN` takes precedence over `JEV_CLOUDFLARE_AUTH_PROFILE`.
 - With a Wrangler profile, each run gets its token from `wrangler auth token --profile NAME --json`.
@@ -55,7 +57,7 @@ state, questions, and answer types. Only the `cloudflare` provider serves the Cl
 
 | `JEV_MODEL` | Workers AI model | Accounted price per million input tokens |
 |---|---|---|
-| `jev` (default) | `typesafe/jev` | $0.0441 on `cloudflare`; see the provider table |
+| `jev` (default) | `typesafe/jev-1.14.0` | $0.0441 on `cloudflare`; see the provider table |
 | `clef` | `@cf/cloudflare/clef` | $0.252 ($0.24 plus a 5% credit fee) |
 | `clef-flash` | `@cf/cloudflare/clef-flash` | $0.0399 ($0.038 plus a 5% credit fee) |
 | `clef-omni` | `@cf/cloudflare/clef-omni` | $0.1575 ($0.15 plus a 5% credit fee) |

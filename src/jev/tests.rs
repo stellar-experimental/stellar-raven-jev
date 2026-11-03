@@ -31,7 +31,7 @@ fn cloudflare_backend_reads_its_settings_and_runs_each_request_once() {
     .unwrap();
     assert!(url.starts_with("https://api.cloudflare.com/client/v4/accounts/"));
     assert!(headers.contains(&("cf-aig-max-attempts".into(), "1".into())));
-    assert_eq!(body["model"], "typesafe/jev");
+    assert_eq!(body["model"], "typesafe/jev-1.14.0");
 }
 
 fn offline_cloudflare() -> Backend {
