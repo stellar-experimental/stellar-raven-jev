@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type RequestParts = (String, Vec<(String, String)>, Value);
@@ -24,35 +24,6 @@ const BATCH_STATE_BYTES: usize = 44_000;
 const DOCUMENT_CHUNK_BYTES: usize = 12_000;
 const NANOS_PER_USD: f64 = 1_000_000_000.0;
 const SHARED_CEILING_USD: f64 = 100.0;
-const AUTH_OUTPUT_LIMIT: usize = 16_384;
-
-/// A Cloudflare credential that a refresh can replace while requests run. Clones share one
-/// value, so the providers that use one Cloudflare account see the same refresh.
-// Never derive Debug: this type holds an authentication value.
-#[derive(Clone)]
-struct Token(Arc<std::sync::RwLock<String>>);
-
-impl Token {
-    fn get(&self) -> String {
-        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    fn set(&self, value: String) {
-        *self.0.write().unwrap_or_else(|e| e.into_inner()) = value;
-    }
-}
-
-impl From<String> for Token {
-    fn from(value: String) -> Self {
-        Self(Arc::new(std::sync::RwLock::new(value)))
-    }
-}
-
-impl From<&str> for Token {
-    fn from(value: &str) -> Self {
-        value.to_owned().into()
-    }
-}
 
 // Never derive Debug: this type holds authentication values.
 enum Backend {
@@ -66,7 +37,7 @@ enum Backend {
     /// Cloudflare Workers AI through an AI Gateway.
     Cloudflare {
         account: String,
-        token: Token,
+        token: String,
         gateway: String,
         model: Model,
     },
@@ -325,7 +296,7 @@ pub fn provider_origin(name: &str) -> Result<String> {
     match name {
         "cloudflare" => Backend::Cloudflare {
             account: empty(),
-            token: empty().into(),
+            token: empty(),
             gateway: empty(),
             model: Model::Jev,
         },
@@ -363,10 +334,9 @@ const RATE_LIMIT_MAX_WAIT_SECS: u64 = 90;
 /// Sends of one attempt across all providers, refusals and waits included.
 const MAX_SENDS_PER_ATTEMPT: u32 = 8;
 
-/// Pauses after counted credential rejections (401 or 403) of one provider. A new token can be
-/// rejected for a short time after Wrangler mints it, and a token can expire during a run, so a
-/// rejection cools the provider and refreshes a Wrangler token. A counted rejection after the
-/// last pause disables the provider.
+/// Pauses after counted credential rejections (401 or 403) of one provider. A provider can reject
+/// valid credentials for a short time, so a rejection cools the provider before the next send. A
+/// counted rejection after the last pause disables the provider.
 const AUTH_PAUSES: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
 
 /// The first and the longest backoff after a refusal without Retry-After or a server error. Each
@@ -447,27 +417,14 @@ struct ProviderState {
     failures: u32,
 }
 
-/// Gets a Cloudflare token for a Wrangler profile.
-type Resolve = dyn Fn(&str) -> Result<String> + Send + Sync;
-
 /// What a credential rejection (401 or 403) does.
 enum Rejection {
     /// The request was sent before the latest counted rejection: the provider already cools.
     Again,
-    /// The provider cools this long, and a Wrangler token is refreshed.
+    /// The provider cools this long.
     Pause(Duration),
     /// No pause remains: the rejection disables the provider, or ends the run's spending.
     Final,
-}
-
-/// A Cloudflare token from a Wrangler profile, which a refresh can replace after a rejection.
-/// Wrangler returns its stored token until that expires, and then a new one.
-struct Refresh {
-    profile: String,
-    token: Token,
-    resolve: Arc<Resolve>,
-    /// One refresh at a time.
-    running: tokio::sync::Mutex<()>,
 }
 
 struct Attempted {
@@ -552,8 +509,6 @@ pub struct JevClient {
     /// The chain index of the fallback model's provider, which answers only when no provider of
     /// the selected model can. It is last in the chain.
     fallback_from: Option<usize>,
-    /// Refreshes a Cloudflare token from its Wrangler profile after a credential rejection.
-    refresh: Option<Refresh>,
     /// Tests replace `AUTH_PAUSES`.
     auth_pauses: Vec<Duration>,
     /// Calls that may still be sent again after a server error or a failed response.
@@ -566,12 +521,7 @@ impl JevClient {
         let mut offline = config.clone();
         offline.fixture = true;
         let http = HttpRecorder::new(&config.output_dir, &offline)?;
-        let mut client = Self::with_settings(
-            &offline,
-            &http,
-            |_| None,
-            |_| panic!("Fixture construction must not resolve credentials"),
-        )?;
+        let mut client = Self::with_settings(&offline, &http, |_| None)?;
         let mut transport = config.clone();
         transport.fixture = false;
         client.http = HttpRecorder::loopback_for_test(&config.output_dir, &transport)?;
@@ -588,14 +538,13 @@ impl JevClient {
     }
 
     pub fn new(config: &RunConfig, http: &HttpRecorder) -> Result<Self> {
-        Self::with_settings(config, http, env_value, wrangler_oauth_token)
+        Self::with_settings(config, http, env_value)
     }
 
     fn with_settings(
         config: &RunConfig,
         http: &HttpRecorder,
         env: impl Fn(&str) -> Option<String>,
-        resolve: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
     ) -> Result<Self> {
         ensure!(
             config.budget_usd.is_finite() && config.budget_usd >= 0.0,
@@ -613,22 +562,8 @@ impl JevClient {
                 config.budget_usd > 0.0,
                 "Live Jev requires --budget-usd above zero"
             );
-            providers_from(&env, |profile: &str| resolve(profile))?
+            providers_from(&env)?
         };
-        let refresh = env("CLOUDFLARE_API_TOKEN")
-            .is_none()
-            .then(|| env("JEV_CLOUDFLARE_AUTH_PROFILE"))
-            .flatten()
-            .zip(chain.iter().find_map(|backend| match backend {
-                Backend::Cloudflare { token, .. } => Some(token.clone()),
-                _ => None,
-            }))
-            .map(|(profile, token)| Refresh {
-                profile,
-                token,
-                resolve: Arc::new(resolve),
-                running: tokio::sync::Mutex::new(()),
-            });
         let fallback_from = chain
             .iter()
             .position(|b| matches!(b, Backend::Cloudflare { model: m, .. } if *m != model));
@@ -668,7 +603,6 @@ impl JevClient {
             recheck: tokio::sync::Mutex::new(()),
             rechecks: std::sync::atomic::AtomicU64::new(0),
             fallback_from,
-            refresh,
             auth_pauses: AUTH_PAUSES.to_vec(),
             retries_left: std::sync::atomic::AtomicU32::new(RETRIES_PER_RUN),
         };
@@ -684,7 +618,7 @@ impl JevClient {
             "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and each provider's credit purchase overhead; each reservation uses the price of the provider it is sent to",
             "retry_policy": format!("each provider runs a request once (Cloudflare: cf-aig-max-attempts: 1); the client sends again after a response that means the request was not run (429, 529, 402, 401, 403), or after a connection that failed before the request was sent, per rate_limit_policy, credential_policy, and provider_chain_policy, at most 8 sends per attempt; a server error (HTTP 5xx except 501 and 505) or a transport failure after the send keeps its reservation, cools the provider by the backoff, and sends the call again once, on the first usable provider, unless the hedge started, the unresolved-usage circuit opened, or the run's {RETRIES_PER_RUN} retries are spent; usage.retried_requests counts them"),
             "rate_limit_policy": "HTTP 429 or 529 releases the reservation, because the provider did not run the request, and cools that provider for every search on the host for Retry-After (1 to 90 s), or without one for the backoff: 2 s, doubled for each refusal or server error in a row up to 90 s, plus up to a quarter of random spread; a valid answer resets the count; the call moves to the next available provider at once; a hedge does not wait",
-            "credential_policy": format!("HTTP 401 or 403 releases the reservation; a rejection of a request sent before the provider's latest counted rejection belongs to the same episode and only moves the call on; a counted rejection cools the provider for {:?} in turn and asks Wrangler for the profile's token again, which replaces the token of every Cloudflare provider when Wrangler returns a new one; a counted rejection after the last pause disables the provider (see provider_chain_policy); a valid answer ends the episode", AUTH_PAUSES),
+            "credential_policy": format!("HTTP 401 or 403 releases the reservation; a rejection of a request sent before the provider's latest counted rejection belongs to the same episode and only moves the call on; a counted rejection cools the provider for {:?} in turn; a counted rejection after the last pause disables the provider (see provider_chain_policy); a valid answer ends the episode", AUTH_PAUSES),
             "fallback_policy": format!("the fallback model (JEV_FALLBACK_MODEL, default clef; none turns it off) runs on the Cloudflare account of the cloudflare provider and is last in the chain; it answers a call only when no Jev provider is enabled, or when every enabled one stays cooling or out of host send budget for more than {} s; it reserves at its own price only when it is sent; usage.provider_requests names it cloudflare/<model>", FALLBACK_AFTER.as_secs()),
             "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 after every credential pause disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; a connection that fails before the request is sent (name resolution, TCP, a proxy tunnel, or the TLS handshake) releases the reservation and cools the provider, and the call moves on only when another provider is usable at once; otherwise the call fails and the network check runs again (see network_check_policy); a request refused locally before the send point (a request limit or a URL rule) releases the reservation and fails the call, and no provider cools; other transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
             "hedge_policy": "a call unanswered jev_hedge_ms after its request is sent gets one identical hedge request when the budget has room without waiting; the first valid answer wins, so a failed attempt lets the other decide; the cancelled request is charged the winner's input tokens",
@@ -1352,27 +1286,6 @@ impl JevClient {
                 .retried_requests += 1;
         }
         taken
-    }
-
-    /// Ask Wrangler for the profile's token again and use it for later Cloudflare requests.
-    /// Returns `replaced`, `unchanged`, or `failed`, or `None` without a Wrangler profile.
-    async fn refresh_token(&self) -> Option<&'static str> {
-        let refresh = self.refresh.as_ref()?;
-        let _one = refresh.running.lock().await;
-        let (resolve, profile) = (refresh.resolve.clone(), refresh.profile.clone());
-        let token = tokio::task::spawn_blocking(move || resolve(&profile))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .and_then(|token| header_setting("The refreshed Cloudflare token", token).ok());
-        Some(match token {
-            Some(token) if token != refresh.token.get() => {
-                refresh.token.set(token);
-                "replaced"
-            }
-            Some(_) => "unchanged",
-            None => "failed",
-        })
     }
 
     /// Disable a provider whose credentials were rejected.
@@ -2211,7 +2124,7 @@ impl JevClient {
             }
             // A rejection soon after another one of the same episode, or one that a pause remains
             // for, cools the provider and releases the reservation: the provider did not run the
-            // request. A pause also refreshes a Wrangler token.
+            // request.
             if matches!(response.status, 401 | 403) {
                 let sent_at = *sent_at.lock().unwrap_or_else(|e| e.into_inner());
                 let rejection = self.credential_rejected(provider, sent_at);
@@ -2222,11 +2135,6 @@ impl JevClient {
                     if let Rejection::Pause(pause) = rejection {
                         self.cool_provider(provider, pause)?;
                         trace["pause_ms"] = json!(pause.as_millis() as u64);
-                        if matches!(backend, Backend::Cloudflare { .. }) {
-                            if let Some(outcome) = self.refresh_token().await {
-                                trace["token_refresh"] = json!(outcome);
-                            }
-                        }
                     }
                     trace["accounting"] =
                         json!("Reservation released; the provider rejected the credentials.");
@@ -2394,7 +2302,7 @@ fn request_parts(
             model,
         } => {
             headers.extend([
-                ("authorization".into(), format!("Bearer {}", token.get())),
+                ("authorization".into(), format!("Bearer {token}")),
                 ("cf-aig-gateway-id".into(), gateway.clone()),
                 ("cf-aig-max-attempts".into(), "1".into()),
                 ("cf-aig-skip-cache".into(), "true".into()),
@@ -2711,20 +2619,14 @@ fn provider_budget(
 /// The provider chain. `JEV_PROVIDERS` (comma-separated) sets the order and must name only
 /// configured providers; without it, every configured provider that serves `JEV_MODEL` is used in
 /// the default order.
-fn providers_from(
-    env: impl Fn(&str) -> Option<String>,
-    resolve: impl FnOnce(&str) -> Result<String>,
-) -> Result<Vec<Backend>> {
+fn providers_from(env: impl Fn(&str) -> Option<String>) -> Result<Vec<Backend>> {
     let order = provider_order(&env)?;
     let model = model_from(&env)?;
     let fallback = fallback_model_from(&env)?;
-    let mut resolve = Some(resolve);
     let mut chain = order
         .iter()
         .map(|name| match name.as_str() {
-            "cloudflare" => {
-                cloudflare_from(&env, model, resolve.take().expect("one Cloudflare entry"))
-            }
+            "cloudflare" => cloudflare_from(&env, model),
             "typesafe" => Ok(Backend::TypeSafe {
                 key: header_setting(
                     "TYPESAFE_AI_API_KEY",
@@ -2778,9 +2680,7 @@ pub fn provider_order(env: &impl Fn(&str) -> Option<String>) -> Result<Vec<Strin
     let serves = |name: &str| model == Model::Jev || name == "cloudflare";
     let configured = |name: &str| match name {
         "cloudflare" => {
-            env("CLOUDFLARE_ACCOUNT_ID").is_some()
-                && (env("CLOUDFLARE_API_TOKEN").is_some()
-                    || env("JEV_CLOUDFLARE_AUTH_PROFILE").is_some())
+            env("CLOUDFLARE_ACCOUNT_ID").is_some() && env("CLOUDFLARE_API_TOKEN").is_some()
         }
         "typesafe" => env("TYPESAFE_AI_API_KEY").is_some(),
         _ => env("OPENROUTER_API_KEY").is_some(),
@@ -2818,21 +2718,17 @@ pub fn provider_order(env: &impl Fn(&str) -> Option<String>) -> Result<Vec<Strin
     };
     ensure!(
         model == Model::Jev || !order.is_empty(),
-        "JEV_MODEL={} needs the cloudflare provider: set CLOUDFLARE_ACCOUNT_ID with CLOUDFLARE_API_TOKEN or JEV_CLOUDFLARE_AUTH_PROFILE",
+        "JEV_MODEL={} needs the cloudflare provider: set CLOUDFLARE_ACCOUNT_ID with CLOUDFLARE_API_TOKEN",
         model.name()
     );
     ensure!(
         !order.is_empty(),
-        "No Jev provider is configured: set CLOUDFLARE_ACCOUNT_ID (with CLOUDFLARE_API_TOKEN or JEV_CLOUDFLARE_AUTH_PROFILE), TYPESAFE_AI_API_KEY, or OPENROUTER_API_KEY"
+        "No Jev provider is configured: set CLOUDFLARE_ACCOUNT_ID (with CLOUDFLARE_API_TOKEN), TYPESAFE_AI_API_KEY, or OPENROUTER_API_KEY"
     );
     Ok(order)
 }
 
-fn cloudflare_from(
-    env: &impl Fn(&str) -> Option<String>,
-    model: Model,
-    resolve: impl FnOnce(&str) -> Result<String>,
-) -> Result<Backend> {
+fn cloudflare_from(env: &impl Fn(&str) -> Option<String>, model: Model) -> Result<Backend> {
     let account = env("CLOUDFLARE_ACCOUNT_ID")
         .ok_or_else(|| anyhow!("Missing Jev configuration: CLOUDFLARE_ACCOUNT_ID"))?;
     ensure!(
@@ -2841,146 +2737,17 @@ fn cloudflare_from(
     );
     Ok(Backend::Cloudflare {
         account,
-        token: cloudflare_token(
-            env("CLOUDFLARE_API_TOKEN"),
-            env("JEV_CLOUDFLARE_AUTH_PROFILE"),
-            resolve,
-        )?
-        .into(),
+        token: header_setting(
+            "CLOUDFLARE_API_TOKEN",
+            env("CLOUDFLARE_API_TOKEN")
+                .context("Missing CLOUDFLARE_API_TOKEN for Cloudflare authentication")?,
+        )?,
         gateway: header_setting(
             "JEV_GATEWAY_ID",
             env("JEV_GATEWAY_ID").unwrap_or_else(|| "default".into()),
         )?,
         model,
     })
-}
-
-fn cloudflare_token(
-    token: Option<String>,
-    profile: Option<String>,
-    resolve: impl FnOnce(&str) -> Result<String>,
-) -> Result<String> {
-    if let Some(token) = token {
-        return header_setting("CLOUDFLARE_API_TOKEN", token);
-    }
-    let profile = profile.context(
-        "Missing CLOUDFLARE_API_TOKEN or JEV_CLOUDFLARE_AUTH_PROFILE for Cloudflare authentication",
-    )?;
-    ensure!(
-        !profile.is_empty()
-            && profile.len() <= 128
-            && profile
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            && !profile.starts_with('-'),
-        "JEV_CLOUDFLARE_AUTH_PROFILE has an invalid format"
-    );
-    header_setting(
-        "The Cloudflare token of JEV_CLOUDFLARE_AUTH_PROFILE",
-        resolve(&profile)?,
-    )
-}
-
-fn parse_wrangler_oauth(bytes: &[u8]) -> Result<String> {
-    // Never include parser errors or subprocess output: either can contain credentials.
-    ensure!(
-        bytes.len() <= AUTH_OUTPUT_LIMIT,
-        "Wrangler authentication output exceeds the limit"
-    );
-    let StrictValue(value) = serde_json::from_slice(bytes)
-        .map_err(|_| anyhow!("Wrangler authentication output is not valid JSON"))?;
-    let object = value
-        .as_object()
-        .context("Wrangler authentication output must be an object")?;
-    ensure!(
-        object.len() == 2 && object.get("type").and_then(Value::as_str) == Some("oauth"),
-        "Wrangler authentication requires the exact OAuth response format"
-    );
-    let token = object
-        .get("token")
-        .and_then(Value::as_str)
-        .context("Wrangler authentication token must be a string")?;
-    ensure!(
-        !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic()),
-        "Wrangler authentication token has an invalid format"
-    );
-    Ok(token.to_owned())
-}
-
-#[cfg(unix)]
-fn wrangler_oauth_token(profile: &str) -> Result<String> {
-    use std::io::{ErrorKind, Read};
-    use std::os::fd::OwnedFd;
-    use std::os::unix::net::UnixStream;
-    use std::process::{Command, Stdio};
-    use std::time::Instant;
-
-    // A nonblocking socket bounds capture without reader threads or temporary token files.
-    let (mut reader, writer) = UnixStream::pair()
-        .map_err(|_| anyhow!("Cannot create the Wrangler authentication channel"))?;
-    reader
-        .set_nonblocking(true)
-        .map_err(|_| anyhow!("Cannot configure the Wrangler authentication channel"))?;
-    let mut child = Command::new("wrangler")
-        .args(["auth", "token", "--profile", profile, "--json"])
-        .env("CI", "true")
-        .env("WRANGLER_SEND_METRICS", "false")
-        .env("WRANGLER_WRITE_LOGS", "false")
-        .env("WRANGLER_LOG", "log")
-        .env("WRANGLER_LOG_SANITIZE", "true")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(OwnedFd::from(writer)))
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| anyhow!("Cannot start Wrangler authentication"))?;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let result = (|| {
-        let mut output = Vec::new();
-        let mut buffer = [0u8; 2048];
-        let mut eof = false;
-        loop {
-            ensure!(
-                Instant::now() < deadline,
-                "Wrangler authentication exceeded 20 seconds"
-            );
-            if !eof {
-                match reader.read(&mut buffer) {
-                    Ok(0) => eof = true,
-                    Ok(n) => {
-                        ensure!(
-                            output.len() + n <= AUTH_OUTPUT_LIMIT,
-                            "Wrangler authentication output exceeds the limit"
-                        );
-                        output.extend_from_slice(&buffer[..n]);
-                        continue;
-                    }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                    Err(_) => bail!("Cannot read Wrangler authentication output"),
-                }
-            }
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|_| anyhow!("Cannot check Wrangler authentication status"))?
-            {
-                ensure!(status.success(), "Wrangler authentication failed");
-                if eof {
-                    return parse_wrangler_oauth(&output);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    })();
-    if result.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    result
-}
-
-#[cfg(not(unix))]
-fn wrangler_oauth_token(_profile: &str) -> Result<String> {
-    bail!("Wrangler profile authentication requires Unix; configure CLOUDFLARE_API_TOKEN")
 }
 
 /// The longest prefix of `text` within `max_bytes` that ends on a character boundary.

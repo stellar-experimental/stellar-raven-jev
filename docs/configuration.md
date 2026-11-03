@@ -36,7 +36,7 @@ Jev runs through one or more providers. Each configured provider joins a chain i
 
 | Provider | Settings | Endpoint and model | Accounted price per million input tokens |
 |---|---|---|---|
-| `cloudflare` | `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_AUTH_PROFILE`; optional `JEV_GATEWAY_ID` (default `default`) | Workers AI `typesafe/jev-1.14.0` | $0.0441 ($0.042 plus a 5% credit fee) |
+| `cloudflare` | `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`; optional `JEV_GATEWAY_ID` (default `default`) | Workers AI `typesafe/jev-1.14.0` | $0.0441 ($0.042 plus a 5% credit fee) |
 | `typesafe` | `TYPESAFE_AI_API_KEY` | `https://api.typesafe.ai/v1/systemone`, `jev-latest` | $0.042 |
 | `openrouter` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1/systemone`, `~typesafe/jev-latest` | $0.0444 |
 
@@ -45,9 +45,9 @@ Jev runs through one or more providers. Each configured provider joins a chain i
 - `typesafe` and `openrouter` send the `jev-latest` alias, which TypeSafe moves to each new
   release. Workers AI has no Jev alias, so `cloudflare` names the release.
 - `JEV_GATEWAY_ID` names the Cloudflare AI Gateway. The gateway's own settings decide how Cloudflare bills the request.
-- `CLOUDFLARE_API_TOKEN` takes precedence over `JEV_CLOUDFLARE_AUTH_PROFILE`.
-- With a Wrangler profile, each run gets its token from `wrangler auth token --profile NAME --json`.
-  The token stays in memory. It must belong to `CLOUDFLARE_ACCOUNT_ID`. Otherwise every Jev call fails with HTTP 401.
+- `CLOUDFLARE_API_TOKEN` is an API token of `CLOUDFLARE_ACCOUNT_ID`. It needs Workers AI Read and AI Gateway Run.
+  Without AI Gateway Run, Jev and the other third-party models fail with HTTP 401. Use an account-owned token
+  that has only these two permissions.
 - `doctor` shows the chain. `usage.provider_requests` in the output counts settled requests per provider.
 
 ### Decision model
@@ -172,7 +172,7 @@ A call goes to the first provider in chain order that is usable. A usable provid
 | Event | Result |
 |---|---|
 | HTTP 429 or 529 | Releases the reservation. Cools the provider for every search on the host, for its `Retry-After` (1 to 90 seconds) or for the backoff. The call moves to the next provider. |
-| HTTP 401 or 403 | Releases the reservation. Cools the provider for 1 second, then for 4 seconds after a second rejection, and gets the Wrangler token again. A third rejection disables the provider when another one remains, and stops the client when none remains. |
+| HTTP 401 or 403 | Releases the reservation. Cools the provider for 1 second, then for 4 seconds after a second rejection. A third rejection disables the provider when another one remains, and stops the client when none remains. |
 | HTTP 402 | With another provider: cools the provider and releases the reservation. With no other provider: counts as an unresolved attempt. |
 | Connection fails before the request is sent (DNS, TCP, proxy, TLS) | Releases the reservation. Cools the provider for 30 seconds. The call moves to a provider that is usable at once. |
 | Request refused locally before the send | Releases the reservation. No provider cools. The call fails with the class `other`. |
@@ -182,7 +182,7 @@ A call goes to the first provider in chain order that is usable. A usable provid
 - The backoff is 2 seconds, doubled for each refusal or server error in a row, up to 90 seconds.
   A random spread of up to a quarter is added. A valid answer resets the count.
 - Rejections of requests that were sent before the latest counted rejection count as one.
-  A new token can be rejected for a short time after Wrangler makes it.
+  A provider can reject valid credentials for a short time.
 - A call is not sent again after its hedge starts, after a second failure, or after the stop.
   A run sends at most 16 calls again. `usage.retried_requests` counts them.
 

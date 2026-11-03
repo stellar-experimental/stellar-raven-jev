@@ -10,15 +10,11 @@ fn cloudflare_backend_reads_its_settings_and_runs_each_request_once() {
                 .map(|(_, v)| v.to_string())
         }
     };
-    let no_profile = |_: &str| -> Result<String> { panic!("static token needs no profile") };
     const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
-    let chain = providers_from(
-        env(&[
-            ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT),
-            ("CLOUDFLARE_API_TOKEN", "t"),
-        ]),
-        no_profile,
-    )
+    let chain = providers_from(env(&[
+        ("CLOUDFLARE_ACCOUNT_ID", ACCOUNT),
+        ("CLOUDFLARE_API_TOKEN", "t"),
+    ]))
     .unwrap();
     // Jev on Cloudflare, then the Clef fallback on the same account.
     assert_eq!(chain.len(), 2);
@@ -30,7 +26,7 @@ fn cloudflare_backend_reads_its_settings_and_runs_each_request_once() {
             ..
         }
     ));
-    assert!(providers_from(env(&[("CLOUDFLARE_API_TOKEN", "t")]), no_profile).is_err());
+    assert!(providers_from(env(&[("CLOUDFLARE_API_TOKEN", "t")])).is_err());
     let (url, headers, body) = request_parts(
         &offline_cloudflare(),
         &json!({}),
@@ -61,7 +57,6 @@ fn jev_model_selects_a_clef_model_on_cloudflare_only() {
                 .map(|(_, v)| v.to_string())
         }
     };
-    let no_profile = |_: &str| -> Result<String> { panic!("static token needs no profile") };
     const ALL: &[(&str, &str)] = &[
         ("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"),
         ("CLOUDFLARE_API_TOKEN", "t"),
@@ -70,7 +65,7 @@ fn jev_model_selects_a_clef_model_on_cloudflare_only() {
         ("JEV_MODEL", "Clef-Flash"),
     ];
     // Only Cloudflare serves a Clef model, so the default chain drops the other providers.
-    let chain = providers_from(env(ALL), no_profile).unwrap();
+    let chain = providers_from(env(ALL)).unwrap();
     assert_eq!(chain.len(), 1);
     let (_, _, body) = request_parts(
         &chain[0],
@@ -106,73 +101,11 @@ fn jev_model_selects_a_clef_model_on_cloudflare_only() {
     ] {
         let bad: &'static [(&'static str, &'static str)] =
             Box::leak(bad.to_vec().into_boxed_slice());
-        assert!(providers_from(env(bad), no_profile).is_err());
+        assert!(providers_from(env(bad)).is_err());
     }
 }
 use std::path::Path;
 use std::sync::Arc;
-
-#[test]
-fn wrangler_auth_accepts_only_exact_oauth_json() {
-    let valid = br#"{"type":"oauth","token":"fixture-secret"}"#;
-    assert_eq!(parse_wrangler_oauth(valid).unwrap(), "fixture-secret");
-    for invalid in [
-        r#"{"type":"api_token","token":"fixture-secret"}"#,
-        r#"{"type":"oauth","token":"fixture-secret","extra":true}"#,
-        r#"{"type":"oauth","token":"fixture-secret","token":"other"}"#,
-        r#"{"type":"oauth","type":"oauth","token":"fixture-secret"}"#,
-        r#"{"type":"oauth","token":null}"#,
-        r#"{"type":"oauth","token":42}"#,
-        r#"{"type":"oauth","token":""}"#,
-        r#"{"type":"oauth","token":"fixture-secret\n"}"#,
-        r#"{"type":"oauth","token":"fixture secret"}"#,
-        r#"{"type":"oauth","token":"é"}"#,
-        r#"{"type":"oauth"}"#,
-        r#"{"type":1,"token":"fixture-secret"}"#,
-        r#"["fixture-secret"]"#,
-        r#"fixture-secret"#,
-        r#"{"type":"oauth","token":"fixture-secret"} trailing"#,
-    ] {
-        let error = parse_wrangler_oauth(invalid.as_bytes()).err().unwrap();
-        assert!(!format!("{error:#}").contains("fixture-secret"));
-    }
-    assert!(parse_wrangler_oauth(&vec![b' '; AUTH_OUTPUT_LIMIT + 1]).is_err());
-}
-
-#[test]
-fn wrangler_profile_resolution_preserves_static_tokens_and_fails_closed() {
-    let token = cloudflare_token(
-        Some("static-fixture".into()),
-        Some("personal".into()),
-        |_| panic!("Static credentials must not start Wrangler"),
-    )
-    .unwrap();
-    assert_eq!(token, "static-fixture");
-    assert!(cloudflare_token(None, None, |_| panic!("Missing profile must fail")).is_err());
-    for invalid in [
-        "",
-        "--help",
-        " personal",
-        "personal\n",
-        "../../personal",
-        "personal;echo",
-    ] {
-        assert!(cloudflare_token(None, Some(invalid.into()), |_| {
-            panic!("Invalid profile must not start Wrangler")
-        })
-        .is_err());
-    }
-    let token = cloudflare_token(None, Some("personal".into()), |profile| {
-        assert_eq!(profile, "personal");
-        Ok("oauth-fixture".into())
-    })
-    .unwrap();
-    assert_eq!(token, "oauth-fixture");
-    assert!(cloudflare_token(None, Some("personal".into()), |_| {
-        bail!("Fixture authentication failure")
-    })
-    .is_err());
-}
 
 fn expected() -> BTreeSet<String> {
     ["a".into(), "b".into()].into()
@@ -199,13 +132,7 @@ fn client(dir: &Path, budget: f64) -> JevClient {
         ..RunConfig::default()
     };
     let http = HttpRecorder::new(dir, &config).unwrap();
-    let mut client = JevClient::with_settings(
-        &config,
-        &http,
-        |_| None,
-        |_| panic!("Test construction must not resolve credentials"),
-    )
-    .unwrap();
+    let mut client = JevClient::with_settings(&config, &http, |_| None).unwrap();
     // Tests swap in an offline provider; the network check must not reach a real one.
     client.network = tokio::sync::OnceCell::new_with(Some(NetworkCheck::default()));
     client
@@ -1309,23 +1236,13 @@ fn a_provider_setting_that_cannot_be_a_header_fails_at_startup_by_name() {
             ],
         ),
     ] {
-        let text = providers_from(env(pairs), |_: &str| -> Result<String> {
-            panic!("static token needs no profile")
-        })
-        .err()
-        .map(|e| format!("{e:#}"))
-        .unwrap_or_else(|| panic!("{setting} was accepted"));
+        let text = providers_from(env(pairs))
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_else(|| panic!("{setting} was accepted"));
         assert!(text.starts_with(setting), "{text}");
         assert!(!text.contains("fernlet"), "{text}");
     }
-    // A token from a profile is checked the same way.
-    let profile = env(vec![account, ("JEV_CLOUDFLARE_AUTH_PROFILE", "fernlet")]);
-    let text = providers_from(profile, |_: &str| Ok(bad.to_owned()))
-        .err()
-        .map(|e| format!("{e:#}"))
-        .unwrap();
-    assert!(text.contains("JEV_CLOUDFLARE_AUTH_PROFILE"), "{text}");
-    assert!(!text.contains("secret"), "{text}");
 }
 
 #[test]
@@ -1338,7 +1255,6 @@ fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
                 .map(|(_, v)| v.to_string())
         }
     };
-    let no_profile = |_: &str| -> Result<String> { panic!("static token needs no profile") };
     let names = |chain: Vec<Backend>| chain.iter().map(|b| b.name()).collect::<Vec<_>>();
     const ALL: &[(&str, &str)] = &[
         ("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"),
@@ -1347,7 +1263,7 @@ fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
         ("OPENROUTER_API_KEY", "o"),
     ];
     assert_eq!(
-        names(providers_from(env(ALL), no_profile).unwrap()),
+        names(providers_from(env(ALL)).unwrap()),
         ["cloudflare", "typesafe", "openrouter", "cloudflare"]
     );
     const NO_FALLBACK: &[(&str, &str)] = &[
@@ -1357,7 +1273,7 @@ fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
         ("JEV_FALLBACK_MODEL", "none"),
     ];
     assert_eq!(
-        names(providers_from(env(NO_FALLBACK), no_profile).unwrap()),
+        names(providers_from(env(NO_FALLBACK)).unwrap()),
         ["cloudflare", "typesafe"]
     );
     const FLASH: &[(&str, &str)] = &[
@@ -1365,7 +1281,7 @@ fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
         ("CLOUDFLARE_API_TOKEN", "t"),
         ("JEV_FALLBACK_MODEL", "Clef-Flash"),
     ];
-    let chain = providers_from(env(FLASH), no_profile).unwrap();
+    let chain = providers_from(env(FLASH)).unwrap();
     assert!(matches!(
         chain[1],
         Backend::Cloudflare {
@@ -1374,7 +1290,7 @@ fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
         }
     ));
     assert_eq!(
-        names(providers_from(env(&[("OPENROUTER_API_KEY", "o")]), no_profile).unwrap()),
+        names(providers_from(env(&[("OPENROUTER_API_KEY", "o")])).unwrap()),
         ["openrouter"]
     );
     const ORDERED: &[(&str, &str)] = &[
@@ -1383,7 +1299,7 @@ fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
         ("JEV_PROVIDERS", "openrouter, TypeSafe"),
     ];
     assert_eq!(
-        names(providers_from(env(ORDERED), no_profile).unwrap()),
+        names(providers_from(env(ORDERED)).unwrap()),
         ["openrouter", "typesafe"]
     );
     for bad in [
@@ -1404,7 +1320,7 @@ fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
     ] {
         let bad: &'static [(&'static str, &'static str)] =
             Box::leak(bad.to_vec().into_boxed_slice());
-        assert!(providers_from(env(bad), no_profile).is_err());
+        assert!(providers_from(env(bad)).is_err());
     }
     let (url, headers, body) = request_parts(
         &Backend::OpenRouter { key: "o".into() },
@@ -2622,13 +2538,7 @@ fn rejects_invalid_and_unapproved_budgets_before_auth() {
             ..RunConfig::default()
         };
         let http = HttpRecorder::new(dir.path(), &config).unwrap();
-        assert!(JevClient::with_settings(
-            &config,
-            &http,
-            |_| None,
-            |_| { panic!("Test construction must not resolve credentials") }
-        )
-        .is_err());
+        assert!(JevClient::with_settings(&config, &http, |_| None).is_err());
     }
 }
 
@@ -2801,29 +2711,19 @@ async fn the_run_stops_sending_calls_again_when_its_retries_are_spent() {
     assert_eq!(client.usage().retried_requests, 1);
 }
 
-#[tokio::test]
-async fn a_token_refresh_replaces_the_token_that_every_cloudflare_provider_sends() {
+#[test]
+fn the_fallback_model_sends_the_cloudflare_token_of_the_jev_provider() {
     let config = RunConfig {
         budget_usd: 1.0,
         ..RunConfig::default()
     };
     let dir = tempfile::tempdir().unwrap();
     let http = HttpRecorder::new(dir.path(), &config).unwrap();
-    let minted = Arc::new(Mutex::new(vec!["second", "first"]));
-    let tokens = minted.clone();
-    let client = JevClient::with_settings(
-        &config,
-        &http,
-        |key| match key {
-            "CLOUDFLARE_ACCOUNT_ID" => Some("0123456789abcdef0123456789abcdef".into()),
-            "JEV_CLOUDFLARE_AUTH_PROFILE" => Some("work".into()),
-            _ => None,
-        },
-        move |profile| {
-            assert_eq!(profile, "work");
-            Ok(tokens.lock().unwrap().pop().unwrap_or("second").to_owned())
-        },
-    )
+    let client = JevClient::with_settings(&config, &http, |key| match key {
+        "CLOUDFLARE_ACCOUNT_ID" => Some("0123456789abcdef0123456789abcdef".into()),
+        "CLOUDFLARE_API_TOKEN" => Some("static".into()),
+        _ => None,
+    })
     .unwrap();
     let bearer = |provider: usize| {
         let (_, headers, _) =
@@ -2837,58 +2737,8 @@ async fn a_token_refresh_replaces_the_token_that_every_cloudflare_provider_sends
     assert_eq!(client.fallback_from, Some(1));
     assert_eq!(
         (bearer(0), bearer(1)),
-        ("Bearer first".into(), "Bearer first".into())
+        ("Bearer static".into(), "Bearer static".into())
     );
-    assert_eq!(client.refresh_token().await, Some("replaced"));
-    assert_eq!(
-        (bearer(0), bearer(1)),
-        ("Bearer second".into(), "Bearer second".into())
-    );
-    assert_eq!(client.refresh_token().await, Some("unchanged"));
-    assert!(minted.lock().unwrap().is_empty());
-
-    // A static token has nothing to refresh.
-    let client = JevClient::with_settings(
-        &config,
-        &http,
-        |key| match key {
-            "CLOUDFLARE_ACCOUNT_ID" => Some("0123456789abcdef0123456789abcdef".into()),
-            "CLOUDFLARE_API_TOKEN" => Some("static".into()),
-            _ => None,
-        },
-        |_| panic!("A static token needs no profile"),
-    )
-    .unwrap();
-    assert_eq!(client.refresh_token().await, None);
-}
-
-#[tokio::test]
-async fn a_failed_token_refresh_keeps_the_old_token() {
-    let config = RunConfig {
-        budget_usd: 1.0,
-        ..RunConfig::default()
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let http = HttpRecorder::new(dir.path(), &config).unwrap();
-    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let counted = calls.clone();
-    let client = JevClient::with_settings(
-        &config,
-        &http,
-        |key| match key {
-            "CLOUDFLARE_ACCOUNT_ID" => Some("0123456789abcdef0123456789abcdef".into()),
-            "JEV_CLOUDFLARE_AUTH_PROFILE" => Some("work".into()),
-            _ => None,
-        },
-        move |_| match counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-            0 => Ok("kept".into()),
-            _ => bail!("Wrangler authentication failed"),
-        },
-    )
-    .unwrap();
-    assert_eq!(client.refresh_token().await, Some("failed"));
-    let (_, headers, _) = request_parts(client.chain()[0], &json!({}), &Map::new()).unwrap();
-    assert!(headers.contains(&("authorization".into(), "Bearer kept".into())));
 }
 
 /// Jev at `primary` and the fallback model at `fallback`.

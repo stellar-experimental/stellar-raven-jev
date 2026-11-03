@@ -586,74 +586,6 @@ fn doctor_config(config: &RunConfig, directory: PathBuf) -> RunConfig {
     result
 }
 
-fn wrangler_on_path() -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|directory| {
-            let executable = directory.join("wrangler");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                executable.metadata().is_ok_and(|metadata| {
-                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                })
-            }
-            #[cfg(not(unix))]
-            {
-                executable.is_file()
-            }
-        })
-    })
-}
-
-fn profile_doctor_check(
-    config: &RunConfig,
-    env: impl Fn(&str) -> Option<String>,
-    wrangler_present: impl FnOnce() -> bool,
-) -> Result<Option<serde_json::Value>> {
-    if config.fixture {
-        return Ok(None);
-    }
-    // The chain must be valid, and only a chain with Cloudflare needs the Wrangler check.
-    let order = stellar_raven_jev::jev::provider_order(&env)?;
-    if !order.iter().any(|name| name == "cloudflare") {
-        return Ok(None);
-    }
-    if env("CLOUDFLARE_API_TOKEN").is_some() {
-        return Ok(None);
-    }
-    let Some(profile) = env("JEV_CLOUDFLARE_AUTH_PROFILE") else {
-        return Ok(None);
-    };
-    let account =
-        env("CLOUDFLARE_ACCOUNT_ID").context("Missing Jev configuration: CLOUDFLARE_ACCOUNT_ID")?;
-    ensure!(
-        account.len() == 32 && account.bytes().all(|b| b.is_ascii_hexdigit()),
-        "CLOUDFLARE_ACCOUNT_ID must contain 32 hexadecimal characters"
-    );
-    ensure!(
-        !profile.is_empty()
-            && profile.len() <= 128
-            && profile
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            && !profile.starts_with('-'),
-        "JEV_CLOUDFLARE_AUTH_PROFILE has an invalid format"
-    );
-    ensure!(
-        cfg!(unix),
-        "Wrangler profile authentication requires Unix; configure CLOUDFLARE_API_TOKEN"
-    );
-    ensure!(
-        wrangler_present(),
-        "Wrangler executable is missing from PATH"
-    );
-    Ok(Some(json!({
-        "mode":"wrangler_profile_local_only", "wrangler_present":true,
-        "profile_token_resolved":false, "profile_login_validated":false,
-        "authorization_validated":false, "oauth_refresh_deferred_until_actual_run":true,
-    })))
-}
-
 /// `doctor --network`: the free network check against each configured provider's origin. It
 /// resolves and sends no credentials.
 async fn doctor_network_check(
@@ -687,13 +619,8 @@ async fn doctor_network_check(
 fn doctor_jev_inspection(
     config: &RunConfig,
     directory: PathBuf,
-    env: impl Fn(&str) -> Option<String>,
-    wrangler_present: impl FnOnce() -> bool,
     resolve: impl FnOnce(&RunConfig, &HttpRecorder) -> Result<()>,
 ) -> Result<serde_json::Value> {
-    if let Some(check) = profile_doctor_check(config, env, wrangler_present)? {
-        return Ok(check);
-    }
     let inspection_config = doctor_config(config, directory.clone());
     let http = HttpRecorder::new(&directory, &inspection_config)?;
     resolve(&inspection_config, &http)?;
@@ -892,13 +819,9 @@ async fn main() -> Result<()> {
                     .ok()
                     .filter(|value| !value.trim().is_empty())
             };
-            let result = doctor_jev_inspection(
-                &config,
-                directory.clone(),
-                env,
-                wrangler_on_path,
-                |config, http| JevClient::new(config, http).map(|_| ()),
-            );
+            let result = doctor_jev_inspection(&config, directory.clone(), |config, http| {
+                JevClient::new(config, http).map(|_| ())
+            });
             // Fixture mode is offline, so it has no network to check.
             let network_check = if network && !config.fixture {
                 Some(doctor_network_check(&config, &directory, env).await)
@@ -1071,79 +994,6 @@ mod tests {
         ] {
             assert!(parse_source_slots(bad).is_err(), "{bad}");
         }
-    }
-
-    fn profile_env(key: &str) -> Option<String> {
-        match key {
-            "CLOUDFLARE_ACCOUNT_ID" => Some("00000000000000000000000000000000".into()),
-            "JEV_CLOUDFLARE_AUTH_PROFILE" => Some("personal".into()),
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn doctor_profile_branch_never_calls_the_authentication_resolver() {
-        let dir = tempfile::tempdir().unwrap();
-        let check = doctor_jev_inspection(
-            &RunConfig::default(),
-            dir.path().join("unused"),
-            profile_env,
-            || true,
-            |_, _| panic!("Doctor must not resolve or refresh OAuth"),
-        )
-        .unwrap();
-        assert_eq!(check["oauth_refresh_deferred_until_actual_run"], true);
-        assert_eq!(check["authorization_validated"], false);
-        assert!(!dir.path().join("unused").exists());
-    }
-
-    #[test]
-    fn doctor_profile_checks_local_prerequisites_without_resolving_a_token() {
-        let check = profile_doctor_check(&RunConfig::default(), profile_env, || true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(check["mode"], "wrangler_profile_local_only");
-        assert_eq!(check["profile_token_resolved"], false);
-        assert_eq!(check["profile_login_validated"], false);
-        assert!(profile_doctor_check(&RunConfig::default(), profile_env, || false).is_err());
-        assert!(profile_doctor_check(
-            &RunConfig::default(),
-            |key| {
-                if key == "JEV_CLOUDFLARE_AUTH_PROFILE" {
-                    Some("--bad".into())
-                } else {
-                    profile_env(key)
-                }
-            },
-            || panic!("Invalid configuration must fail before checking Wrangler")
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn doctor_static_token_and_fixture_do_not_check_wrangler() {
-        assert!(profile_doctor_check(
-            &RunConfig::default(),
-            |key| {
-                if key == "CLOUDFLARE_API_TOKEN" {
-                    Some("test-placeholder".into())
-                } else {
-                    profile_env(key)
-                }
-            },
-            || panic!("A static token takes precedence")
-        )
-        .unwrap()
-        .is_none());
-        let config = RunConfig {
-            fixture: true,
-            ..Default::default()
-        };
-        assert!(
-            profile_doctor_check(&config, profile_env, || panic!("Fixture mode is offline"))
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[test]
