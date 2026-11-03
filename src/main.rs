@@ -57,6 +57,8 @@ Output (compact JSON):
   currentness        The question's time intent and the newest dated evidence among the results.
   not_shown          Counts you did not see; full_report_path holds every result.
   usage              Jev cost and requests. session.usage is the total for the session.
+                     retried_requests counts calls sent again after a server error;
+                     provider_requests names the fallback model as cloudflare/<model>.
   report_stage_counts  Reports by stage; the full report (--json) lists them.
   load               What capacity limits and failures did. degraded is true when evidence was
                      lost: a source was cut, refused, or fell back; documents went over the
@@ -928,12 +930,22 @@ async fn main() -> Result<()> {
                     |model| json!(model.name()),
                 )
             });
+            let jev_fallback_model = (!config.fixture).then(|| {
+                // The fallback runs only on the cloudflare provider.
+                let on_cloudflare = stellar_raven_jev::jev::provider_order(&env)
+                    .is_ok_and(|order| order.iter().any(|name| name == "cloudflare"));
+                stellar_raven_jev::jev::fallback_model_from(&env).map_or_else(
+                    |error| json!({"error": error.to_string()}),
+                    |model| json!(model.filter(|_| on_cloudflare).map(|m| m.name())),
+                )
+            });
             println!(
                 "{}",
                 serde_json::to_string(&json!({
                     "mode":if config.fixture {"offline-fixture"} else {"live-jev"},
                     "network_checked":network_check.is_some(),"network_check":network_check,
                     "jev_providers":jev_providers,"jev_model":jev_model,
+                    "jev_fallback_model":jev_fallback_model,
                     "jev_authentication_check":result.as_ref().ok(),
                     "local_configuration_ready":configuration_ready,
                     "jev_configuration_ready":result.is_ok(),

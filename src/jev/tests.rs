@@ -20,8 +20,16 @@ fn cloudflare_backend_reads_its_settings_and_runs_each_request_once() {
         no_profile,
     )
     .unwrap();
-    assert_eq!(chain.len(), 1);
+    // Jev on Cloudflare, then the Clef fallback on the same account.
+    assert_eq!(chain.len(), 2);
     assert_eq!(chain[0].name(), "cloudflare");
+    assert!(matches!(
+        chain[1],
+        Backend::Cloudflare {
+            model: Model::Clef,
+            ..
+        }
+    ));
     assert!(providers_from(env(&[("CLOUDFLARE_API_TOKEN", "t")]), no_profile).is_err());
     let (url, headers, body) = request_parts(
         &offline_cloudflare(),
@@ -78,8 +86,8 @@ fn jev_model_selects_a_clef_model_on_cloudflare_only() {
     assert_eq!(default_rpm(&chain[0]), 300.0);
     // Jev and a Clef model on one account keep separate host budgets.
     assert_ne!(
-        provider_budget(&chain[0], &BTreeMap::new()).key,
-        provider_budget(&offline_cloudflare(), &BTreeMap::new()).key
+        provider_budget(&chain[0], &BTreeMap::new(), "cloudflare").key,
+        provider_budget(&offline_cloudflare(), &BTreeMap::new(), "cloudflare").key
     );
     for bad in [
         &[("TYPESAFE_AI_API_KEY", "k"), ("JEV_MODEL", "clef")][..],
@@ -345,10 +353,10 @@ async fn a_full_budget_of_in_flight_reservations_makes_the_next_attempt_wait_not
     client.backend = offline_cloudflare();
     let client = Arc::new(client);
     // One reservation fills the budget. With nothing in flight, the next one fails at once.
-    let first = client.reserve_waiting().await.unwrap();
+    let first = client.reserve_waiting(0).await.unwrap();
     let waiter = {
         let client = client.clone();
-        tokio::spawn(async move { client.reserve_waiting().await })
+        tokio::spawn(async move { client.reserve_waiting(0).await })
     };
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
@@ -367,7 +375,7 @@ async fn a_full_budget_of_in_flight_reservations_makes_the_next_attempt_wait_not
     assert!(client.usage().cost_usd <= 0.004);
     // Nothing in flight and no room: fail immediately instead of waiting forever.
     let tiny = client_with_budget_nanos(dir.path(), 1);
-    assert!(tiny.reserve_waiting().await.is_err());
+    assert!(tiny.reserve_waiting(0).await.is_err());
 }
 
 #[tokio::test]
@@ -376,10 +384,10 @@ async fn a_stop_wakes_waiting_reservations_with_an_error() {
     let mut client = client(dir.path(), 0.004);
     client.backend = offline_cloudflare();
     let client = Arc::new(client);
-    let _held = client.reserve_waiting().await.unwrap();
+    let _held = client.reserve_waiting(0).await.unwrap();
     let waiter = {
         let client = client.clone();
-        tokio::spawn(async move { client.reserve_waiting().await })
+        tokio::spawn(async move { client.reserve_waiting(0).await })
     };
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(!waiter.is_finished());
@@ -543,7 +551,7 @@ async fn http_errors_stop_spending_and_preserve_raw_inflight_receipts() {
             let dir = tempfile::tempdir().unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
-            let mut candidate = client(dir.path(), 1.0);
+            let mut candidate = without_retries(client(dir.path(), 1.0));
             candidate.http = HttpRecorder::loopback_for_test(
                 dir.path(),
                 &RunConfig {
@@ -1147,7 +1155,7 @@ async fn a_failed_call_for_one_claim_fails_the_documents_it_covered() {
         (0, "500 Internal Server Error", "{}".into()),
     ])
     .await;
-    let mut client = hedging_client(dir.path(), url, 1.0);
+    let mut client = without_retries(hedging_client(dir.path(), url, 1.0));
     client.hedge_after = None;
     client.batch = 4;
     let documents = vec![
@@ -1235,7 +1243,7 @@ async fn a_failed_shared_call_fails_every_document_in_it() {
         .map(|i| text_document(&format!("d{i}"), format!("Text {i}")))
         .collect();
     let (url, server) = scripted_server(vec![(0, "503 Service Unavailable", "{}".into())]).await;
-    let mut client = hedging_client(dir.path(), url, 1.0);
+    let mut client = without_retries(hedging_client(dir.path(), url, 1.0));
     client.hedge_after = None;
     // This test packs several chunks per call.
     client.batch = 4;
@@ -1252,9 +1260,13 @@ async fn a_failed_shared_call_fails_every_document_in_it() {
 
 #[test]
 fn provider_rate_overrides_are_strict() {
-    let parsed = rpm_overrides(Some("typesafe=3000, cloudflare=600".into())).unwrap();
+    let parsed = rpm_overrides(Some(
+        "typesafe=3000, cloudflare=600, cloudflare/clef=50".into(),
+    ))
+    .unwrap();
     assert_eq!(parsed["typesafe"], 3000.0);
     assert_eq!(parsed["cloudflare"], 600.0);
+    assert_eq!(parsed["cloudflare/clef"], 50.0);
     assert!(rpm_overrides(None).unwrap().is_empty());
     for bad in [
         "typesafe",
@@ -1262,6 +1274,8 @@ fn provider_rate_overrides_are_strict() {
         "typesafe=0",
         "example=10",
         "typesafe=-5",
+        "cloudflare/jev=10",
+        "typesafe/clef=10",
     ] {
         assert!(rpm_overrides(Some(bad.into())).is_err(), "{bad}");
     }
@@ -1334,8 +1348,31 @@ fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
     ];
     assert_eq!(
         names(providers_from(env(ALL), no_profile).unwrap()),
-        ["cloudflare", "typesafe", "openrouter"]
+        ["cloudflare", "typesafe", "openrouter", "cloudflare"]
     );
+    const NO_FALLBACK: &[(&str, &str)] = &[
+        ("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"),
+        ("CLOUDFLARE_API_TOKEN", "t"),
+        ("TYPESAFE_AI_API_KEY", "k"),
+        ("JEV_FALLBACK_MODEL", "none"),
+    ];
+    assert_eq!(
+        names(providers_from(env(NO_FALLBACK), no_profile).unwrap()),
+        ["cloudflare", "typesafe"]
+    );
+    const FLASH: &[(&str, &str)] = &[
+        ("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"),
+        ("CLOUDFLARE_API_TOKEN", "t"),
+        ("JEV_FALLBACK_MODEL", "Clef-Flash"),
+    ];
+    let chain = providers_from(env(FLASH), no_profile).unwrap();
+    assert!(matches!(
+        chain[1],
+        Backend::Cloudflare {
+            model: Model::ClefFlash,
+            ..
+        }
+    ));
     assert_eq!(
         names(providers_from(env(&[("OPENROUTER_API_KEY", "o")]), no_profile).unwrap()),
         ["openrouter"]
@@ -1356,6 +1393,13 @@ fn the_provider_chain_follows_jev_providers_or_the_configured_default() {
             ("JEV_PROVIDERS", "typesafe,typesafe"),
         ][..],
         &[("TYPESAFE_AI_API_KEY", "k"), ("JEV_PROVIDERS", "vertex")][..],
+        &[("TYPESAFE_AI_API_KEY", "k"), ("JEV_FALLBACK_MODEL", "jev")][..],
+        &[
+            ("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"),
+            ("CLOUDFLARE_API_TOKEN", "t"),
+            ("JEV_MODEL", "clef"),
+            ("JEV_FALLBACK_MODEL", "clef-flash"),
+        ][..],
         &[][..],
     ] {
         let bad: &'static [(&'static str, &'static str)] =
@@ -1417,6 +1461,14 @@ async fn a_rate_limited_provider_hands_the_call_to_the_next_one_at_once() {
     // The second call skips the cooling provider entirely.
     assert_eq!((usage.requests, usage.rate_limited_requests), (2, 1));
     assert!(client.spending_stop_reason().is_none());
+}
+
+/// A client that fails a call at its first server error, failed response, or credential
+/// rejection, for tests of the failure itself.
+fn without_retries(mut client: JevClient) -> JevClient {
+    client.retries_left = std::sync::atomic::AtomicU32::new(0);
+    client.auth_pauses.clear();
+    client
 }
 
 fn two_provider_client(dir: &Path, first: String, second: String) -> JevClient {
@@ -2017,7 +2069,7 @@ async fn a_failure_after_the_request_was_sent_keeps_its_reservation_and_stops() 
     let dir = tempfile::tempdir().unwrap();
     let (first, _) = hanging_up_server().await;
     let (second, second_connections) = hanging_up_server().await;
-    let client = two_provider_client(dir.path(), first, second);
+    let client = without_retries(two_provider_client(dir.path(), first, second));
     let reservation = client.backend.reservation().unwrap();
     for _ in 0..UNRESOLVED_STOP_AFTER {
         let error = evaluate_one(&client).await.unwrap_err();
@@ -2332,7 +2384,7 @@ async fn rejected_credentials_disable_one_provider_and_the_next_one_answers() {
     let dir = tempfile::tempdir().unwrap();
     let (bad, bad_server) = scripted_server(vec![(0, "401 Unauthorized", "{}".into())]).await;
     let (good, good_server) = scripted_server(vec![(0, "200 OK", response().to_string())]).await;
-    let mut client = hedging_client(dir.path(), bad, 1.0);
+    let mut client = without_retries(hedging_client(dir.path(), bad, 1.0));
     client.hedge_after = None;
     client.fallbacks = vec![Backend::Loopback {
         url: good,
@@ -2616,4 +2668,332 @@ async fn fixture_never_sends_requests_and_identifies_fixture_scores() {
         .route("q", &[source.clone(), source], 0)
         .await
         .is_err());
+}
+
+/// A client with short credential pauses and a short backoff, so retry tests run fast.
+fn quick_client(dir: &Path, url: String) -> JevClient {
+    let mut client = hedging_client(dir, url, 1.0);
+    client.hedge_after = None;
+    client.auth_pauses = vec![Duration::from_millis(50)];
+    client.rate_limit_wait = Some(Duration::from_millis(10));
+    client
+}
+
+#[tokio::test]
+async fn one_rejected_burst_pauses_the_provider_and_the_call_succeeds_after() {
+    let dir = tempfile::tempdir().unwrap();
+    // Three calls are sent before the first rejection returns. Only one pause is configured, so
+    // the burst must count as one rejection, or the second count would end the run's spending.
+    let (url, server) = scripted_server(vec![
+        (150, "401 Unauthorized", "{}".into()),
+        (150, "401 Unauthorized", "{}".into()),
+        (150, "401 Unauthorized", "{}".into()),
+        (0, "200 OK", response().to_string()),
+        (0, "200 OK", response().to_string()),
+        (0, "200 OK", response().to_string()),
+    ])
+    .await;
+    let client = Arc::new(quick_client(dir.path(), url));
+    let calls = (0..3).map(|_| {
+        let client = client.clone();
+        tokio::spawn(async move { ask(&client).await })
+    });
+    for result in futures::future::join_all(calls).await {
+        assert_eq!(result.unwrap().unwrap().0.len(), 2);
+    }
+    server.await.unwrap();
+    assert!(client.spending_stop_reason().is_none());
+    let states = client.providers.lock().unwrap();
+    assert!(!states[0].disabled);
+    assert_eq!(states[0].auth_strikes, 0, "an answer ends the episode");
+    drop(states);
+    let ledger = client.ledger.lock().unwrap();
+    assert_eq!(
+        ledger.accounted_nanos,
+        3 * client.backend.cost_nanos(100).unwrap(),
+        "rejected requests cost nothing"
+    );
+    drop(ledger);
+    let rejected = traces_in_state(dir.path(), "credentials_rejected");
+    assert_eq!(rejected.len(), 3);
+    assert_eq!(rejected.iter().filter(|t| t["pause_ms"] == 50).count(), 1);
+}
+
+#[tokio::test]
+async fn a_rejection_after_every_pause_ends_spending_on_the_only_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = scripted_server(vec![
+        (0, "401 Unauthorized", "{}".into()),
+        (0, "401 Unauthorized", "{}".into()),
+    ])
+    .await;
+    let client = quick_client(dir.path(), url);
+    let error = format!("{:#}", ask(&client).await.unwrap_err());
+    server.await.unwrap();
+    assert!(error.contains("HTTP 401"), "{error}");
+    assert!(client.ledger.lock().unwrap().authentication_failed);
+    assert_eq!(traces_in_state(dir.path(), "credentials_rejected").len(), 1);
+}
+
+#[tokio::test]
+async fn a_server_error_is_sent_again_once_and_keeps_its_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = scripted_server(vec![
+        (0, "503 Service Unavailable", "{}".into()),
+        (0, "200 OK", response().to_string()),
+    ])
+    .await;
+    let client = quick_client(dir.path(), url);
+    let reservation = client.backend.reservation().unwrap();
+    assert_eq!(ask(&client).await.unwrap().0.len(), 2);
+    server.await.unwrap();
+    let usage = client.usage();
+    assert_eq!((usage.requests, usage.retried_requests), (2, 1));
+    let (accounted, unresolved) = {
+        let ledger = client.ledger.lock().unwrap();
+        (ledger.accounted_nanos, ledger.consecutive_unresolved)
+    };
+    assert_eq!(
+        accounted,
+        reservation + client.backend.cost_nanos(100).unwrap(),
+        "the failed send may have run, so it keeps its reservation"
+    );
+    assert_eq!(unresolved, 0);
+    let retried = traces_in_state(dir.path(), "http_error");
+    assert_eq!((retried.len(), &retried[0]["retried"]), (1, &json!(true)));
+
+    // A second server error of the same call fails it.
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = scripted_server(vec![
+        (0, "502 Bad Gateway", "{}".into()),
+        (0, "502 Bad Gateway", "{}".into()),
+    ])
+    .await;
+    let client = quick_client(dir.path(), url);
+    let error = ask(&client).await.unwrap_err();
+    server.await.unwrap();
+    assert_eq!(failure_cause(&error), Some("http_502"));
+    assert_eq!(
+        (client.usage().requests, client.usage().retried_requests),
+        (2, 1)
+    );
+}
+
+#[tokio::test]
+async fn the_run_stops_sending_calls_again_when_its_retries_are_spent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = scripted_server(vec![
+        (0, "500 Internal Server Error", "{}".into()),
+        (0, "200 OK", response().to_string()),
+        (0, "500 Internal Server Error", "{}".into()),
+    ])
+    .await;
+    let client = quick_client(dir.path(), url);
+    client
+        .retries_left
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    assert!(ask(&client).await.is_ok());
+    assert_eq!(
+        failure_cause(&ask(&client).await.unwrap_err()),
+        Some("http_500")
+    );
+    server.await.unwrap();
+    assert_eq!(client.usage().retried_requests, 1);
+}
+
+#[tokio::test]
+async fn a_token_refresh_replaces_the_token_that_every_cloudflare_provider_sends() {
+    let config = RunConfig {
+        budget_usd: 1.0,
+        ..RunConfig::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let http = HttpRecorder::new(dir.path(), &config).unwrap();
+    let minted = Arc::new(Mutex::new(vec!["second", "first"]));
+    let tokens = minted.clone();
+    let client = JevClient::with_settings(
+        &config,
+        &http,
+        |key| match key {
+            "CLOUDFLARE_ACCOUNT_ID" => Some("0123456789abcdef0123456789abcdef".into()),
+            "JEV_CLOUDFLARE_AUTH_PROFILE" => Some("work".into()),
+            _ => None,
+        },
+        move |profile| {
+            assert_eq!(profile, "work");
+            Ok(tokens.lock().unwrap().pop().unwrap_or("second").to_owned())
+        },
+    )
+    .unwrap();
+    let bearer = |provider: usize| {
+        let (_, headers, _) =
+            request_parts(client.chain()[provider], &json!({}), &Map::new()).unwrap();
+        headers
+            .into_iter()
+            .find(|(name, _)| name == "authorization")
+            .unwrap()
+            .1
+    };
+    assert_eq!(client.fallback_from, Some(1));
+    assert_eq!(
+        (bearer(0), bearer(1)),
+        ("Bearer first".into(), "Bearer first".into())
+    );
+    assert_eq!(client.refresh_token().await, Some("replaced"));
+    assert_eq!(
+        (bearer(0), bearer(1)),
+        ("Bearer second".into(), "Bearer second".into())
+    );
+    assert_eq!(client.refresh_token().await, Some("unchanged"));
+    assert!(minted.lock().unwrap().is_empty());
+
+    // A static token has nothing to refresh.
+    let client = JevClient::with_settings(
+        &config,
+        &http,
+        |key| match key {
+            "CLOUDFLARE_ACCOUNT_ID" => Some("0123456789abcdef0123456789abcdef".into()),
+            "CLOUDFLARE_API_TOKEN" => Some("static".into()),
+            _ => None,
+        },
+        |_| panic!("A static token needs no profile"),
+    )
+    .unwrap();
+    assert_eq!(client.refresh_token().await, None);
+}
+
+#[tokio::test]
+async fn a_failed_token_refresh_keeps_the_old_token() {
+    let config = RunConfig {
+        budget_usd: 1.0,
+        ..RunConfig::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let http = HttpRecorder::new(dir.path(), &config).unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counted = calls.clone();
+    let client = JevClient::with_settings(
+        &config,
+        &http,
+        |key| match key {
+            "CLOUDFLARE_ACCOUNT_ID" => Some("0123456789abcdef0123456789abcdef".into()),
+            "JEV_CLOUDFLARE_AUTH_PROFILE" => Some("work".into()),
+            _ => None,
+        },
+        move |_| match counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => Ok("kept".into()),
+            _ => bail!("Wrangler authentication failed"),
+        },
+    )
+    .unwrap();
+    assert_eq!(client.refresh_token().await, Some("failed"));
+    let (_, headers, _) = request_parts(client.chain()[0], &json!({}), &Map::new()).unwrap();
+    assert!(headers.contains(&("authorization".into(), "Bearer kept".into())));
+}
+
+/// Jev at `primary` and the fallback model at `fallback`.
+fn fallback_client(dir: &Path, primary: String, fallback: String) -> JevClient {
+    let mut client = two_provider_client(dir, primary, fallback);
+    client.fallback_from = Some(1);
+    client.auth_pauses.clear();
+    client
+}
+
+#[tokio::test]
+async fn the_fallback_model_answers_when_no_jev_provider_is_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (jev, jev_server) = scripted_server(vec![(0, "401 Unauthorized", "{}".into())]).await;
+    let (clef, clef_server) = scripted_server(vec![
+        (0, "200 OK", response().to_string()),
+        (0, "200 OK", response().to_string()),
+    ])
+    .await;
+    let client = fallback_client(dir.path(), jev, clef);
+    assert!(ask(&client).await.is_ok());
+    assert!(ask(&client).await.is_ok());
+    jev_server.await.unwrap();
+    clef_server.await.unwrap();
+    assert!(client.providers.lock().unwrap()[0].disabled);
+    assert_eq!(
+        client.usage().provider_requests,
+        BTreeMap::from([("loopback/fallback".into(), 2)])
+    );
+}
+
+#[tokio::test]
+async fn a_short_cooldown_waits_for_jev_and_a_long_one_moves_to_the_fallback() {
+    // Cooling within FALLBACK_AFTER: the call waits for Jev.
+    let dir = tempfile::tempdir().unwrap();
+    let (jev, jev_server) = scripted_server(vec![
+        (0, "429 Too Many Requests", "{}".into()),
+        (0, "200 OK", response().to_string()),
+    ])
+    .await;
+    let mut client = fallback_client(dir.path(), jev, refusing_url());
+    client.rate_limit_wait = Some(Duration::from_millis(20));
+    assert!(ask(&client).await.is_ok());
+    jev_server.await.unwrap();
+    assert_eq!(
+        client.usage().provider_requests,
+        BTreeMap::from([("loopback".into(), 1)])
+    );
+
+    // Cooling past FALLBACK_AFTER: the fallback answers at once.
+    let dir = tempfile::tempdir().unwrap();
+    let (jev, jev_server) = scripted_server(vec![(0, "429 Too Many Requests", "{}".into())]).await;
+    let (clef, clef_server) = scripted_server(vec![(0, "200 OK", response().to_string())]).await;
+    let mut client = fallback_client(dir.path(), jev, clef);
+    client.rate_limit_wait = Some(FALLBACK_AFTER * 4);
+    let started = std::time::Instant::now();
+    assert!(ask(&client).await.is_ok());
+    assert!(started.elapsed() < FALLBACK_AFTER);
+    jev_server.await.unwrap();
+    clef_server.await.unwrap();
+    assert_eq!(
+        client.usage().provider_requests,
+        BTreeMap::from([("loopback/fallback".into(), 1)])
+    );
+}
+
+#[test]
+fn only_a_send_to_the_fallback_model_reserves_at_its_price() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = client(dir.path(), 1.0);
+    client.backend = offline_cloudflare();
+    client.fallbacks = vec![Backend::Cloudflare {
+        account: "0".repeat(32),
+        token: "offline-placeholder".into(),
+        gateway: "default".into(),
+        model: Model::Clef,
+    }];
+    client.providers = Mutex::new(vec![ProviderState::default(); 2]);
+    client.fallback_from = Some(1);
+    let jev = client.backend.reservation().unwrap();
+    let clef = client.fallbacks[0].reservation().unwrap();
+    assert!(clef > jev);
+    assert_eq!(client.reservation_nanos(None).unwrap(), jev);
+    assert_eq!(client.reservation_nanos(Some(0)).unwrap(), jev);
+    assert_eq!(client.reservation_nanos(Some(1)).unwrap(), clef);
+    assert_eq!(client.label(1), "cloudflare/clef");
+    // A rate for `cloudflare` does not slow the fallback; its own entry does.
+    client.rpm_overrides = rpm_overrides(Some("cloudflare=1".into())).unwrap();
+    assert_eq!(
+        (client.budget(0).per_minute, client.budget(1).per_minute),
+        (1.0, 300.0)
+    );
+    client.rpm_overrides = rpm_overrides(Some("cloudflare/clef=60".into())).unwrap();
+    assert_eq!(client.budget(1).per_minute, 60.0);
+    assert_ne!(client.budget(0).key, client.budget(1).key);
+}
+
+#[test]
+fn the_backoff_doubles_from_its_first_wait_up_to_its_limit() {
+    for (failures, base) in [(1, 2), (2, 4), (3, 8), (6, 64), (7, 90), (40, 90)] {
+        let wait = backoff(failures);
+        let base = Duration::from_secs(base).min(BACKOFF_MAX);
+        assert!(
+            wait >= base && wait <= (base + base / 4).min(BACKOFF_MAX),
+            "{failures}: {wait:?}"
+        );
+    }
 }

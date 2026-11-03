@@ -66,6 +66,18 @@ state, questions, and answer types. Only the `cloudflare` provider serves the Cl
 - A Clef model has its own host send budget, with a default of 300 requests per minute.
 - `doctor` shows the model as `jev_model`.
 
+### Fallback model
+
+When no Jev provider can answer, a Clef model answers on the `cloudflare` provider's account.
+`JEV_FALLBACK_MODEL` selects it: `clef` (default), `clef-flash`, `clef-omni`, or `none`.
+
+- The fallback applies only to `JEV_MODEL=jev`, and only when `cloudflare` is in the chain.
+- It answers a call only in two cases: no Jev provider is enabled, or each enabled one stays cooling
+  or out of send budget for more than 3 seconds.
+- It reserves at its own price, and only when a call goes to it.
+- `usage.provider_requests` counts it as `cloudflare/clef` (or the model that you selected).
+- `doctor` shows it as `jev_fallback_model`.
+
 ## Environment variables
 
 | Variable | Default | Meaning |
@@ -78,8 +90,9 @@ state, questions, and answer types. Only the `cloudflare` provider serves the Cl
 | `JEV_MAX_SEARCHES` | `6` | Searches that may run at once on this host |
 | `JEV_SOURCE_SLOTS` | see [operating.md](operating.md#source-fetch-slots) | Questions that may fetch from one source host at once, as `HOST=N[,HOST=N]` |
 | `JEV_MODEL` | `jev` | Decision model: `jev`, `clef`, `clef-flash`, or `clef-omni`. See [Decision model](#decision-model). |
+| `JEV_FALLBACK_MODEL` | `clef` | Model that answers when no Jev provider can: `clef`, `clef-flash`, `clef-omni`, or `none`. See [Fallback model](#fallback-model). |
 | `JEV_PROVIDERS` | all configured, in chain order | Jev provider order or subset |
-| `JEV_PROVIDER_RPM` | `cloudflare=400,typesafe=3600,openrouter=3600` | Jev requests per minute per provider on this host. A malformed value is an error. |
+| `JEV_PROVIDER_RPM` | `cloudflare=400,typesafe=3600,openrouter=3600,cloudflare/clef=300` | Jev requests per minute per provider on this host. The fallback model has its own entry, such as `cloudflare/clef`. A malformed value is an error. |
 
 The source and provider credentials are in the tables above.
 
@@ -135,7 +148,7 @@ and it leaves pools for `more`. See [operating.md](operating.md#sessions-and-poo
 ## Spending
 
 - `--budget-usd` is a hard limit for one call. A session can spend at most 3 times that value across its calls.
-- Each Jev attempt reserves a worst case first: 65,536 input tokens at the highest provider price, about $0.003.
+- Each Jev attempt reserves a worst case first: 65,536 input tokens at the price of its provider, about $0.003 for Jev.
   When the attempt ends, the reservation settles to the reported cost.
 - When attempts in flight fill the budget, the next attempt waits for one to settle.
   It fails at once only when no attempt is in flight.
@@ -158,12 +171,20 @@ A call goes to the first provider in chain order that is usable. A usable provid
 
 | Event | Result |
 |---|---|
-| HTTP 429 or 529 | Releases the reservation. Cools the provider for every search on the host, for its `Retry-After` (1 to 90 seconds). The call moves to the next provider. |
-| HTTP 401 or 403 | With another provider in the chain: disables the provider for the run and releases the reservation. With no other provider: stops the client. |
+| HTTP 429 or 529 | Releases the reservation. Cools the provider for every search on the host, for its `Retry-After` (1 to 90 seconds) or for the backoff. The call moves to the next provider. |
+| HTTP 401 or 403 | Releases the reservation. Cools the provider for 1 second, then for 4 seconds after a second rejection, and gets the Wrangler token again. A third rejection disables the provider when another one remains, and stops the client when none remains. |
 | HTTP 402 | With another provider: cools the provider and releases the reservation. With no other provider: counts as an unresolved attempt. |
 | Connection fails before the request is sent (DNS, TCP, proxy, TLS) | Releases the reservation. Cools the provider for 30 seconds. The call moves to a provider that is usable at once. |
 | Request refused locally before the send | Releases the reservation. No provider cools. The call fails with the class `other`. |
-| Other HTTP error, read timeout, reset, or incomplete body | Keeps the reservation as spent. Not retried, because the provider may have run the request. |
+| HTTP 5xx (not 501 or 505), read timeout, reset, or incomplete body | Keeps the reservation as spent, because the provider may have run the request. Cools the provider for the backoff, and sends the call again once. |
+| Other HTTP error | Keeps the reservation as spent. Not retried. |
+
+- The backoff is 2 seconds, doubled for each refusal or server error in a row, up to 90 seconds.
+  A random spread of up to a quarter is added. A valid answer resets the count.
+- Rejections of requests that were sent before the latest counted rejection count as one.
+  A new token can be rejected for a short time after Wrangler makes it.
+- A call is not sent again after its hedge starts, after a second failure, or after the stop.
+  A run sends at most 16 calls again. `usage.retried_requests` counts them.
 
 - An attempt that was sent and ends without a usage receipt is unresolved.
   After 3 unresolved attempts in a row, the client stops paid work for the run. A settled attempt resets the count.

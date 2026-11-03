@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type RequestParts = (String, Vec<(String, String)>, Value);
@@ -26,6 +26,34 @@ const NANOS_PER_USD: f64 = 1_000_000_000.0;
 const SHARED_CEILING_USD: f64 = 100.0;
 const AUTH_OUTPUT_LIMIT: usize = 16_384;
 
+/// A Cloudflare credential that a refresh can replace while requests run. Clones share one
+/// value, so the providers that use one Cloudflare account see the same refresh.
+// Never derive Debug: this type holds an authentication value.
+#[derive(Clone)]
+struct Token(Arc<std::sync::RwLock<String>>);
+
+impl Token {
+    fn get(&self) -> String {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set(&self, value: String) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = value;
+    }
+}
+
+impl From<String> for Token {
+    fn from(value: String) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(value)))
+    }
+}
+
+impl From<&str> for Token {
+    fn from(value: &str) -> Self {
+        value.to_owned().into()
+    }
+}
+
 // Never derive Debug: this type holds authentication values.
 enum Backend {
     Fixture,
@@ -38,7 +66,7 @@ enum Backend {
     /// Cloudflare Workers AI through an AI Gateway.
     Cloudflare {
         account: String,
-        token: String,
+        token: Token,
         gateway: String,
         model: Model,
     },
@@ -162,6 +190,37 @@ pub fn model_from(env: &impl Fn(&str) -> Option<String>) -> Result<Model> {
         })
 }
 
+/// The model that answers on Cloudflare when no Jev provider can, from `JEV_FALLBACK_MODEL`. The
+/// default is Clef, which matched Jev's document relevance in a replay. `none` turns the fallback
+/// off. Only Jev has a fallback, and it needs the `cloudflare` provider in the chain.
+pub fn fallback_model_from(env: &impl Fn(&str) -> Option<String>) -> Result<Option<Model>> {
+    let model = model_from(env)?;
+    let value = env("JEV_FALLBACK_MODEL").map(|v| v.trim().to_ascii_lowercase());
+    if model != Model::Jev {
+        ensure!(
+            value.as_deref().is_none_or(|v| v == "none"),
+            "JEV_FALLBACK_MODEL applies only to JEV_MODEL=jev"
+        );
+        return Ok(None);
+    }
+    let Some(value) = value else {
+        return Ok(Some(Model::Clef));
+    };
+    if value == "none" {
+        return Ok(None);
+    }
+    Model::ALL
+        .into_iter()
+        .filter(|m| *m != Model::Jev)
+        .find(|m| m.name() == value)
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "JEV_FALLBACK_MODEL names an unknown fallback: {value} (use clef, clef-flash, clef-omni, none)"
+            )
+        })
+}
+
 /// A Jev call that failed with a known class: a transport class (see
 /// `crate::http::TransportCause`), `http_NNN` for an HTTP error status, or `invalid_response`.
 /// The class names no URL, header, credential, or body, so reports can carry it.
@@ -266,7 +325,7 @@ pub fn provider_origin(name: &str) -> Result<String> {
     match name {
         "cloudflare" => Backend::Cloudflare {
             account: empty(),
-            token: empty(),
+            token: empty().into(),
             gateway: empty(),
             model: Model::Jev,
         },
@@ -304,6 +363,34 @@ const RATE_LIMIT_MAX_WAIT_SECS: u64 = 90;
 /// Sends of one attempt across all providers, refusals and waits included.
 const MAX_SENDS_PER_ATTEMPT: u32 = 8;
 
+/// Pauses after counted credential rejections (401 or 403) of one provider. A new token can be
+/// rejected for a short time after Wrangler mints it, and a token can expire during a run, so a
+/// rejection cools the provider and refreshes a Wrangler token. A counted rejection after the
+/// last pause disables the provider.
+const AUTH_PAUSES: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
+
+/// The first and the longest backoff after a refusal without Retry-After or a server error. Each
+/// failure in a row doubles the wait, with up to a quarter of random spread.
+const BACKOFF_FIRST: Duration = Duration::from_secs(2);
+const BACKOFF_MAX: Duration = Duration::from_secs(RATE_LIMIT_MAX_WAIT_SECS);
+
+/// Calls of one run that may be sent again after a server error (HTTP 5xx) or a transport failure
+/// after the send. Each call is sent again at most once, and each such failure keeps its
+/// reservation, so the unresolved-usage circuit still bounds the spending.
+const RETRIES_PER_RUN: u32 = 16;
+
+/// How long a call waits for a cooling Jev provider before the fallback model answers it. It
+/// stays below the governor's longest single wait, which a longer cooldown reports.
+const FALLBACK_AFTER: Duration = Duration::from_secs(3);
+
+/// The backoff after `failures` refusals or server errors in a row (at least 1).
+fn backoff(failures: u32) -> Duration {
+    let doubled = BACKOFF_FIRST.saturating_mul(1u32 << failures.saturating_sub(1).min(16));
+    let base = doubled.min(BACKOFF_MAX);
+    let spread = (uuid::Uuid::new_v4().as_u128() % 1_000) as u32;
+    (base + base.mul_f64(f64::from(spread) / 4_000.0)).min(BACKOFF_MAX)
+}
+
 /// Unresolved attempts in a row before the client stops. A single upstream block page (HTTP 402
 /// wrapping a Cloudflare challenge) is transient and must not end a run. Each unresolved attempt
 /// retains its full reservation, so the budget stays a hard ceiling.
@@ -339,15 +426,48 @@ struct Call<'a> {
     rate_limited: std::sync::atomic::AtomicBool,
     /// The provider the first attempt last used, so a hedge goes elsewhere when it can.
     first_provider: std::sync::atomic::AtomicUsize,
+    /// Set when the hedge starts. The first attempt is not sent again after a failure then,
+    /// because the hedge decides.
+    hedged: std::sync::atomic::AtomicBool,
 }
 
 /// A provider's standing for the rest of the run. Cooldowns and send budgets live in the host
 /// governor, which every search on the host shares.
 #[derive(Clone, Copy, Default)]
 struct ProviderState {
-    /// Rejected the credentials (401 or 403), or did not answer the network check: never used
-    /// again in this run.
+    /// Kept rejecting the credentials (401 or 403) after its pauses, or did not answer the network
+    /// check: never used again in this run.
     disabled: bool,
+    /// Credential rejections counted since the provider last answered. A rejection of a request
+    /// sent before the latest counted one belongs to the same episode and does not count again.
+    auth_strikes: u32,
+    /// When the latest counted credential rejection arrived.
+    strike_at: Option<std::time::Instant>,
+    /// Refusals and server errors since the provider last answered, for the backoff.
+    failures: u32,
+}
+
+/// Gets a Cloudflare token for a Wrangler profile.
+type Resolve = dyn Fn(&str) -> Result<String> + Send + Sync;
+
+/// What a credential rejection (401 or 403) does.
+enum Rejection {
+    /// The request was sent before the latest counted rejection: the provider already cools.
+    Again,
+    /// The provider cools this long, and a Wrangler token is refreshed.
+    Pause(Duration),
+    /// No pause remains: the rejection disables the provider, or ends the run's spending.
+    Final,
+}
+
+/// A Cloudflare token from a Wrangler profile, which a refresh can replace after a rejection.
+/// Wrangler returns its stored token until that expires, and then a new one.
+struct Refresh {
+    profile: String,
+    token: Token,
+    resolve: Arc<Resolve>,
+    /// One refresh at a time.
+    running: tokio::sync::Mutex<()>,
 }
 
 struct Attempted {
@@ -429,6 +549,15 @@ pub struct JevClient {
     recheck: tokio::sync::Mutex<()>,
     /// Network checks run after connect failures so far.
     rechecks: std::sync::atomic::AtomicU64,
+    /// The chain index of the fallback model's provider, which answers only when no provider of
+    /// the selected model can. It is last in the chain.
+    fallback_from: Option<usize>,
+    /// Refreshes a Cloudflare token from its Wrangler profile after a credential rejection.
+    refresh: Option<Refresh>,
+    /// Tests replace `AUTH_PAUSES`.
+    auth_pauses: Vec<Duration>,
+    /// Calls that may still be sent again after a server error or a failed response.
+    retries_left: std::sync::atomic::AtomicU32,
 }
 
 impl JevClient {
@@ -466,7 +595,7 @@ impl JevClient {
         config: &RunConfig,
         http: &HttpRecorder,
         env: impl Fn(&str) -> Option<String>,
-        resolve: impl FnOnce(&str) -> Result<String>,
+        resolve: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
     ) -> Result<Self> {
         ensure!(
             config.budget_usd.is_finite() && config.budget_usd >= 0.0,
@@ -484,8 +613,25 @@ impl JevClient {
                 config.budget_usd > 0.0,
                 "Live Jev requires --budget-usd above zero"
             );
-            providers_from(&env, resolve)?
+            providers_from(&env, |profile: &str| resolve(profile))?
         };
+        let refresh = env("CLOUDFLARE_API_TOKEN")
+            .is_none()
+            .then(|| env("JEV_CLOUDFLARE_AUTH_PROFILE"))
+            .flatten()
+            .zip(chain.iter().find_map(|backend| match backend {
+                Backend::Cloudflare { token, .. } => Some(token.clone()),
+                _ => None,
+            }))
+            .map(|(profile, token)| Refresh {
+                profile,
+                token,
+                resolve: Arc::new(resolve),
+                running: tokio::sync::Mutex::new(()),
+            });
+        let fallback_from = chain
+            .iter()
+            .position(|b| matches!(b, Backend::Cloudflare { model: m, .. } if *m != model));
         let backend = chain.remove(0);
         let fallbacks = chain;
         let audit_dir = http.run_dir().join("jev");
@@ -521,9 +667,13 @@ impl JevClient {
             offline: tokio::sync::watch::Sender::new(None),
             recheck: tokio::sync::Mutex::new(()),
             rechecks: std::sync::atomic::AtomicU64::new(0),
+            fallback_from,
+            refresh,
+            auth_pauses: AUTH_PAUSES.to_vec(),
+            retries_left: std::sync::atomic::AtomicU32::new(RETRIES_PER_RUN),
         };
         client.write_audit("accounting-policy", &json!({
-            "providers": client.chain().iter().map(|b| b.name()).collect::<Vec<_>>(),
+            "providers": (0..client.chain().len()).map(|i| client.label(i)).collect::<Vec<_>>(),
             "model": model.name(),
             "run_budget_usd": config.budget_usd,
             "shared_ceiling_usd": SHARED_CEILING_USD,
@@ -531,10 +681,12 @@ impl JevClient {
             "input_usd_per_million": model.usd_per_million(), "output_usd_per_million": 0.0,
             "credit_purchase_multipliers": {"cloudflare": 1.05, "openrouter": 444.0 / 420.0, "typesafe": 1.0},
             "reservation_input_tokens_per_request": MAX_INPUT_TOKENS,
-            "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and each provider's credit purchase overhead; reservations use the highest provider price",
-            "retry_policy": "each provider runs a request once (Cloudflare: cf-aig-max-attempts: 1); the client sends again only after a response that means the request was not run (429, 529, 402, 401, 403), or after a connection that failed before the request was sent, per rate_limit_policy and provider_chain_policy, at most 8 sends per attempt",
-            "rate_limit_policy": "HTTP 429 or 529 releases the reservation, because the provider did not run the request, and cools that provider for every search on the host for Retry-After (1 to 90 s); the call moves to the next available provider at once; a hedge does not wait",
-            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; a connection that fails before the request is sent (name resolution, TCP, a proxy tunnel, or the TLS handshake) releases the reservation and cools the provider, and the call moves on only when another provider is usable at once; otherwise the call fails and the network check runs again (see network_check_policy); a request refused locally before the send point (a request limit or a URL rule) releases the reservation and fails the call, and no provider cools; other transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
+            "cost_usd_semantics": "conservative accounted cost; includes uncertain attempts and each provider's credit purchase overhead; each reservation uses the price of the provider it is sent to",
+            "retry_policy": format!("each provider runs a request once (Cloudflare: cf-aig-max-attempts: 1); the client sends again after a response that means the request was not run (429, 529, 402, 401, 403), or after a connection that failed before the request was sent, per rate_limit_policy, credential_policy, and provider_chain_policy, at most 8 sends per attempt; a server error (HTTP 5xx except 501 and 505) or a transport failure after the send keeps its reservation, cools the provider by the backoff, and sends the call again once, on the first usable provider, unless the hedge started, the unresolved-usage circuit opened, or the run's {RETRIES_PER_RUN} retries are spent; usage.retried_requests counts them"),
+            "rate_limit_policy": "HTTP 429 or 529 releases the reservation, because the provider did not run the request, and cools that provider for every search on the host for Retry-After (1 to 90 s), or without one for the backoff: 2 s, doubled for each refusal or server error in a row up to 90 s, plus up to a quarter of random spread; a valid answer resets the count; the call moves to the next available provider at once; a hedge does not wait",
+            "credential_policy": format!("HTTP 401 or 403 releases the reservation; a rejection of a request sent before the provider's latest counted rejection belongs to the same episode and only moves the call on; a counted rejection cools the provider for {:?} in turn and asks Wrangler for the profile's token again, which replaces the token of every Cloudflare provider when Wrangler returns a new one; a counted rejection after the last pause disables the provider (see provider_chain_policy); a valid answer ends the episode", AUTH_PAUSES),
+            "fallback_policy": format!("the fallback model (JEV_FALLBACK_MODEL, default clef; none turns it off) runs on the Cloudflare account of the cloudflare provider and is last in the chain; it answers a call only when no Jev provider is enabled, or when every enabled one stays cooling or out of host send budget for more than {} s; it reserves at its own price only when it is sent; usage.provider_requests names it cloudflare/<model>", FALLBACK_AFTER.as_secs()),
+            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 after every credential pause disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; a connection that fails before the request is sent (name resolution, TCP, a proxy tunnel, or the TLS handshake) releases the reservation and cools the provider, and the call moves on only when another provider is usable at once; otherwise the call fails and the network check runs again (see network_check_policy); a request refused locally before the send point (a request limit or a URL rule) releases the reservation and fails the call, and no provider cools; other transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
             "hedge_policy": "a call unanswered jev_hedge_ms after its request is sent gets one identical hedge request when the budget has room without waiting; the first valid answer wins, so a failed attempt lets the other decide; the cancelled request is charged the winner's input tokens",
             "unresolved_usage_policy": "retain the full reservation of any sent attempt without a valid usage receipt; no automatic retry; stop new reservations after 3 consecutive unresolved attempts; a call refused after the stop reserves nothing, and its item is reported as not assessed after stop",
             "network_check_policy": format!("once, before the first reservation: {NETWORK_CHECK_SCOPE} The wait ends when one provider is reachable; a provider whose check failed by then is not used in this run; when every check fails, nothing is reserved. It runs again on the enabled providers when a connect failure leaves no provider usable, once for the calls at that moment, which wait for its result; while every provider fails, it probes again after 1, 2, and 4 s and starts no round after 10 s; when every round fails, every later call fails at once and nothing is reserved; when one passes, nothing changes"),
@@ -1055,30 +1207,78 @@ impl JevClient {
     }
 
     /// One attempt reserves the worst case at the highest provider price.
-    fn reservation_nanos(&self) -> Result<u64> {
-        self.chain()
-            .iter()
-            .map(|b| b.reservation())
-            .try_fold(0u64, |max, r| r.map(|r| max.max(r)))
+    /// The reservation for a send to `provider`, or without one, the highest among the providers of
+    /// the selected model. The fallback model reserves only when it is sent.
+    fn reservation_nanos(&self, provider: Option<usize>) -> Result<u64> {
+        let chain = self.chain();
+        match provider {
+            Some(provider) => chain[provider].reservation(),
+            None => (0..chain.len())
+                .filter(|&i| !self.is_fallback(i))
+                .map(|i| chain[i].reservation())
+                .try_fold(0u64, |max, r| r.map(|r| max.max(r))),
+        }
+    }
+
+    /// Whether the provider at `provider` serves the fallback model.
+    fn is_fallback(&self, provider: usize) -> bool {
+        self.fallback_from.is_some_and(|from| provider >= from)
+    }
+
+    /// The provider's name in usage counts: `cloudflare/clef` for the fallback model.
+    fn label(&self, provider: usize) -> String {
+        let backend = self.chain()[provider];
+        match backend {
+            _ if !self.is_fallback(provider) => backend.name().to_owned(),
+            Backend::Cloudflare { model, .. } => format!("{}/{}", backend.name(), model.name()),
+            _ => format!("{}/fallback", backend.name()),
+        }
     }
 
     /// The provider's identity and send rate for the host governor.
     fn budget(&self, provider: usize) -> crate::governor::ProviderBudget {
-        provider_budget(self.chain()[provider], &self.rpm_overrides)
+        provider_budget(
+            self.chain()[provider],
+            &self.rpm_overrides,
+            &self.label(provider),
+        )
     }
 
     /// The first provider in chain order that is enabled, not cooling, and has host send budget,
     /// preferring one other than `avoid`. Nothing is spent until the send.
+    ///
+    /// The fallback model answers only when no provider of the selected model is enabled, or when
+    /// each one will stay cooling or out of budget for longer than `FALLBACK_AFTER`.
     fn pick_provider(&self, avoid: Option<usize>) -> Result<crate::governor::Send> {
-        let usable: Vec<bool> = self
+        use crate::governor::Send;
+        let enabled: Vec<bool> = self
             .providers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|s| !s.disabled)
             .collect();
-        let budgets: Vec<_> = (0..usable.len()).map(|i| self.budget(i)).collect();
-        self.governor.choose(&budgets, &usable, avoid)
+        let tier = |fallback: bool| -> Vec<bool> {
+            (0..enabled.len())
+                .map(|i| enabled[i] && self.is_fallback(i) == fallback)
+                .collect()
+        };
+        let budgets: Vec<_> = (0..enabled.len()).map(|i| self.budget(i)).collect();
+        let primary = self.governor.choose(&budgets, &tier(false), avoid)?;
+        let fallback = tier(true);
+        if !fallback.contains(&true) {
+            return Ok(primary);
+        }
+        Ok(match primary {
+            Send::Go(_) => primary,
+            Send::Wait(wait) if wait <= FALLBACK_AFTER => primary,
+            _ => match (self.governor.choose(&budgets, &fallback, avoid)?, primary) {
+                (Send::Go(i), _) => Send::Go(i),
+                (Send::Wait(a), Send::Wait(b)) => Send::Wait(a.min(b)),
+                (Send::Wait(a), _) => Send::Wait(a),
+                (Send::None, primary) => primary,
+            },
+        })
     }
 
     /// Cool a provider for every search on the host. A shorter Retry-After never cuts an existing
@@ -1097,6 +1297,82 @@ impl JevClient {
                 .governor
                 .consume(&self.budget(provider))
                 .unwrap_or(false)
+    }
+
+    /// Count a credential rejection of a request sent at `sent_at`.
+    fn credential_rejected(&self, provider: usize, sent_at: std::time::Instant) -> Rejection {
+        let mut states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut states[provider];
+        if state.strike_at.is_some_and(|at| sent_at < at) {
+            return Rejection::Again;
+        }
+        state.auth_strikes += 1;
+        state.strike_at = Some(std::time::Instant::now());
+        match self.auth_pauses.get(state.auth_strikes as usize - 1) {
+            Some(&pause) => Rejection::Pause(pause),
+            None => Rejection::Final,
+        }
+    }
+
+    /// Count one refusal or server error of a provider and return its failures in a row.
+    fn note_failure(&self, provider: usize) -> u32 {
+        let mut states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
+        states[provider].failures = states[provider].failures.saturating_add(1);
+        states[provider].failures
+    }
+
+    /// A valid answer ends the provider's rejection episode and its failures in a row.
+    fn provider_answered(&self, provider: usize) {
+        let mut states = self.providers.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut states[provider];
+        state.auth_strikes = 0;
+        state.strike_at = None;
+        state.failures = 0;
+    }
+
+    /// Whether the first attempt of `call` may be sent again after a server error or a failed
+    /// response: once per call, not after the hedge started, and within the run's retries.
+    fn may_retry(&self, call: &Call<'_>, attempt: u32, retried: &mut bool) -> bool {
+        use std::sync::atomic::Ordering;
+        if attempt > 0 || *retried || call.hedged.load(Ordering::SeqCst) {
+            return false;
+        }
+        let taken = self
+            .retries_left
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if taken {
+            *retried = true;
+            self.ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .usage
+                .retried_requests += 1;
+        }
+        taken
+    }
+
+    /// Ask Wrangler for the profile's token again and use it for later Cloudflare requests.
+    /// Returns `replaced`, `unchanged`, or `failed`, or `None` without a Wrangler profile.
+    async fn refresh_token(&self) -> Option<&'static str> {
+        let refresh = self.refresh.as_ref()?;
+        let _one = refresh.running.lock().await;
+        let (resolve, profile) = (refresh.resolve.clone(), refresh.profile.clone());
+        let token = tokio::task::spawn_blocking(move || resolve(&profile))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|token| header_setting("The refreshed Cloudflare token", token).ok());
+        Some(match token {
+            Some(token) if token != refresh.token.get() => {
+                refresh.token.set(token);
+                "replaced"
+            }
+            Some(_) => "unchanged",
+            None => "failed",
+        })
     }
 
     /// Disable a provider whose credentials were rejected.
@@ -1385,19 +1661,19 @@ impl JevClient {
     /// Reserve without waiting. Fails when the budget cannot cover another attempt now.
     #[cfg(test)]
     fn reserve(&self) -> Result<u64> {
-        self.reserve_now(false)?
+        self.reserve_now(None, false)?
             .context("Jev budget cannot cover another complete attempt")
     }
 
     /// Reserve, and wait while unsettled reservations are what fills the budget. Each in-flight
     /// attempt ends in `settle`, `retain_unresolved`, or a stop flag, and each wakes this wait. Parallel
     /// scoring under a small budget therefore waits for room instead of failing.
-    async fn reserve_waiting(&self) -> Result<u64> {
+    async fn reserve_waiting(&self, provider: usize) -> Result<u64> {
         loop {
             let notified = self.settled.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(reservation) = self.reserve_now(true)? {
+            if let Some(reservation) = self.reserve_now(Some(provider), true)? {
                 return Ok(reservation);
             }
             notified.await;
@@ -1405,8 +1681,8 @@ impl JevClient {
     }
 
     /// `Ok(None)` means: wait, because in-flight reservations may still settle below budget.
-    fn reserve_now(&self, may_wait: bool) -> Result<Option<u64>> {
-        let reservation = self.reservation_nanos()?;
+    fn reserve_now(&self, provider: Option<usize>, may_wait: bool) -> Result<Option<u64>> {
+        let reservation = self.reservation_nanos(provider)?;
         let mut ledger = self
             .ledger
             .lock()
@@ -1515,7 +1791,7 @@ impl JevClient {
             *ledger
                 .usage
                 .provider_requests
-                .entry(self.chain()[provider].name().to_owned())
+                .entry(self.label(provider))
                 .or_default() += 1;
             ledger.usage.input_tokens = ledger
                 .usage
@@ -1638,6 +1914,7 @@ impl JevClient {
             sent: tokio::sync::Notify::new(),
             rate_limited: std::sync::atomic::AtomicBool::new(false),
             first_provider: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            hedged: std::sync::atomic::AtomicBool::new(false),
         };
         let first = self.attempt(&call, 0);
         tokio::pin!(first);
@@ -1656,6 +1933,7 @@ impl JevClient {
         if call.rate_limited.load(std::sync::atomic::Ordering::SeqCst) {
             return first.await.map(|a| (a.answers, a.path));
         }
+        call.hedged.store(true, std::sync::atomic::Ordering::SeqCst);
         let second = self.attempt(&call, 1);
         tokio::pin!(second);
         // The first valid answer wins. When one attempt fails, the other one decides.
@@ -1687,6 +1965,8 @@ impl JevClient {
         let mut wait_deadline: Option<std::time::Instant> = None;
         let mut tries = 0u32;
         let mut refusals = 0u32;
+        // Set once the call was sent again after a server error or a failed response.
+        let mut retried = false;
         loop {
             // Before each reservation: a failed network check ends the call here.
             self.check_network().await?;
@@ -1749,16 +2029,20 @@ impl JevClient {
             let (url, headers, body) = request_parts(backend, call.state, call.questions)?;
             // Decided once the request holds its permit: the provider may have been cooled,
             // disabled, or spent by another call while this one waited.
+            // The send time, taken when the request holds its permit, places a credential
+            // rejection before or after the latest counted one.
+            let sent_at = Mutex::new(std::time::Instant::now());
             let stop = || {
+                *sent_at.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
                 self.offline.borrow().is_some()
                     || (attempt > 0 && call.rate_limited.load(std::sync::atomic::Ordering::SeqCst))
                     || !self.send_now(provider)
             };
             let reservation = if attempt == 0 {
-                self.reserve_waiting().await?
+                self.reserve_waiting(provider).await?
             } else {
                 let reservation = self
-                    .reserve_now(false)?
+                    .reserve_now(Some(provider), false)?
                     .context("The Jev budget has no room for a hedge request")?;
                 let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
                 ledger.usage.hedged_requests += 1;
@@ -1875,6 +2159,17 @@ impl JevClient {
                     trace["state"] = json!("transport_error_or_incomplete_body");
                     trace["accounting"] =
                         json!("Full reservation retained; provider completion is unknown.");
+                    if !opened && self.may_retry(call, attempt, &mut retried) {
+                        let failures = self.note_failure(provider);
+                        self.cool_provider(
+                            provider,
+                            self.rate_limit_wait.unwrap_or_else(|| backoff(failures)),
+                        )?;
+                        trace["retried"] = json!(true);
+                        self.write_audit(&audit_name, &trace)?;
+                        pending.finished = true;
+                        continue;
+                    }
                     let path = self.write_audit(&audit_name, &trace)?;
                     // Accounted by retain_unresolved; the drop guard must not stop the client again.
                     pending.finished = true;
@@ -1887,16 +2182,16 @@ impl JevClient {
             };
             trace["http_status"] = json!(response.status);
             trace["response_artifact"] = json!(response.artifact);
-            let wait = self.rate_limit_wait.unwrap_or_else(|| {
-                Duration::from_secs(
-                    response
-                        .headers
-                        .get("retry-after")
-                        .and_then(|v| v.trim().parse::<u64>().ok())
-                        .unwrap_or(RATE_LIMIT_DEFAULT_WAIT_SECS)
-                        .clamp(1, RATE_LIMIT_MAX_WAIT_SECS),
-                )
-            });
+            // The provider's Retry-After, or else the backoff for its failures in a row.
+            let retry_after = response
+                .headers
+                .get("retry-after")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(|secs| Duration::from_secs(secs.clamp(1, RATE_LIMIT_MAX_WAIT_SECS)));
+            let wait = |failures: u32| {
+                self.rate_limit_wait
+                    .unwrap_or_else(|| retry_after.unwrap_or_else(|| backoff(failures)))
+            };
             // 429 (rate limited) and 529 (overloaded) mean the provider did not run the request, so
             // nothing was spent. The provider cools down and the call moves to the next usable
             // provider at once; it waits only when none is usable. With another provider in the
@@ -1905,7 +2200,8 @@ impl JevClient {
             if matches!(response.status, 429 | 529) || (response.status == 402 && others) {
                 self.release_unrun(reservation, attempt > 0, response.status != 402);
                 refusals += 1;
-                self.cool_provider(provider, wait)?;
+                let failures = self.note_failure(provider);
+                self.cool_provider(provider, wait(failures))?;
                 trace["state"] = json!("rate_limited");
                 trace["accounting"] =
                     json!("Reservation released; the provider did not run the request.");
@@ -1913,7 +2209,34 @@ impl JevClient {
                 pending.finished = true;
                 continue;
             }
-            // Rejected credentials disable only this provider while another remains.
+            // A rejection soon after another one of the same episode, or one that a pause remains
+            // for, cools the provider and releases the reservation: the provider did not run the
+            // request. A pause also refreshes a Wrangler token.
+            if matches!(response.status, 401 | 403) {
+                let sent_at = *sent_at.lock().unwrap_or_else(|e| e.into_inner());
+                let rejection = self.credential_rejected(provider, sent_at);
+                if let Rejection::Again | Rejection::Pause(_) = rejection {
+                    refusals += 1;
+                    self.release_unrun(reservation, attempt > 0, false);
+                    trace["state"] = json!("credentials_rejected");
+                    if let Rejection::Pause(pause) = rejection {
+                        self.cool_provider(provider, pause)?;
+                        trace["pause_ms"] = json!(pause.as_millis() as u64);
+                        if matches!(backend, Backend::Cloudflare { .. }) {
+                            if let Some(outcome) = self.refresh_token().await {
+                                trace["token_refresh"] = json!(outcome);
+                            }
+                        }
+                    }
+                    trace["accounting"] =
+                        json!("Reservation released; the provider rejected the credentials.");
+                    self.write_audit(&audit_name, &trace)?;
+                    pending.finished = true;
+                    continue;
+                }
+            }
+            // Credentials still rejected after every pause disable only this provider while
+            // another remains.
             if matches!(response.status, 401 | 403) && others {
                 refusals += 1;
                 self.disable_provider(provider);
@@ -1936,6 +2259,20 @@ impl JevClient {
                 trace["unresolved_usage_circuit_open"] = json!(opened);
                 trace["state"] = json!("http_error");
                 trace["accounting"] = json!("Full reservation retained; no usage receipt.");
+                // A server error (except 501 and 505, which do not change) is sent again once,
+                // after the provider cools.
+                if (500..600).contains(&response.status)
+                    && !matches!(response.status, 501 | 505)
+                    && !opened
+                    && self.may_retry(call, attempt, &mut retried)
+                {
+                    let failures = self.note_failure(provider);
+                    self.cool_provider(provider, wait(failures))?;
+                    trace["retried"] = json!(true);
+                    self.write_audit(&audit_name, &trace)?;
+                    pending.finished = true;
+                    continue;
+                }
                 let path = self.write_audit(&audit_name, &trace)?;
                 pending.finished = true;
                 return Err(CallFailure {
@@ -1948,6 +2285,7 @@ impl JevClient {
             let parsed = parse_response(&response.body, expected);
             match parsed {
                 Ok(parsed) => {
+                    self.provider_answered(provider);
                     let settlement = self.settle_on(
                         provider,
                         reservation,
@@ -2056,7 +2394,7 @@ fn request_parts(
             model,
         } => {
             headers.extend([
-                ("authorization".into(), format!("Bearer {token}")),
+                ("authorization".into(), format!("Bearer {}", token.get())),
                 ("cf-aig-gateway-id".into(), gateway.clone()),
                 ("cf-aig-max-attempts".into(), "1".into()),
                 ("cf-aig-skip-cache".into(), "true".into()),
@@ -2318,8 +2656,13 @@ fn rpm_overrides(value: Option<String>) -> Result<BTreeMap<String, f64>> {
             .split_once('=')
             .with_context(|| format!("JEV_PROVIDER_RPM entry {pair:?} is not NAME=NUMBER"))?;
         let name = name.trim();
+        let fallback = name.strip_prefix("cloudflare/").is_some_and(|model| {
+            Model::ALL
+                .iter()
+                .any(|m| *m != Model::Jev && m.name() == model)
+        });
         ensure!(
-            PROVIDERS.contains(&name),
+            PROVIDERS.contains(&name) || fallback,
             "JEV_PROVIDER_RPM names an unknown provider {name:?}"
         );
         let rpm: f64 = rpm
@@ -2335,10 +2678,12 @@ fn rpm_overrides(value: Option<String>) -> Result<BTreeMap<String, f64>> {
 
 /// The provider's host budget identity and rate. The key is the provider name plus a digest of the
 /// account, gateway, and model, or of the key, so separate credentials and Workers AI models keep
-/// separate budgets.
+/// separate budgets. `label` names the provider in `JEV_PROVIDER_RPM`: the fallback model has its
+/// own entry, such as `cloudflare/clef`.
 fn provider_budget(
     backend: &Backend,
     overrides: &BTreeMap<String, f64>,
+    label: &str,
 ) -> crate::governor::ProviderBudget {
     let identity = match backend {
         Backend::Cloudflare {
@@ -2357,7 +2702,7 @@ fn provider_budget(
     crate::governor::ProviderBudget {
         key: format!("{name}:{}", &digest[..12]),
         per_minute: overrides
-            .get(name)
+            .get(label)
             .copied()
             .unwrap_or_else(|| default_rpm(backend)),
     }
@@ -2372,8 +2717,9 @@ fn providers_from(
 ) -> Result<Vec<Backend>> {
     let order = provider_order(&env)?;
     let model = model_from(&env)?;
+    let fallback = fallback_model_from(&env)?;
     let mut resolve = Some(resolve);
-    order
+    let mut chain = order
         .iter()
         .map(|name| match name.as_str() {
             "cloudflare" => {
@@ -2392,7 +2738,26 @@ fn providers_from(
                 )?,
             }),
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    // The fallback model shares the Cloudflare account, gateway, and token, and it comes last.
+    let shared = chain.iter().find_map(|backend| match backend {
+        Backend::Cloudflare {
+            account,
+            token,
+            gateway,
+            ..
+        } => Some((account.clone(), token.clone(), gateway.clone())),
+        _ => None,
+    });
+    if let (Some(model), Some((account, token, gateway))) = (fallback, shared) {
+        chain.push(Backend::Cloudflare {
+            account,
+            token,
+            gateway,
+            model,
+        });
+    }
+    Ok(chain)
 }
 
 /// A setting that each request sends in an HTTP header. A value that cannot be a header value, for
@@ -2480,7 +2845,8 @@ fn cloudflare_from(
             env("CLOUDFLARE_API_TOKEN"),
             env("JEV_CLOUDFLARE_AUTH_PROFILE"),
             resolve,
-        )?,
+        )?
+        .into(),
         gateway: header_setting(
             "JEV_GATEWAY_ID",
             env("JEV_GATEWAY_ID").unwrap_or_else(|| "default".into()),

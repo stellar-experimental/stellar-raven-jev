@@ -1682,6 +1682,7 @@ pub(crate) fn add_usage(a: &Usage, b: &Usage) -> Usage {
         cost_usd: a.cost_usd + b.cost_usd,
         hedged_requests: a.hedged_requests + b.hedged_requests,
         rate_limited_requests: a.rate_limited_requests + b.rate_limited_requests,
+        retried_requests: a.retried_requests + b.retried_requests,
         provider_requests,
         provider_wait_ms: a.provider_wait_ms + b.provider_wait_ms,
     }

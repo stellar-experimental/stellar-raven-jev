@@ -78,7 +78,11 @@ pub struct Usage {
     pub hedged_requests: u64,
     /// Requests a provider rejected with HTTP 429 or 529. They are not in `requests` and cost nothing.
     pub rate_limited_requests: u64,
-    /// Settled requests per provider (`cloudflare`, `typesafe`, `openrouter`).
+    /// Calls sent again after a server error or a failed response. Each failed send keeps its
+    /// reservation and is in `requests`.
+    pub retried_requests: u64,
+    /// Settled requests per provider (`cloudflare`, `typesafe`, `openrouter`, and
+    /// `cloudflare/<model>` for the fallback model).
     pub provider_requests: std::collections::BTreeMap<String, u64>,
     /// Time calls waited because every usable provider was cooling or out of host send budget.
     pub provider_wait_ms: u64,
