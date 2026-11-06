@@ -357,6 +357,8 @@ struct LoadCounters {
     server_errors: AtomicU64,
     /// Source reads sent again after a server error or a failed response.
     retried: AtomicU64,
+    /// Retry sends and reservations not yet sent. Unsent reservations are refundable.
+    retry_slots: AtomicU64,
     /// Server errors and failed responses in a row, per host. An answer resets the count.
     host_failures: Mutex<std::collections::BTreeMap<String, u32>>,
     gate_wait_ms: AtomicU64,
@@ -378,6 +380,28 @@ struct LoadCounters {
     cancelled_while_queued: Mutex<std::collections::BTreeMap<String, u64>>,
     /// Time from a sent source request's start to its send, per host: this client's queue time.
     queue_ms: Mutex<std::collections::BTreeMap<String, Vec<u64>>>,
+}
+
+/// One reserved retry. Cancellation before send returns its place in the run's retry budget.
+pub(crate) struct SourceRetry {
+    load: Arc<LoadCounters>,
+    sent: AtomicBool,
+}
+
+impl SourceRetry {
+    fn mark_sent(&self) {
+        if !self.sent.swap(true, Ordering::SeqCst) {
+            self.load.retried.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for SourceRetry {
+    fn drop(&mut self) {
+        if !self.sent.load(Ordering::SeqCst) {
+            self.load.retry_slots.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// One source request waiting for its host permit. Dropping it before `sent`, also by
@@ -581,6 +605,8 @@ pub struct SendGate<'a> {
     pub sending: Option<&'a AtomicBool>,
     /// What this attempt is, for its receipt.
     pub tag: Option<&'a AttemptTag>,
+    /// A reserved source retry, charged only immediately before sending.
+    pub(crate) retry: Option<&'a SourceRetry>,
 }
 
 /// What an attempt is, written to its receipt: its role (`primary`, `hedge`, or `retry`), the hedge
@@ -733,6 +759,8 @@ pub struct TransportFailure {
     /// The HTTP status that arrived before the body failed. `None` when the request failed
     /// before a response.
     pub status: Option<u16>,
+    /// Retry-After received before a response body failed.
+    pub retry_after: Option<Duration>,
     text: String,
 }
 
@@ -742,6 +770,7 @@ impl TransportFailure {
             cause: transport_cause(error),
             unsent: error.is_connect(),
             status: None,
+            retry_after: None,
             text,
         }
     }
@@ -938,14 +967,18 @@ impl HttpRecorder {
         clone
     }
 
-    /// Take one of the run's `limit` source retries. False when they are spent.
-    pub(crate) fn take_source_retry(&self, limit: u64) -> bool {
+    /// Reserve one of the run's `limit` source retries. Dropping it before send refunds it.
+    pub(crate) fn reserve_source_retry(&self, limit: u64) -> Option<SourceRetry> {
         self.load
-            .retried
+            .retry_slots
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 (used < limit).then_some(used + 1)
             })
-            .is_ok()
+            .ok()
+            .map(|_| SourceRetry {
+                load: self.load.clone(),
+                sent: AtomicBool::new(false),
+            })
     }
 
     /// Record whether a source read to `url`'s host and port failed, and return its failures in a
@@ -1509,20 +1542,18 @@ impl HttpRecorder {
 
     /// A source request that repeats an earlier attempt: its receipt has role `retry` and names the
     /// attempt it repeats. It is never hedged.
-    pub async fn request_retry(
+    pub(crate) async fn request_retry(
         &self,
         method: Method,
         url: &str,
         headers: Vec<(String, String)>,
         body: Option<Value>,
-        parent: Option<String>,
-        parent_race: Option<String>,
+        tag: AttemptTag,
+        retry: SourceRetry,
     ) -> Result<HttpResponse> {
         let tag = AttemptTag {
             role: "retry",
-            parent,
-            parent_race,
-            ..AttemptTag::default()
+            ..tag
         };
         self.request_recorded(
             method,
@@ -1532,6 +1563,7 @@ impl HttpRecorder {
             true,
             SendGate {
                 tag: Some(&tag),
+                retry: Some(&retry),
                 ..SendGate::default()
             },
         )
@@ -1837,6 +1869,9 @@ impl HttpRecorder {
             if let Some(sending) = gate.sending {
                 sending.store(true, Ordering::SeqCst);
             }
+            if let Some(retry) = gate.retry {
+                retry.mark_sent();
+            }
             let response = self
                 .client
                 .execute(request)
@@ -1964,6 +1999,7 @@ impl HttpRecorder {
                     let e = e.without_url();
                     TransportFailure {
                         status: Some(status),
+                        retry_after: retry_after(&response_headers),
                         ..TransportFailure::new(
                             &e,
                             format!("Response body failed after HTTP {status}: {e}"),

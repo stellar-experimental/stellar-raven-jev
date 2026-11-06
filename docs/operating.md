@@ -99,7 +99,8 @@ A page on a tier 4 host is tier 4 even when it holds ordinary text.
 
 ### Load
 
-`load` says what capacity limits and failures did to the call. `degraded` is true when evidence was lost:
+`load` says what capacity limits and failures did to the call. `degraded` is true when evidence was lost
+or a source used coarser fallback matching:
 
 - A source was cut, refused, or fell back to coarser matching.
 - Documents went over the scoring limit.
@@ -264,14 +265,17 @@ A source can slow down under load before its rate window fills. A slow source is
 
 - Each host has its own limit of `--concurrency` requests in flight, so a slow host does not delay the others.
 - Identical GET requests in one run share one response.
-- Every source read (Scout, Lumenloop, Algolia, the developer-docs search, and published pages) is sent again at most 2 times.
+- Connector searches and content reads (Scout, Lumenloop, Algolia, the developer-docs search, and published pages) are sent again at most 2 times.
   This happens after HTTP 500, 502, or 503, or after a failure before a complete response.
   A timeout, HTTP 504, a 4xx status, and a rate-limit refusal are not retried. HTTP 504 means the upstream already used its time limit.
+- The optional Algolia index inventory only annotates freshness. One read per application per run is
+  shared across that application's indexes. It is not retried, but source hedging can send a second attempt.
 - The first retry waits 250 ms and the second waits 500 ms. Each wait gets up to the same again of random spread.
   When the host sent a `Retry-After`, the retry waits at least that long. A `Retry-After` above 4 seconds is not retried.
 - A retry starts only if, after its wait, the fetch deadline leaves at least 1 second and at least as long as the attempt before it took.
   The deadline can still cut it.
-- A host that failed 4 reads in a row gets no retries until it answers again. This keeps retries off a host that is down.
+- A host with 4 server or transport failures in a row gets no retries until a read returns a status below 500.
+  Timeouts and non-retryable server errors extend the streak. A request refused locally does not reset it.
 - One run sends at most 64 source retries. `load.source_retried_requests` counts them.
 - A failure report names the earlier attempts, and the reason when a read was not sent again.
 - A Scout HTTP failure report names Scout's `Retry-After` and the `error` field of its JSON body, when Scout sent them.

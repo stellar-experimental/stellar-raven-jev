@@ -530,10 +530,15 @@ async fn http_errors_stop_spending_and_preserve_raw_inflight_receipts() {
             let failure = first.await.unwrap().unwrap_err().to_string();
             assert!(failure.contains(&format!("HTTP {status}")));
             assert!(!failure.contains(TOKEN));
-            assert_eq!(client.ledger.lock().unwrap().authentication_failed, matches!(status, 401 | 403));
-            assert!(client.ledger.lock().unwrap().unresolved_usage);
-            assert_eq!(client.usage().requests, 2);
-            assert_eq!(client.ledger.lock().unwrap().accounted_nanos, 2 * reservation);
+            let auth = matches!(status, 401 | 403);
+            let retained = if auth { 0 } else { reservation };
+            let charged_requests = if auth { 1 } else { 2 };
+            assert_eq!(client.ledger.lock().unwrap().authentication_failed, auth);
+            assert_eq!(client.ledger.lock().unwrap().unresolved_usage, !auth);
+            assert_eq!(client.ledger.lock().unwrap().consecutive_unresolved, u32::from(!auth));
+            assert_eq!(client.ledger.lock().unwrap().in_flight, 1);
+            assert_eq!(client.usage().requests, charged_requests);
+            assert_eq!(client.ledger.lock().unwrap().accounted_nanos, reservation + retained);
             assert_eq!(client.http.metrics()["requests_started"], 2);
 
             let later = (0..16).map(|_| tokio::spawn(evaluate_fixture(client.clone())));
@@ -542,8 +547,8 @@ async fn http_errors_stop_spending_and_preserve_raw_inflight_receipts() {
                 assert!(error.contains(if matches!(status, 401 | 403) { "authentication failure" } else { "unresolved paid-attempt usage" }));
                 assert!(!error.contains(TOKEN));
             }
-            assert_eq!(client.usage().requests, 2);
-            assert_eq!(client.ledger.lock().unwrap().accounted_nanos, 2 * reservation);
+            assert_eq!(client.usage().requests, charged_requests);
+            assert_eq!(client.ledger.lock().unwrap().accounted_nanos, reservation + retained);
             assert_eq!(client.http.metrics()["requests_started"], 2);
             release.send(()).unwrap();
             let (answers, success_path) = inflight.await.unwrap().unwrap();
@@ -552,15 +557,18 @@ async fn http_errors_stop_spending_and_preserve_raw_inflight_receipts() {
 
             let settled = client.backend.cost_nanos(100).unwrap();
             let usage = client.usage();
-            assert_eq!(usage.requests, 2);
+            assert_eq!(usage.requests, charged_requests);
             assert_eq!((usage.input_tokens, usage.output_tokens), (100, 20));
-            assert_eq!(client.ledger.lock().unwrap().accounted_nanos, reservation + settled);
-            assert!((usage.cost_usd - (reservation + settled) as f64 / NANOS_PER_USD).abs() < 1e-12);
+            assert_eq!(client.ledger.lock().unwrap().accounted_nanos, retained + settled);
+            assert_eq!(client.ledger.lock().unwrap().in_flight, 0);
+            assert!((usage.cost_usd - (retained + settled) as f64 / NANOS_PER_USD).abs() < 1e-12);
             assert!(client.reserve().is_err());
             let success: Value = serde_json::from_slice(
                 &std::fs::read(dir.path().join(success_path)).unwrap(),
             ).unwrap();
             assert_eq!(success["state"], "complete");
+            assert!(success.get("reported_provider_cost_usd").is_none());
+            assert_eq!(success["accounted_cost_usd"], settled as f64 / NANOS_PER_USD);
             let traces: Vec<Value> = std::fs::read_dir(dir.path().join("jev")).unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.file_name().unwrap().to_str().unwrap().contains("-attempt-"))
@@ -570,7 +578,7 @@ async fn http_errors_stop_spending_and_preserve_raw_inflight_receipts() {
             let failed = traces.iter().find(|trace| trace["state"] == "http_error").unwrap();
             assert_eq!(failed["http_status"], status);
             assert_eq!(failed["authentication_circuit_open"] == true, matches!(status, 401 | 403));
-            assert_eq!(failed["unresolved_usage_circuit_open"], true);
+            assert_eq!(failed["unresolved_usage_circuit_open"], !auth);
             assert_eq!(failed["reservation_usd"], reservation as f64 / NANOS_PER_USD);
             let artifact = failed["response_artifact"].as_str().unwrap();
             let mut body = Vec::new();
@@ -1983,11 +1991,12 @@ async fn a_refused_connection_moves_the_call_to_the_next_provider_for_free() {
 #[tokio::test]
 async fn a_failure_after_the_request_was_sent_keeps_its_reservation_and_stops() {
     let dir = tempfile::tempdir().unwrap();
-    let (first, _) = hanging_up_server().await;
+    let (first, first_connections) = hanging_up_server().await;
     let (second, second_connections) = hanging_up_server().await;
-    let client = without_retries(two_provider_client(dir.path(), first, second));
+    let mut client = without_retries(two_provider_client(dir.path(), first, second));
+    client.rate_limit_wait = Some(Duration::from_millis(20));
     let reservation = client.backend.reservation().unwrap();
-    for _ in 0..UNRESOLVED_STOP_AFTER {
+    for call in 1..=UNRESOLVED_STOP_AFTER {
         let error = evaluate_one(&client).await.unwrap_err();
         assert_eq!(failure_cause(&error), Some("connection_closed"));
         assert!(!not_assessed_after_stop(&error));
@@ -1995,6 +2004,12 @@ async fn a_failure_after_the_request_was_sent_keeps_its_reservation_and_stops() 
         assert!(
             text.starts_with("Jev transport failed (connection_closed) after the request may have been sent; the reservation remains charged."),
             "{text}"
+        );
+        assert_eq!(
+            first_connections.load(std::sync::atomic::Ordering::SeqCst)
+                + second_connections.load(std::sync::atomic::Ordering::SeqCst),
+            call as usize,
+            "a failed call is not retried; later calls may use another provider"
         );
     }
     // Each sent attempt keeps its reservation. The next call reserves nothing, and its item
@@ -2009,11 +2024,6 @@ async fn a_failure_after_the_request_was_sent_keeps_its_reservation_and_stops() 
     assert_eq!(
         client.ledger.lock().unwrap().accounted_nanos,
         reservation * stop
-    );
-    // The provider may have run the request, so no other provider receives it.
-    assert_eq!(
-        second_connections.load(std::sync::atomic::Ordering::SeqCst),
-        0
     );
     let traces = traces_in_state(dir.path(), "transport_error_or_incomplete_body");
     assert_eq!(traces.len() as u64, stop);
@@ -2437,6 +2447,10 @@ async fn incomplete_and_unreceipted_schema_responses_stop_but_known_usage_stays_
             .collect();
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0]["usage_receipt_accounted"] == true, known);
+        assert!(traces[0].get("reported_provider_cost_usd").is_none());
+        if known {
+            assert_eq!(traces[0]["accounted_cost_usd"], client.usage().cost_usd);
+        }
     }
 }
 
@@ -2508,6 +2522,7 @@ fn accounted_receipt_with_unfinished_audit_stops_without_claiming_unknown_usage(
     let client = client(dir.path(), 1.0);
     let reservation = client.reserve().unwrap();
     let hedge = Hedge::default();
+    let sending = std::sync::atomic::AtomicBool::new(true);
     let mut pending = PendingAttempt {
         client: &client,
         receipt_accounted: false,
@@ -2516,6 +2531,9 @@ fn accounted_receipt_with_unfinished_audit_stops_without_claiming_unknown_usage(
         provider: 0,
         hedge: &hedge,
         audit_name: "unfinished".into(),
+        sending: &sending,
+        retry_counted: None,
+        hedge_attempt: false,
     };
     client.settle(reservation, 100, 20).unwrap();
     pending.receipt_accounted = true;
@@ -2631,18 +2649,36 @@ async fn one_rejected_burst_pauses_the_provider_and_the_call_succeeds_after() {
 
 #[tokio::test]
 async fn a_rejection_after_every_pause_ends_spending_on_the_only_provider() {
-    let dir = tempfile::tempdir().unwrap();
-    let (url, server) = scripted_server(vec![
-        (0, "401 Unauthorized", "{}".into()),
-        (0, "401 Unauthorized", "{}".into()),
-    ])
-    .await;
-    let client = quick_client(dir.path(), url);
-    let error = format!("{:#}", ask(&client).await.unwrap_err());
-    server.await.unwrap();
-    assert!(error.contains("HTTP 401"), "{error}");
-    assert!(client.ledger.lock().unwrap().authentication_failed);
-    assert_eq!(traces_in_state(dir.path(), "credentials_rejected").len(), 1);
+    let mut accounting = Vec::new();
+    for (status, reply) in [(401, "401 Unauthorized"), (403, "403 Forbidden")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, server) = scripted_server(vec![(0, reply, "{}".into()); 3]).await;
+        let mut client = quick_client(dir.path(), url);
+        client.auth_pauses = vec![Duration::from_millis(10), Duration::from_millis(20)];
+        let error = ask(&client).await.unwrap_err();
+        server.await.unwrap();
+        assert_eq!(
+            failure_cause(&error),
+            Some(format!("http_{status}").as_str())
+        );
+        assert!(not_assessed_after_stop(&ask(&client).await.unwrap_err()));
+        assert_eq!(traces_in_state(dir.path(), "credentials_rejected").len(), 2);
+        let ledger = client.ledger.lock().unwrap();
+        assert!(ledger.authentication_failed);
+        accounting.push((
+            status,
+            ledger.accounted_nanos,
+            ledger.usage.requests,
+            ledger.in_flight,
+            ledger.consecutive_unresolved,
+            ledger.unresolved_usage,
+        ));
+    }
+    assert_eq!(
+        accounting,
+        vec![(401, 0, 0, 0, 0, false), (403, 0, 0, 0, 0, false)],
+        "every credential rejection is known not to have run, including the final one"
+    );
 }
 
 #[tokio::test]
@@ -2846,4 +2882,230 @@ fn the_backoff_doubles_from_its_first_wait_up_to_its_limit() {
             "{failures}: {wait:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_hedge_on_another_model_retains_the_loser_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, primary_server) =
+        scripted_server(vec![(300, "200 OK", response().to_string())]).await;
+    let mut other_model = response();
+    other_model["usage"]["input_tokens"] = json!(10);
+    let (fallback, fallback_server) =
+        scripted_server(vec![(0, "200 OK", other_model.to_string())]).await;
+    let mut client = fallback_client(dir.path(), primary, fallback);
+    client.hedge_after = Some(Duration::from_millis(20));
+    // One primary send empties its bucket for a minute; the fallback still has room.
+    client.rpm_overrides.insert("loopback".into(), 1.0);
+    let reservation = client.backend.reservation().unwrap();
+    let result = ask(&client).await;
+    primary_server.await.unwrap();
+    fallback_server.abort();
+    assert!(result.is_ok());
+    assert_eq!(client.usage().requests, 2);
+    assert_eq!(client.usage().hedged_requests, 1);
+    assert_eq!(
+        client.ledger.lock().unwrap().accounted_nanos,
+        reservation + client.fallbacks[0].cost_nanos(10).unwrap(),
+        "another model's receipt cannot settle the loser's reservation"
+    );
+    assert_eq!(client.usage().input_tokens, 10);
+    assert_eq!(client.ledger.lock().unwrap().in_flight, 0);
+    assert!(client.spending_stop_reason().is_none());
+}
+
+#[tokio::test]
+async fn a_server_error_cools_the_provider_when_no_retry_remains() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = scripted_server(vec![(0, "503 Service Unavailable", "{}".into())]).await;
+    let mut client = without_retries(quick_client(dir.path(), url));
+    client.rate_limit_wait = None;
+    assert_eq!(
+        failure_cause(&ask(&client).await.unwrap_err()),
+        Some("http_503")
+    );
+    server.await.unwrap();
+    assert!(matches!(
+        client.pick_provider(None).unwrap(),
+        crate::governor::Send::Wait(_)
+    ));
+    assert_eq!(client.providers.lock().unwrap()[0].failures, 1);
+}
+
+#[tokio::test]
+async fn a_failed_transport_cools_the_provider_when_no_retry_remains() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _) = hanging_up_server().await;
+    let mut client = without_retries(quick_client(dir.path(), url));
+    client.rate_limit_wait = None;
+    assert!(ask(&client).await.is_err());
+    assert!(matches!(
+        client.pick_provider(None).unwrap(),
+        crate::governor::Send::Wait(_)
+    ));
+    assert_eq!(client.providers.lock().unwrap()[0].failures, 1);
+}
+
+#[tokio::test]
+async fn a_retry_without_reservation_room_is_not_counted_as_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = scripted_server(vec![(0, "503 Service Unavailable", "{}".into())]).await;
+    let client = quick_client(dir.path(), url);
+    let reservation = client.backend.reservation().unwrap();
+    client.ledger.lock().unwrap().budget_nanos = reservation;
+    let error = ask(&client).await.unwrap_err();
+    server.await.unwrap();
+    assert!(error.to_string().contains("budget"));
+    assert_eq!(client.usage().requests, 1);
+    assert_eq!(
+        client.usage().retried_requests,
+        0,
+        "no second request was sent"
+    );
+    assert_eq!(client.ledger.lock().unwrap().accounted_nanos, reservation);
+}
+
+#[tokio::test]
+async fn a_queued_hedge_loser_releases_its_unsent_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = scripted_server(vec![(200, "200 OK", response().to_string())]).await;
+    let mut client = hedging_client(dir.path(), url, 1.0);
+    client.http = client.http.with_concurrency(1);
+    client.hedge_after = Some(Duration::from_millis(20));
+    assert!(ask(&client).await.is_ok());
+    server.await.unwrap();
+    assert_eq!(
+        (client.usage().requests, client.usage().hedged_requests),
+        (1, 0)
+    );
+    assert_eq!(client.usage().input_tokens, 100);
+    assert_eq!(
+        client.ledger.lock().unwrap().accounted_nanos,
+        client.backend.cost_nanos(100).unwrap()
+    );
+    assert_eq!(client.ledger.lock().unwrap().in_flight, 0);
+}
+
+#[tokio::test]
+async fn a_locally_refused_retry_is_not_counted_as_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, server) =
+        scripted_server(vec![(0, "503 Service Unavailable", "{}".into())]).await;
+    // URL validation refuses this address before any DNS lookup or connection.
+    let client = two_provider_client(dir.path(), primary, "http://denied.invalid/evaluate".into());
+    let error = ask(&client).await.unwrap_err();
+    server.await.unwrap();
+    assert!(error.to_string().contains("Request URL must use HTTPS"));
+    assert_eq!(client.usage().requests, 1);
+    assert_eq!(client.usage().retried_requests, 0);
+    assert_eq!(
+        client.ledger.lock().unwrap().accounted_nanos,
+        client.backend.reservation().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_retry_on_the_fallback_model_uses_its_own_hedge_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, primary_server) =
+        scripted_server(vec![(0, "503 Service Unavailable", "{}".into())]).await;
+    let (fallback, fallback_server) = scripted_server(vec![
+        (300, "200 OK", response().to_string()),
+        (0, "200 OK", response().to_string()),
+    ])
+    .await;
+    let mut client = fallback_client(dir.path(), primary, fallback);
+    client.rate_limit_wait = Some(FALLBACK_AFTER * 4);
+    client.hedge_after = Some(Duration::from_millis(20));
+    assert!(ask(&client).await.is_ok());
+    primary_server.await.unwrap();
+    fallback_server.await.unwrap();
+    assert_eq!(
+        (
+            client.usage().requests,
+            client.usage().hedged_requests,
+            client.usage().retried_requests
+        ),
+        (3, 1, 1)
+    );
+    assert_eq!(client.usage().input_tokens, 200);
+    assert_eq!(
+        client.ledger.lock().unwrap().accounted_nanos,
+        client.backend.reservation().unwrap() + 2 * client.fallbacks[0].cost_nanos(100).unwrap()
+    );
+    assert_eq!(client.ledger.lock().unwrap().in_flight, 0);
+}
+
+#[tokio::test]
+async fn a_primary_that_changes_model_during_the_race_keeps_the_other_model_reserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, primary_server) = scripted_server(vec![
+        (80, "429 Too Many Requests", "{}".into()),
+        (300, "200 OK", response().to_string()),
+    ])
+    .await;
+    let mut other_model = response();
+    other_model["usage"]["input_tokens"] = json!(10);
+    let (fallback, fallback_server) =
+        scripted_server(vec![(0, "200 OK", other_model.to_string())]).await;
+    let mut client = fallback_client(dir.path(), primary, fallback);
+    client.rate_limit_wait = Some(FALLBACK_AFTER * 4);
+    client.hedge_after = Some(Duration::from_millis(20));
+    assert!(ask(&client).await.is_ok());
+    primary_server.await.unwrap();
+    fallback_server.await.unwrap();
+    assert_eq!(
+        (
+            client.usage().requests,
+            client.usage().rate_limited_requests
+        ),
+        (2, 1)
+    );
+    assert_eq!(client.usage().input_tokens, 10);
+    assert_eq!(
+        client.ledger.lock().unwrap().accounted_nanos,
+        client.backend.reservation().unwrap() + client.fallbacks[0].cost_nanos(10).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_cross_model_hedge_cancellation_counts_toward_the_unresolved_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (primary, primary_server) =
+        scripted_server(vec![(300, "200 OK", response().to_string())]).await;
+    let (fallback, fallback_server) = scripted_server(vec![
+        (0, "200 OK", response().to_string()),
+        (0, "503 Service Unavailable", "{}".into()),
+        (0, "503 Service Unavailable", "{}".into()),
+    ])
+    .await;
+    let mut client = without_retries(fallback_client(dir.path(), primary, fallback));
+    client.rpm_overrides.insert("loopback".into(), 1.0);
+    client.hedge_after = Some(Duration::from_millis(20));
+    client.rate_limit_wait = Some(Duration::from_millis(10));
+    assert!(ask(&client).await.is_ok());
+    primary_server.await.unwrap();
+    client.hedge_after = None;
+    for _ in 0..2 {
+        assert_eq!(
+            failure_cause(&ask(&client).await.unwrap_err()),
+            Some("http_503")
+        );
+    }
+    fallback_server.await.unwrap();
+    {
+        let ledger = client.ledger.lock().unwrap();
+        assert_eq!(ledger.consecutive_unresolved, UNRESOLVED_STOP_AFTER);
+        assert!(ledger.unresolved_usage);
+        assert_eq!(ledger.in_flight, 0);
+        assert_eq!(
+            ledger.accounted_nanos,
+            client.backend.reservation().unwrap()
+                + 2 * client.fallbacks[0].reservation().unwrap()
+                + client.fallbacks[0].cost_nanos(100).unwrap()
+        );
+    }
+    let requests = client.usage().requests;
+    assert!(not_assessed_after_stop(&ask(&client).await.unwrap_err()));
+    assert_eq!(client.usage().requests, requests);
 }

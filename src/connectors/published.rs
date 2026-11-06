@@ -80,10 +80,10 @@ pub(crate) async fn read(ctx: &FetchContext, source: &Source, url: &Url, markdow
     while next < candidates.len() {
         let (candidate, kind) = candidates[next].clone();
         next += 1;
-        match super::read(ctx, Method::GET, candidate.as_str(), vec![], None)
-            .await
-            .response
-        {
+        let super::Read { response, note } =
+            super::read(ctx, Method::GET, candidate.as_str(), vec![], None).await;
+        let note = note.map(|note| format!(" {note}")).unwrap_or_default();
+        match response {
             Ok(response) => {
                 server_failed |= response.status >= 500;
                 artifacts.push(response.artifact.clone());
@@ -121,7 +121,7 @@ pub(crate) async fn read(ctx: &FetchContext, source: &Source, url: &Url, markdow
                 failure(
                     "original",
                     format!(
-                        "Original request returned HTTP {}, an unusable body, or unresolved Markdown components. Artifact: {}",
+                        "Original request returned HTTP {}, an unusable body, or unresolved Markdown components.{note} Artifact: {}",
                         response.status, response.artifact
                     ),
                 );
@@ -141,7 +141,7 @@ pub(crate) async fn read(ctx: &FetchContext, source: &Source, url: &Url, markdow
                         _ => failure(
                             "original",
                             format!(
-                                "Original page moved (HTTP {}) to a location that is not read: another host, not HTTPS, missing, or past {MAX_REDIRECTS} moves.",
+                                "Original page moved (HTTP {}) to a location that is not read: another host, not HTTPS, missing, or past {MAX_REDIRECTS} moves.{note}",
                                 moved.status
                             ),
                         ),
@@ -151,8 +151,7 @@ pub(crate) async fn read(ctx: &FetchContext, source: &Source, url: &Url, markdow
                     server_failed = true;
                     failure(
                         "original",
-                        "Original request failed. The recorder retains available failure evidence."
-                            .into(),
+                        format!("Original request failed.{note} The recorder retains available failure evidence."),
                     )
                 }
             },
@@ -304,6 +303,12 @@ mod tests {
         assert_eq!(read.meta["full_original"], false);
         assert_eq!(read.meta["requested"], true);
         assert!(read.failures.iter().any(|f| f.stage == "original_lost"));
+        assert!(read.failures[0]
+            .message
+            .contains("First attempt: HTTP 503. Second attempt: HTTP 503."));
+        assert!(read.failures[1]
+            .message
+            .contains("It was not retried: its host failed 4 reads in a row."));
     }
 
     #[test]
@@ -327,5 +332,32 @@ mod tests {
         ] {
             assert!(same_host_move(&from, refused).is_none(), "{refused}");
         }
+    }
+    #[tokio::test]
+    async fn retry_notes_survive_published_terminal_failures() {
+        let status = "503 Service Unavailable\r\nRetry-After: 30";
+        let (read, paths) = read_from(vec![
+            ("/receipts.md", status, ""),
+            ("/receipts", status, ""),
+        ])
+        .await;
+        assert_eq!(paths, ["/receipts.md", "/receipts"]);
+        for failure in read
+            .failures
+            .iter()
+            .filter(|failure| failure.stage == "original")
+        {
+            assert!(
+                failure
+                    .message
+                    .contains("Retry-After of 30 s is above the 4 s retry limit"),
+                "{}",
+                failure.message
+            );
+        }
+        assert!(read
+            .failures
+            .iter()
+            .any(|failure| failure.stage == "original_lost"));
     }
 }

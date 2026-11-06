@@ -34,8 +34,8 @@ pub(crate) struct Read {
 }
 
 /// Whether a read outcome may be sent again: HTTP 500, 502, or 503, or a failure before a
-/// complete response, unless it was a timeout or a 4xx status had arrived. HTTP 504 is not
-/// repeated: an upstream that sends it has already spent its time limit, and so has a timeout.
+/// complete response, unless it was a timeout or a non-retryable error status had arrived.
+/// HTTP 504 is not repeated: that upstream has already spent its time limit, and so has a timeout.
 /// A refusal by a rate limit is not repeated either; its gate decides when to send again.
 fn read_retryable(outcome: &Result<crate::http::HttpResponse>) -> bool {
     match outcome {
@@ -44,9 +44,9 @@ fn read_retryable(outcome: &Result<crate::http::HttpResponse>) -> bool {
             .downcast_ref::<crate::http::TransportFailure>()
             .is_some_and(|failure| {
                 failure.cause != crate::http::TransportCause::Timeout
-                    && !failure
+                    && failure
                         .status
-                        .is_some_and(|status| (400..500).contains(&status))
+                        .is_none_or(|status| status < 400 || matches!(status, 500 | 502 | 503))
             }),
     }
 }
@@ -91,15 +91,26 @@ pub(crate) async fn read(
     let mut earlier: Vec<String> = Vec::new();
     let mut stopped = None;
     loop {
-        let failed = read_retryable(&outcome);
-        let failures = ctx.http.note_source_outcome(url, failed);
-        if !failed || earlier.len() as u32 == READ_RETRIES {
+        // Retry eligibility and host health differ: a timeout or a nonretryable server error
+        // still extends an outage. A local refusal says nothing about whether the host recovered.
+        let host_failed = match &outcome {
+            Ok(response) => Some(response.status >= 500),
+            Err(error) if error.is::<crate::http::TransportFailure>() => Some(true),
+            Err(error) if error.is::<crate::http::Redirected>() => Some(false),
+            Err(_) => None,
+        };
+        let failures = host_failed
+            .map(|failed| ctx.http.note_source_outcome(url, failed))
+            .unwrap_or_default();
+        if !read_retryable(&outcome) || earlier.len() as u32 == READ_RETRIES {
             break;
         }
-        let asked = outcome
-            .as_ref()
-            .ok()
-            .and_then(|response| crate::http::retry_after(&response.headers));
+        let asked = match &outcome {
+            Ok(response) => crate::http::retry_after(&response.headers),
+            Err(error) => error
+                .downcast_ref::<crate::http::TransportFailure>()
+                .and_then(|failure| failure.retry_after),
+        };
         let base = READ_RETRY_FIRST * (1u32 << earlier.len());
         let spread = std::time::Duration::from_millis(
             (uuid::Uuid::new_v4().as_u128() % (base.as_millis() + 1)) as u64,
@@ -122,8 +133,6 @@ pub(crate) async fn read(
                 "a retry after {} ms would end past the fetch deadline",
                 delay.as_millis()
             ))
-        } else if !ctx.http.take_source_retry(READ_RETRIES_PER_RUN) {
-            Some("the run's source retries are spent".to_owned())
         } else {
             None
         };
@@ -131,6 +140,10 @@ pub(crate) async fn read(
             stopped = Some(reason);
             break;
         }
+        let Some(retry) = ctx.http.reserve_source_retry(READ_RETRIES_PER_RUN) else {
+            stopped = Some("the run's source retries are spent".to_owned());
+            break;
+        };
         earlier.push(read_outcome_text(&outcome));
         let parent = outcome
             .as_ref()
@@ -145,8 +158,12 @@ pub(crate) async fn read(
                 url,
                 headers.clone(),
                 body.clone(),
-                parent,
-                race.clone(),
+                crate::http::AttemptTag {
+                    parent,
+                    parent_race: race.clone(),
+                    ..Default::default()
+                },
+                retry,
             )
             .await;
     }
@@ -508,10 +525,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_run_stops_retrying_when_its_source_retries_are_spent() {
+    async fn the_run_stops_retrying_when_its_source_retries_are_reserved() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        while ctx.http.take_source_retry(READ_RETRIES_PER_RUN) {}
+        let reserved: Vec<_> = (0..READ_RETRIES_PER_RUN)
+            .map(|_| ctx.http.reserve_source_retry(READ_RETRIES_PER_RUN).unwrap())
+            .collect();
         let (url, accepted) = replying(vec![UNAVAILABLE, OK]).await;
         let read = read(&ctx, reqwest::Method::GET, &url, vec![], None).await;
         assert_eq!(read.response.unwrap().status, 503);
@@ -520,10 +539,12 @@ mod tests {
             read.note.as_deref(),
             Some("It was not retried: the run's source retries are spent.")
         );
-        assert_eq!(
-            ctx.http.load_summary()["source_retried_requests"],
-            READ_RETRIES_PER_RUN
-        );
+        assert_eq!(ctx.http.load_summary()["source_retried_requests"], 0);
+        drop(reserved);
+        assert!(ctx
+            .http
+            .reserve_source_retry(READ_RETRIES_PER_RUN)
+            .is_some());
     }
 
     #[tokio::test]
@@ -552,5 +573,147 @@ mod tests {
         assert_eq!(read.response.unwrap().status, 503);
         let note = read.note.unwrap();
         assert!(note.contains("would end past the fetch deadline"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_error_body_keeps_its_status_retry_policy() {
+        for status in [400, 429, 501, 504, 505] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = context(dir.path());
+            let reply = format!(
+                "HTTP/1.1 {status} Failure\r\nContent-Length: 99\r\nConnection: close\r\n\r\nx"
+            );
+            let (url, accepted) =
+                replying(vec![Box::leak(reply.into_bytes().into_boxed_slice()), OK]).await;
+            let result = read(&ctx, reqwest::Method::GET, &url, vec![], None).await;
+            assert!(result.response.is_err(), "HTTP {status} must remain final");
+            assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(ctx.http.load_summary()["source_retried_requests"], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_body_keeps_a_long_retry_after() {
+        for status in [200, 503] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = context(dir.path());
+            let reply = format!("HTTP/1.1 {status} Failure\r\nRetry-After: 30\r\nContent-Length: 99\r\nConnection: close\r\n\r\nx");
+            let (url, accepted) =
+                replying(vec![Box::leak(reply.into_bytes().into_boxed_slice()), OK]).await;
+            let result = read(&ctx, reqwest::Method::GET, &url, vec![], None).await;
+            assert!(
+                result.response.is_err(),
+                "Retry-After must survive a body failure"
+            );
+            assert!(result.note.unwrap().contains("Retry-After of 30 s"));
+            assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(ctx.http.load_summary()["source_retried_requests"], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_backoff_does_not_count_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let (url, accepted) = replying(vec![UNAVAILABLE, OK]).await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            read(&ctx, reqwest::Method::GET, &url, vec![], None),
+        )
+        .await
+        .is_err());
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ctx.http.load_summary()["source_retried_requests"], 0);
+        assert!(ctx.http.reserve_source_retry(1).is_some());
+    }
+
+    async fn check_host_streak(timeout: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/read", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let number = counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = [0; 4096];
+                    let _ = socket.read(&mut request).await;
+                    if number == 3 && timeout {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    } else {
+                        let reply = match number {
+                            3 => &b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n"[..],
+                            5 | 7 => OK,
+                            _ => UNAVAILABLE,
+                        };
+                        let _ = socket.write_all(reply).await;
+                    }
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let ctx = FetchContext {
+            http: crate::http::HttpRecorder::loopback_for_test(dir.path(), &config).unwrap(),
+            config,
+            deadline: None,
+        };
+        assert_eq!(
+            read(&ctx, reqwest::Method::GET, &url, vec![], None)
+                .await
+                .response
+                .unwrap()
+                .status,
+            503
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+        let fourth = read(&ctx, reqwest::Method::GET, &url, vec![], None).await;
+        if timeout {
+            assert!(fourth.response.is_err());
+        } else {
+            assert_eq!(fourth.response.unwrap().status, 504);
+        }
+        let fifth = read(&ctx, reqwest::Method::GET, &url, vec![], None).await;
+        assert_eq!(
+            fifth.response.unwrap().status,
+            503,
+            "an outage must not reset on timeout={timeout}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 5);
+        assert!(fifth.note.unwrap().contains("host failed 5 reads in a row"));
+        // A subsequent successful primary resets the streak, allowing a retry again.
+        assert_eq!(
+            read(&ctx, reqwest::Method::GET, &url, vec![], None)
+                .await
+                .response
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(
+            read(&ctx, reqwest::Method::GET, &url, vec![], None)
+                .await
+                .response
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn nonretryable_server_errors_keep_the_host_streak() {
+        check_host_streak(false).await;
+    }
+
+    #[tokio::test]
+    async fn nonretryable_timeouts_keep_the_host_streak() {
+        check_host_streak(true).await;
     }
 }

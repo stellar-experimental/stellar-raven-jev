@@ -184,7 +184,9 @@ A call goes to the first provider in chain order that is usable. A usable provid
 - Rejections of requests that were sent before the latest counted rejection count as one.
   A provider can reject valid credentials for a short time.
 - A call is not sent again after its hedge starts, after a second failure, or after the stop.
-  A run sends at most 16 calls again. `usage.retried_requests` counts them.
+  These failures still cool the provider even when no retry is allowed.
+  A run allows at most 16 calls to be sent again. `usage.retried_requests` counts calls whose retry
+  reached the send point; a denied reservation or local refusal does not count.
 
 - An attempt that was sent and ends without a usage receipt is unresolved.
   After 3 unresolved attempts in a row, the client stops paid work for the run. A settled attempt resets the count.
@@ -202,11 +204,14 @@ A call goes to the first provider in chain order that is usable. A usable provid
 
 ### Jev hedging
 
-A Jev call with no answer 2 seconds after its request is sent gets one identical hedge request.
+A Jev call with no answer 2 seconds after its request is sent gets one hedge with the same questions.
 It does this only if the budget has room without waiting. Queue time does not count.
 
 - The first valid answer wins, and the other request is cancelled.
 - If one attempt fails, the other one decides.
-- The cancelled request is charged the winner's input tokens at its own provider's price.
+- A cancelled request that was still queued releases its reservation and counts no request or tokens.
+- A sent cancelled request to the same model is charged the winner's input tokens at its own provider's price.
+- If the winning send used another model, the sent cancelled request keeps its full reservation.
+  Its usage is unresolved; no token count is inferred from the winner's receipt.
 - A hedge never waits for a provider, and it prefers another provider than the first attempt.
 - `usage.hedged_requests` counts the hedges.

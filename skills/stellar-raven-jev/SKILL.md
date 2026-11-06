@@ -62,7 +62,8 @@ Use compact output for ordinary lookups. Use `--json` when uncertain results or 
 Exit 1 indicates a failed call. Read the error before another call. Repeated calls do not repair missing settings.
 Exit 2 indicates partial results. Inspect `report_stage_counts` and `load` before using them or planning another call.
 Use `--json` for the full reports.
-`load.degraded` indicates reduced evidence, even when usable results remain.
+Inspect `load` even on exit 0. `load.degraded` indicates lost evidence or coarser source matching;
+a fallback alone keeps the call complete. Read the reports to assess its effect on the answer.
 Exit 3 indicates `busy`. Inspect its reported usage; routing can spend money before source admission fails.
 Respect `retry_after_ms` and the task's time and spending limits before retrying.
 A `network_check` report, or a `load.jev_failure_causes` class such as `dns` or `connect_denied`, usually shows missing network access.

@@ -27,6 +27,8 @@ stellar-raven-jev more SESSION --pool POOL_ID
 
 It fetches or scores the pending pool against the original question and can spend money.
 A default search normally leaves no pools. Do not use `more` as a general retry command.
+Skip pools marked `unavailable`: this version cannot fetch them. Start a new search when the missing
+evidence is needed; saved unscored documents remain usable through their `unscored_tail` pools.
 Use one narrower `search` when the session has no relevant pending evidence.
 Read the new text and assess it against the original question before declaring coverage.
 

@@ -33,6 +33,9 @@ Output (compact JSON):
   status             complete; partial (results usable, some evidence lost); or busy (the
                      call was refused; retry after retry_after_ms).
   session.id         The session folder. Pass it to `check` or `more`.
+  pools              Counts of unfetched sources and unscored tails, plus actionable pools.
+                     unavailable counts routed sources this version cannot fetch. Start a new
+                     search to use the current sources.
   results[]          Best results, one per URL: probability (Jev relevance, 0-1), title, url,
                      excerpt, text_path (full text on disk), text_bytes, content_scope, date,
                      date_kind, still_current, authority_tier, same_url_others, and companions
@@ -57,19 +60,20 @@ Output (compact JSON):
   currentness        The question's time intent and the newest dated evidence among the results.
   not_shown          Counts you did not see; full_report_path holds every result.
   usage              Jev cost and requests. session.usage is the total for the session.
-                     retried_requests counts calls sent again after a server error;
+                     retried_requests counts calls sent again after a server error or failed response;
                      provider_requests names the fallback model as cloudflare/<model>.
   report_stage_counts  Reports by stage; the full report (--json) lists them.
   load               What capacity limits and failures did. degraded is true when evidence was
-                     lost: a source was cut, refused, or fell back; documents went over the
+                     lost or a source used coarser fallback matching. Evidence is lost when a
+                     source was cut or refused; documents went over the
                      scoring limit; or a request, a Jev judgment, or host coordination failed.
-                     The results are usable but thinner.
                      jev_failure_causes counts the reports of failed Jev calls by cause class
                      (dns or connect_denied: usually no network access). jev_providers_skipped
                      names the providers that failed the network check, with the class.
                      not_assessed_after_stop counts items that Jev did not judge because it had
                      stopped paid work. A fallback alone sets degraded but leaves status complete.
-                     source_retried_requests counts source reads sent again after a server error.
+                     source_retried_requests counts source reads sent again after a server error
+                     or failed response.
                      source_latency, per host: send-to-last-byte times, cancelled_while_queued
                      (requests cut before they left this client), and queue_p95_ms and
                      queue_max_ms (time a request waited in this client before it was sent).";
@@ -89,7 +93,31 @@ not yet scored. `pools.actionable` lists only pools with a signal. `more` scores
 against the original question and prints the re-ranked session. When part of the question has
 no support at all, a narrower `search` works better than `more`. A default search fetches and
 scores everything, so it normally leaves no pools. An `unavailable` pool names a routed source
-that this version no longer has: `more` cannot fetch it, so start a new search.";
+that this version no longer has: `more` cannot fetch it, so start a new search. `pools.unavailable`
+counts these pools; they are never actionable.";
+
+const DOCTOR_FIELDS: &str = "\
+Output (compact JSON):
+  mode                       live-jev, or offline-fixture with --fixture.
+  jev_providers              Configured provider chain in order, or a configuration error.
+  jev_model                  Decision model selected by JEV_MODEL (default jev).
+  jev_fallback_model         Fallback selected by JEV_FALLBACK_MODEL (default clef); null when
+                             disabled, when Jev is not selected, or without cloudflare in the chain.
+  jev_authentication_check   Local credential configuration only; no authorization is tested.
+  jev_configuration_ready    Whether the Jev client accepts the local provider settings.
+  source_credentials         Presence and missing setting names per source, never values.
+  source_credentials_ready   Whether every required source setting is present.
+  local_configuration_ready  Whether both Jev and source settings are ready.
+  budget_usd                 The configured per-call allowance; doctor spends nothing.
+  live_run_budget_ready      Whether the allowance is above 0 and at most 100.
+  source_count               Number of registered sources.
+  network_checked / network_check  With --network: reachability per provider and whether any
+                             is reachable. A pass does not validate credentials or paid calls.
+  error                      Local Jev configuration error, or null.
+Model fields can hold a configuration error. In fixture mode, provider and model fields are
+null, local_configuration_ready ignores live credentials, and --network sends nothing.
+Exit 1 when local configuration is not ready or the requested network check has no reachable
+provider. A zero budget alone does not fail doctor; inspect live_run_budget_ready.";
 
 #[derive(Parser)]
 #[command(
@@ -300,6 +328,7 @@ enum Command {
         limit: usize,
     },
     /// Check local settings and authentication presence without network requests.
+    #[command(after_help = DOCTOR_FIELDS)]
     Doctor {
         /// Also check the network: send one HEAD request without credentials or body to each
         /// configured Jev provider. No model runs, so it costs nothing. A pass cannot promise that

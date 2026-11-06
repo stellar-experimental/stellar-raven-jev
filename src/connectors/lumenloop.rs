@@ -129,7 +129,7 @@ async fn read(
 ) -> std::result::Result<Reply, ReadError> {
     // Tool names are constants selected below. The question never selects an operation or URL.
     // Every tool is a read, so `super::read` may send it again after a server error.
-    let super::Read { response, note } = super::read(
+    let read = super::read(
         ctx,
         Method::POST,
         &format!("{BASE}/{tool}"),
@@ -140,25 +140,36 @@ async fn read(
         Some(args),
     )
     .await;
-    let response = response.map_err(|error| ReadError {
-        message: match &note {
-            Some(note) => format!("{}. {note}", error.to_string().trim_end_matches('.')),
-            None => error.to_string(),
-        },
-        stop: false,
-        artifact: None,
-        notice: false,
-    })?;
-    let envelope = response.json().map_err(|_| ReadError {
-        message: format!("Invalid JSON; response: {}", response.artifact),
-        stop: matches!(response.status, 401 | 402 | 403 | 429),
-        artifact: Some(response.artifact.clone()),
-        notice: false,
-    })?;
-    let data = decode(response.status, envelope, &response.artifact)?;
-    Ok(Reply {
-        data,
-        artifact: response.artifact,
+    decode_read(read)
+}
+
+/// Decode a tool read without losing the earlier attempts when parsing or the API fails.
+fn decode_read(read: super::Read) -> std::result::Result<Reply, ReadError> {
+    let super::Read { response, note } = read;
+    let decoded = (|| {
+        let response = response.map_err(|error| ReadError {
+            message: error.to_string(),
+            stop: false,
+            artifact: None,
+            notice: false,
+        })?;
+        let envelope = response.json().map_err(|_| ReadError {
+            message: format!("Invalid JSON; response: {}", response.artifact),
+            stop: matches!(response.status, 401 | 402 | 403 | 429),
+            artifact: Some(response.artifact.clone()),
+            notice: false,
+        })?;
+        let data = decode(response.status, envelope, &response.artifact)?;
+        Ok(Reply {
+            data,
+            artifact: response.artifact,
+        })
+    })();
+    decoded.map_err(|mut error: ReadError| {
+        if let Some(note) = note {
+            error.message = format!("{}. {note}", error.message.trim_end_matches('.'));
+        }
+        error
     })
 }
 
@@ -1099,5 +1110,36 @@ mod tests {
         .unwrap();
         assert!(result.documents.is_empty());
         assert_eq!(result.failures.len(), 1);
+    }
+    #[test]
+    fn retry_notes_survive_lumenloop_terminal_failures() {
+        let note = "First attempt: HTTP 502. It was not retried again: the run's source retries are spent.";
+        for (status, body, expected, stopped) in [
+            (503, r#"{"success":false}"#, "HTTP 503", false),
+            (200, "[", "Invalid JSON", false),
+            (
+                401,
+                r#"{"success":false,"code":"unauthorized"}"#,
+                "HTTP 401",
+                true,
+            ),
+        ] {
+            let error = decode_read(super::super::Read {
+                response: Ok(crate::http::HttpResponse {
+                    status,
+                    body: body.as_bytes().to_vec(),
+                    artifact: "raw/fernlet.body".into(),
+                    headers: Default::default(),
+                }),
+                note: Some(note.into()),
+            })
+            .err()
+            .unwrap();
+            assert!(error.message.starts_with(expected), "{}", error.message);
+            assert!(error.message.contains(note), "{}", error.message);
+            assert_eq!(error.stop, stopped);
+            assert!(!error.notice);
+            assert_eq!(error.artifact.as_deref(), Some("raw/fernlet.body"));
+        }
     }
 }

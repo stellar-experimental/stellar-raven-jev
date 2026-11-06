@@ -351,6 +351,31 @@ pub fn search_host(source: &Source) -> Option<String> {
     endpoint(&app, None).ok()?.host_str().map(str::to_owned)
 }
 
+/// Decode one search read, keeping retry history on terminal transport, HTTP, and JSON failures.
+fn search_response(read: &super::Read) -> Result<(&crate::http::HttpResponse, Value), String> {
+    let note = read
+        .note
+        .as_ref()
+        .map(|note| format!(" {note}"))
+        .unwrap_or_default();
+    let response = read.response.as_ref().map_err(|_| {
+        format!("The search request failed.{note} Partial results remain available.")
+    })?;
+    if response.status != 200 {
+        return Err(format!(
+            "Search returned HTTP {}.{note} Artifact: {}",
+            response.status, response.artifact
+        ));
+    }
+    let body = response.json().map_err(|_| {
+        format!(
+            "Search returned malformed JSON.{note} Artifact: {}",
+            response.artifact
+        )
+    })?;
+    Ok((response, body))
+}
+
 pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Result<FetchResult> {
     let index = indices()
         .find(|index| index.id() == source.id)
@@ -434,61 +459,33 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
             variants.push(json!({"query":active_query,"page":page,"matching_mode":"none",
                 "kind":query_kind,"variant":if keyword_retry {"site_shared_keyword_or_local_entity"} else {"shared_initial"}}));
             // A search is a read, so `super::read` may send it again after a server error.
-            let response = match super::read(
+            let read = super::read(
                 ctx,
                 Method::POST,
                 url.as_str(),
                 headers.clone(),
                 Some(params),
             )
-            .await
-            .response
-            {
+            .await;
+            let (response, body) = match search_response(&read) {
                 Ok(response) => response,
-                Err(_) => {
-                    failure(
-                        &mut result,
-                        source,
-                        "search",
-                        "The search request failed. Partial results remain available.",
-                    );
+                Err(message) => {
+                    failure(&mut result, source, "search", message);
                     break;
                 }
             };
-            if response.status != 200 {
-                failure(
-                    &mut result,
-                    source,
-                    "search",
-                    format!(
-                        "Search returned HTTP {}. Artifact: {}",
-                        response.status, response.artifact
-                    ),
-                );
-                break;
-            }
-            let body = match response.json() {
-                Ok(body) => body,
-                Err(_) => {
-                    failure(
-                        &mut result,
-                        source,
-                        "search",
-                        format!(
-                            "Search returned malformed JSON. Artifact: {}",
-                            response.artifact
-                        ),
-                    );
-                    break;
-                }
-            };
+            let note = read
+                .note
+                .as_ref()
+                .map(|note| format!(" {note}"))
+                .unwrap_or_default();
             if body.get("message").is_some() {
                 failure(
                     &mut result,
                     source,
                     "search_notice",
                     format!(
-                        "The search response contains an API warning. Artifact: {}",
+                        "The search response contains an API warning.{note} Artifact: {}",
                         response.artifact
                     ),
                 );
@@ -500,7 +497,10 @@ pub async fn fetch(ctx: &FetchContext, source: &Source, question: &str) -> Resul
                         &mut result,
                         source,
                         "search",
-                        format!("Search has no hits array. Artifact: {}", response.artifact),
+                        format!(
+                            "Search has no hits array.{note} Artifact: {}",
+                            response.artifact
+                        ),
                     );
                     break;
                 }
@@ -893,5 +893,41 @@ mod tests {
             assert!(a.documents[0].raw_artifacts.is_empty());
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn retry_notes_survive_algolia_terminal_failures() {
+        let note = "First attempt: HTTP 502. It was not retried again: the run's source retries are spent.";
+        for (response, expected) in [
+            (
+                Err(anyhow::anyhow!("transfer failed")),
+                "The search request failed.",
+            ),
+            (
+                Ok(crate::http::HttpResponse {
+                    status: 503,
+                    body: b"{}".to_vec(),
+                    artifact: "raw/fernlet.body".into(),
+                    headers: Default::default(),
+                }),
+                "Search returned HTTP 503.",
+            ),
+            (
+                Ok(crate::http::HttpResponse {
+                    status: 200,
+                    body: b"[".to_vec(),
+                    artifact: "raw/fernlet.body".into(),
+                    headers: Default::default(),
+                }),
+                "Search returned malformed JSON.",
+            ),
+        ] {
+            let read = super::super::Read {
+                response,
+                note: Some(note.into()),
+            };
+            let error = search_response(&read).err().unwrap();
+            assert!(error.starts_with(expected), "{error}");
+            assert!(error.contains(note), "{error}");
+        }
     }
 }

@@ -375,10 +375,14 @@ const RECHECK_PAUSES: [Duration; 3] = [
 ];
 const RECHECK_WINDOW: Duration = Duration::from_secs(10);
 
-/// Shared by the attempts of one call. When one attempt wins, it records its input tokens here and
-/// the other is cancelled and charged that amount: identical requests report identical input
-/// tokens, and output is free.
-type Hedge = std::sync::OnceLock<u64>;
+/// The winning send's receipt. The provider can change during an attempt, so cancellation uses
+/// the provider that actually answered when deciding whether its token count applies to the loser.
+struct HedgeReceipt {
+    input_tokens: u64,
+    provider: usize,
+}
+
+type Hedge = std::sync::OnceLock<HedgeReceipt>;
 
 /// One Jev call: the request and what every attempt of it shares.
 struct Call<'a> {
@@ -431,11 +435,12 @@ struct Attempted {
     answers: BTreeMap<String, f64>,
     path: String,
     input_tokens: u64,
+    provider: usize,
 }
 
 // A dropped future cannot release a possibly spent reservation. This guard also
 // closes the client when a trace write fails after the reservation was made. A hedge loser is the
-// one planned cancellation: it is charged the winner's input tokens.
+// one planned cancellation: it is charged the winner's input tokens only for the same model.
 struct PendingAttempt<'a> {
     client: &'a JevClient,
     receipt_accounted: bool,
@@ -444,18 +449,37 @@ struct PendingAttempt<'a> {
     provider: usize,
     hedge: &'a Hedge,
     audit_name: String,
+    sending: &'a std::sync::atomic::AtomicBool,
+    /// Shared across the sends of a retry, so a call is counted once. Cleared on a known unsent
+    /// connection failure; cancellation after the send point still counts.
+    retry_counted: Option<&'a std::sync::atomic::AtomicBool>,
+    hedge_attempt: bool,
+}
+
+impl PendingAttempt<'_> {
+    fn count_retry_if_sent(&self) {
+        use std::sync::atomic::Ordering;
+        if self.sending.load(Ordering::SeqCst)
+            && self
+                .retry_counted
+                .is_some_and(|counted| !counted.swap(true, Ordering::SeqCst))
+        {
+            self.client
+                .ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .usage
+                .retried_requests += 1;
+        }
+    }
 }
 
 impl Drop for PendingAttempt<'_> {
     fn drop(&mut self) {
+        self.count_retry_if_sent();
         if !self.finished {
-            if let (false, Some(&input)) = (self.receipt_accounted, self.hedge.get()) {
-                self.client.settle_cancelled(
-                    self.reservation,
-                    input,
-                    self.provider,
-                    &self.audit_name,
-                );
+            if let (false, Some(receipt)) = (self.receipt_accounted, self.hedge.get()) {
+                self.client.settle_cancelled(self, receipt);
                 return;
             }
             let mut ledger = self.client.ledger.lock().unwrap_or_else(|e| e.into_inner());
@@ -591,7 +615,7 @@ impl JevClient {
                 ..Ledger::default()
             }),
             settled: tokio::sync::Notify::new(),
-            // A hedge uses the same model and input as the first request.
+            // Both sends use the same questions; provider availability can change the model.
             hedge_after: (!config.fixture && config.jev_hedge_ms > 0)
                 .then(|| Duration::from_millis(config.jev_hedge_ms)),
             rate_limit_wait: None,
@@ -620,9 +644,9 @@ impl JevClient {
             "rate_limit_policy": "HTTP 429 or 529 releases the reservation, because the provider did not run the request, and cools that provider for every search on the host for Retry-After (1 to 90 s), or without one for the backoff: 2 s, doubled for each refusal or server error in a row up to 90 s, plus up to a quarter of random spread; a valid answer resets the count; the call moves to the next available provider at once; a hedge does not wait",
             "credential_policy": format!("HTTP 401 or 403 releases the reservation; a rejection of a request sent before the provider's latest counted rejection belongs to the same episode and only moves the call on; a counted rejection cools the provider for {:?} in turn; a counted rejection after the last pause disables the provider (see provider_chain_policy); a valid answer ends the episode", AUTH_PAUSES),
             "fallback_policy": format!("the fallback model (JEV_FALLBACK_MODEL, default clef; none turns it off) runs on the Cloudflare account of the cloudflare provider and is last in the chain; it answers a call only when no Jev provider is enabled, or when every enabled one stays cooling or out of host send budget for more than {} s; it reserves at its own price only when it is sent; usage.provider_requests names it cloudflare/<model>", FALLBACK_AFTER.as_secs()),
-            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 after every credential pause disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; a connection that fails before the request is sent (name resolution, TCP, a proxy tunnel, or the TLS handshake) releases the reservation and cools the provider, and the call moves on only when another provider is usable at once; otherwise the call fails and the network check runs again (see network_check_policy); a request refused locally before the send point (a request limit or a URL rule) releases the reservation and fails the call, and no provider cools; other transport errors and other HTTP errors keep the reservation and are not retried elsewhere, because the provider may have run the request",
-            "hedge_policy": "a call unanswered jev_hedge_ms after its request is sent gets one identical hedge request when the budget has room without waiting; the first valid answer wins, so a failed attempt lets the other decide; the cancelled request is charged the winner's input tokens",
-            "unresolved_usage_policy": "retain the full reservation of any sent attempt without a valid usage receipt; no automatic retry; stop new reservations after 3 consecutive unresolved attempts; a call refused after the stop reserves nothing, and its item is reported as not assessed after stop",
+            "provider_chain_policy": "each send goes to the first provider in chain order that is enabled, not cooling, and has host send budget; when none has, the call waits at most 120 s in total; 401 or 403 after every credential pause disables a provider for the run and 402 cools it, releasing the reservation, while other providers remain; a connection that fails before the request is sent (name resolution, TCP, a proxy tunnel, or the TLS handshake) releases the reservation and cools the provider, and the call moves on only when another provider is usable at once; otherwise the call fails and the network check runs again (see network_check_policy); a request refused locally before the send point (a request limit or a URL rule) releases the reservation and fails the call, and no provider cools; sent transport failures and HTTP 5xx except 501 and 505 keep the reservation and cool the provider even when retry permission is exhausted; retry_policy bounds whether the call is sent again; other HTTP errors keep the reservation and are not retried",
+            "hedge_policy": "a call unanswered jev_hedge_ms after its request is sent gets one hedge with the same questions when the budget has room without waiting; the first valid answer wins, so a failed attempt lets the other decide; a cancelled request that was not sent releases its reservation; a sent cancelled request to the same model is charged the winner's input tokens; a sent cancelled request to another model keeps its full reservation with no inferred input tokens",
+            "unresolved_usage_policy": "retain the full reservation of any sent attempt without a valid usage receipt; retry_policy permits one retry within the run allowance; stop new reservations after 3 consecutive unresolved attempts; a call refused after the stop reserves nothing, and its item is reported as not assessed after stop",
             "network_check_policy": format!("once, before the first reservation: {NETWORK_CHECK_SCOPE} The wait ends when one provider is reachable; a provider whose check failed by then is not used in this run; when every check fails, nothing is reserved. It runs again on the enabled providers when a connect failure leaves no provider usable, once for the calls at that moment, which wait for its result; while every provider fails, it probes again after 1, 2, and 4 s and starts no round after 10 s; when every round fails, every later call fails at once and nothing is reserved; when one passes, nothing changes"),
             "token_guard": "UTF-8 byte limits are local guards, not a verified provider tokenizer",
             "retrieved_pricing_date": "2026-09-21"
@@ -1279,11 +1303,6 @@ impl JevClient {
             .is_ok();
         if taken {
             *retried = true;
-            self.ledger
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .usage
-                .retried_requests += 1;
         }
         taken
     }
@@ -1761,38 +1780,61 @@ impl JevClient {
         self.settled.notify_waiters();
     }
 
-    /// Charge a cancelled hedge loser. Identical requests report identical input tokens, so the
-    /// winner's receipt is the loser's charge whether or not the provider finished it.
-    fn settle_cancelled(&self, reservation: u64, input: u64, provider: usize, audit_name: &str) {
+    /// Charge a cancelled hedge loser. Only providers of the same model can share the winner's
+    /// input count. A different model keeps its full reservation without inventing a receipt.
+    fn settle_cancelled(&self, pending: &PendingAttempt<'_>, receipt: &HedgeReceipt) {
+        let sent = pending.sending.load(std::sync::atomic::Ordering::SeqCst);
+        // Every primary provider serves the selected model; the fallback tier serves one other
+        // model. Use the winning send's provider, not the first provider of its attempt.
+        let input = (sent
+            && self.is_fallback(pending.provider) == self.is_fallback(receipt.provider))
+        .then_some(receipt.input_tokens);
+        let unresolved = sent && input.is_none();
+        let opened = unresolved.then(|| self.retain_unresolved("cancelled_hedge_loser"));
         let recorded = self
             .write_audit(
-                &format!("{audit_name}-cancelled"),
-                &json!({"state":"cancelled_hedge_loser","charged_input_tokens":input}),
+                &format!("{}-cancelled", pending.audit_name),
+                &json!({"state":"cancelled_hedge_loser","charged_input_tokens":input,
+                    "unresolved_usage_circuit_open":opened,
+                    "accounting":if !sent {
+                        "Reservation released; the cancelled request was not sent."
+                    } else if input.is_some() {
+                        "Winner's input tokens charged at this provider's price; same model."
+                    } else {
+                        "Full reservation retained; a different model won and the loser's usage is unresolved."
+                    }}),
             )
             .is_ok();
+        if !sent {
+            self.release_unrun(pending.reservation, pending.hedge_attempt, false);
+        }
         let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
-        let charged = self.chain()[provider]
-            .cost_nanos(input)
-            .ok()
-            .and_then(|cost| {
-                ledger
-                    .accounted_nanos
-                    .checked_sub(reservation)?
-                    .checked_add(cost)
-            });
-        match charged {
-            Some(accounted) => {
-                ledger.accounted_nanos = accounted;
-                ledger.usage.input_tokens = ledger.usage.input_tokens.saturating_add(input);
-                ledger.usage.cost_usd = accounted as f64 / NANOS_PER_USD;
+        if let Some(input) = input {
+            let charged = self.chain()[pending.provider]
+                .cost_nanos(input)
+                .ok()
+                .and_then(|cost| {
+                    ledger
+                        .accounted_nanos
+                        .checked_sub(pending.reservation)?
+                        .checked_add(cost)
+                });
+            match charged {
+                Some(accounted) => {
+                    ledger.accounted_nanos = accounted;
+                    ledger.usage.input_tokens = ledger.usage.input_tokens.saturating_add(input);
+                    ledger.usage.cost_usd = accounted as f64 / NANOS_PER_USD;
+                }
+                None => ledger.stopped = true,
             }
-            None => ledger.stopped = true,
         }
         // A lost audit record stops the client, as on every other attempt path.
         if !recorded {
             ledger.stopped = true;
         }
-        ledger.in_flight = ledger.in_flight.saturating_sub(1);
+        if sent && !unresolved {
+            ledger.in_flight = ledger.in_flight.saturating_sub(1);
+        }
         drop(ledger);
         self.settled.notify_waiters();
     }
@@ -1863,7 +1905,10 @@ impl JevClient {
         // Both attempts live in this task and drop when it returns, after this charge is set. The
         // `PendingAttempt` guard relies on that: a loser is never polled again once it is set.
         if let Ok(answer) = &winner {
-            let _ = call.hedge.set(answer.input_tokens);
+            let _ = call.hedge.set(HedgeReceipt {
+                input_tokens: answer.input_tokens,
+                provider: answer.provider,
+            });
         }
         winner.map(|a| (a.answers, a.path))
     }
@@ -1880,6 +1925,7 @@ impl JevClient {
         let mut refusals = 0u32;
         // Set once the call was sent again after a server error or a failed response.
         let mut retried = false;
+        let retry_counted = std::sync::atomic::AtomicBool::new(false);
         loop {
             // Before each reservation: a failed network check ends the call here.
             self.check_network().await?;
@@ -1967,6 +2013,7 @@ impl JevClient {
                 format!("{}-attempt-{attempt}-try-{tries}", call.trace_id)
             };
             tries += 1;
+            let sending = std::sync::atomic::AtomicBool::new(false);
             let mut pending = PendingAttempt {
                 client: self,
                 receipt_accounted: false,
@@ -1975,15 +2022,17 @@ impl JevClient {
                 provider,
                 hedge: &call.hedge,
                 audit_name: audit_name.clone(),
+                sending: &sending,
+                retry_counted: retried.then_some(&retry_counted),
+                hedge_attempt: attempt > 0,
             };
             // Persist the reservation first. Cancellation leaves a conservative pending record.
             let mut trace = json!({"schema_version":1,"backend":backend.name(),"context":context,
                 "attempt":attempt,"request":body,"state":"reserved","reservation_usd":reservation as f64/NANOS_PER_USD,
                 "usage":self.usage(),"time_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()});
             self.write_audit(&audit_name, &trace)?;
-            let sending = std::sync::atomic::AtomicBool::new(false);
             let rechecks = self.rechecks.load(std::sync::atomic::Ordering::SeqCst);
-            let response = match self
+            let response = self
                 .http
                 .request_body_recorded_elsewhere(
                     reqwest::Method::POST,
@@ -1995,10 +2044,20 @@ impl JevClient {
                         notify: (attempt == 0).then_some(&call.sent),
                         sending: Some(&sending),
                         tag: None,
+                        retry: None,
                     },
                 )
-                .await
+                .await;
+            if response
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<crate::http::TransportFailure>())
+                .is_some_and(|failure| failure.unsent)
             {
+                pending.retry_counted = None;
+            }
+            pending.count_retry_if_sent();
+            let response = match response {
                 Ok(response) => response,
                 Err(error) if error.downcast_ref::<crate::http::NotSent>().is_some() => {
                     // Stopped before sending: the provider became unusable while this request
@@ -2072,12 +2131,12 @@ impl JevClient {
                     trace["state"] = json!("transport_error_or_incomplete_body");
                     trace["accounting"] =
                         json!("Full reservation retained; provider completion is unknown.");
+                    let failures = self.note_failure(provider);
+                    self.cool_provider(
+                        provider,
+                        self.rate_limit_wait.unwrap_or_else(|| backoff(failures)),
+                    )?;
                     if !opened && self.may_retry(call, attempt, &mut retried) {
-                        let failures = self.note_failure(provider);
-                        self.cool_provider(
-                            provider,
-                            self.rate_limit_wait.unwrap_or_else(|| backoff(failures)),
-                        )?;
                         trace["retried"] = json!(true);
                         self.write_audit(&audit_name, &trace)?;
                         pending.finished = true;
@@ -2159,23 +2218,28 @@ impl JevClient {
             if !(200..300).contains(&response.status) {
                 // Stop new reservations across this client. In-flight requests retain
                 // their existing reservations and may still record valid receipts.
-                if self.stop_on_authentication_failure(response.status)? {
-                    trace["authentication_circuit_open"] = json!(true);
-                }
                 let cause = format!("http_{}", response.status);
-                let opened = self.retain_unresolved(&cause);
+                let opened = if self.stop_on_authentication_failure(response.status)? {
+                    trace["authentication_circuit_open"] = json!(true);
+                    self.release_unrun(reservation, attempt > 0, false);
+                    trace["accounting"] =
+                        json!("Reservation released; the provider rejected the credentials.");
+                    false
+                } else {
+                    trace["accounting"] = json!("Full reservation retained; no usage receipt.");
+                    self.retain_unresolved(&cause)
+                };
                 trace["unresolved_usage_circuit_open"] = json!(opened);
                 trace["state"] = json!("http_error");
-                trace["accounting"] = json!("Full reservation retained; no usage receipt.");
                 // A server error (except 501 and 505, which do not change) is sent again once,
                 // after the provider cools.
-                if (500..600).contains(&response.status)
-                    && !matches!(response.status, 501 | 505)
-                    && !opened
-                    && self.may_retry(call, attempt, &mut retried)
-                {
+                let retryable =
+                    (500..600).contains(&response.status) && !matches!(response.status, 501 | 505);
+                if retryable {
                     let failures = self.note_failure(provider);
                     self.cool_provider(provider, wait(failures))?;
+                }
+                if retryable && !opened && self.may_retry(call, attempt, &mut retried) {
                     trace["retried"] = json!(true);
                     self.write_audit(&audit_name, &trace)?;
                     pending.finished = true;
@@ -2201,8 +2265,6 @@ impl JevClient {
                         parsed.output_tokens,
                     );
                     pending.receipt_accounted = true;
-                    trace["reported_provider_cost_usd"] =
-                        json!(parsed.input_tokens as f64 * 0.042 / 1_000_000.0);
                     trace["accounted_cost_usd"] = json!(backend
                         .cost_nanos(parsed.input_tokens)
                         .map(|n| n as f64 / NANOS_PER_USD)
@@ -2222,6 +2284,7 @@ impl JevClient {
                         answers: parsed.answers,
                         path,
                         input_tokens: parsed.input_tokens,
+                        provider,
                     });
                 }
                 Err(error) => {
@@ -2234,8 +2297,6 @@ impl JevClient {
                             ) {
                                 let settled = self.settle_on(provider, reservation, input, output);
                                 pending.receipt_accounted = true;
-                                trace["reported_provider_cost_usd"] =
-                                    json!(input as f64 * 0.042 / 1_000_000.0);
                                 trace["accounted_cost_usd"] = json!(backend
                                     .cost_nanos(input)
                                     .map(|n| n as f64 / NANOS_PER_USD)

@@ -424,8 +424,12 @@ async fn a_retry_receipt_names_its_role_and_the_attempt_it_repeats() {
             &url,
             vec![],
             None,
-            Some("raw/000041.body.gz".into()),
-            Some("race-c".into()),
+            AttemptTag {
+                parent: Some("raw/000041.body.gz".into()),
+                parent_race: Some("race-c".into()),
+                ..Default::default()
+            },
+            recorder.reserve_source_retry(1).unwrap(),
         )
         .await
         .unwrap();
@@ -434,6 +438,8 @@ async fn a_retry_receipt_names_its_role_and_the_attempt_it_repeats() {
     assert_eq!(receipts[0]["parent_artifact"], "raw/000041.body.gz");
     assert_eq!(receipts[0]["parent_race_id"], "race-c");
     assert!(receipts[0].get("race_id").is_none());
+    assert_eq!(recorder.load_summary()["source_retried_requests"], 1);
+    assert!(recorder.reserve_source_retry(1).is_none());
 }
 
 #[tokio::test]
@@ -1669,4 +1675,73 @@ fn sha256_hex_is_lowercase_hex_of_the_digest() {
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
     assert_eq!(sha256_hex(b"").len(), 64);
+}
+
+#[tokio::test]
+async fn a_retry_cut_before_its_permit_is_not_counted_and_refunds_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = RunConfig {
+        concurrency: 1,
+        ..RunConfig::default()
+    };
+    let recorder = hedging(dir.path(), config);
+    let (url, count) = counting_server(OK, Duration::from_millis(300)).await;
+    let parsed = Url::parse(&url).unwrap();
+    let authority = format!("{}:{}", parsed.host_str().unwrap(), parsed.port().unwrap());
+    let permit = recorder
+        .hosts
+        .semaphore(&authority)
+        .acquire_owned()
+        .await
+        .unwrap();
+    assert!(tokio::time::timeout(
+        Duration::from_millis(50),
+        recorder.request_retry(
+            Method::GET,
+            &url,
+            vec![],
+            None,
+            AttemptTag::default(),
+            recorder.reserve_source_retry(1).unwrap()
+        ),
+    )
+    .await
+    .is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder.load_summary()["source_retried_requests"], 0);
+    assert_eq!(
+        recorder.load_summary()["source_latency"]["127.0.0.1"]["cancelled_while_queued"],
+        1
+    );
+    assert!(recorder.reserve_source_retry(1).is_some());
+    drop(permit);
+}
+
+#[tokio::test]
+async fn concurrent_source_retries_cannot_send_past_the_run_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = gated(dir.path());
+    let (url, count) = counting_server(OK, Duration::ZERO).await;
+    let limit = crate::connectors::READ_RETRIES_PER_RUN;
+    let outcomes = futures::future::join_all((0..limit + 8).map(|_| async {
+        let retry = recorder.reserve_source_retry(limit)?;
+        Some(
+            recorder
+                .request_retry(
+                    Method::GET,
+                    &url,
+                    vec![],
+                    None,
+                    AttemptTag::default(),
+                    retry,
+                )
+                .await
+                .unwrap(),
+        )
+    }))
+    .await;
+    assert_eq!(outcomes.iter().flatten().count() as u64, limit);
+    assert_eq!(count.load(Ordering::SeqCst) as u64, limit);
+    assert_eq!(recorder.load_summary()["source_retried_requests"], limit);
+    assert!(recorder.reserve_source_retry(limit).is_none());
 }

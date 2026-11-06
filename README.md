@@ -62,8 +62,8 @@ The output is one JSON object, usually about 10 KB. This sample is shortened:
 - `results` holds the 10 best results, one for each URL.
 - `text_path` names a file with the full text. The excerpt holds 400 characters only.
 - `content_scope` tells you what the text is: a full page, a chunk, a summary, or index metadata.
-- `load.degraded` is true when evidence was lost. Examples are a cut source or a failed Jev judgment.
-  The results are usable, but thinner.
+- `load.degraded` is true when evidence was lost or a source used coarser fallback matching.
+  A fallback alone keeps status `complete`; lost evidence makes the results `partial`.
 
 `stellar-raven-jev search --help` explains every output field.
 
