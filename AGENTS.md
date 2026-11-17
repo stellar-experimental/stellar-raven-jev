@@ -58,3 +58,9 @@ documents and unjudged documents apart from negative judgments.
   when agent behavior changes.
 - Before a commit, scan staged files for `.env` values, tokens, account IDs, emails, and local
   home paths.
+- When the user asks to commit and push, push to `main` directly unless they asked for a branch
+  and PR. Confirm with `git fetch` and `git log origin/main`.
+- After a PR merges, finish the cleanup without asking the user to run a step: delete the remote
+  branch (check first; merged head branches may already be deleted), remove the worktree and local
+  branch, then `git fetch --prune`. If a permission prompt blocks a step, ask the user; do not
+  route around it with a different command.
