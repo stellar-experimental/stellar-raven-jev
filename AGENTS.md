@@ -48,16 +48,27 @@ When an evaluation question fails, fix the general mechanism. Then check the fix
 that were written before anyone looked at the results. Do not tune on the test set.
 Measure retrieval coverage, document relevance, and answer support separately. Keep unread
 documents and unjudged documents apart from negative judgments.
+Score, claim-check, and currentness calls take one item each, because packing items changes
+judgments. Start a ranking or prompt tuning round only with a new mechanism and a gate written
+before the run.
 
 ## Other rules
 
-- Forward only: no legacy fallbacks, compatibility flags, or history notes in code or docs.
+- Forward only: no legacy fallbacks, compatibility flags, aliases, `#[serde(default)]` for old
+  saved files, or history notes in code or docs. Change a format outright; old run folders may
+  fail with `report`.
+- Do not add an MCP server, typed plans, or `ask`/`chat` commands unless asked. The tool stays a
+  small CLI.
+- Authenticate services with scoped API keys from `.env`. Do not shell out to a CLI such as `cf`
+  or `wrangler` at runtime, because CLI OAuth tokens expire and add a subprocess dependency.
 - The tool is for agents: compact JSON by default, no human-oriented output modes.
 - `--help` is the source of truth for commands, flags, and output fields. When you change one,
   update its help text in `src/main.rs`. Update the skill in `skills/stellar-raven-jev/` only
   when agent behavior changes.
-- Before a commit, scan staged files for `.env` values, tokens, account IDs, emails, and local
-  home paths.
+- The repo is public. Before a commit, scan staged files for `.env` values, tokens, account IDs,
+  emails, and local home paths. Keep evaluation sets, run evidence, and partner figures out of it.
+- CI allows only GitHub-owned actions plus the SHA-pinned ones already in the workflows. Add a new
+  third-party action to the repo's Actions allowlist, or CI fails at job setup.
 - Lead session only (the session the owner started and works with; lanes, reviewers and harness runs report to their lead instead): when the user asks to commit and push, push to `main` directly unless they asked for a branch
   and PR. Confirm with `git fetch` and `git log origin/main`.
 - Lead session only: after a PR merges, finish the cleanup without asking the user to run a step: delete the remote
